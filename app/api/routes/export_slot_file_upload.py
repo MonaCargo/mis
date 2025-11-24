@@ -4,6 +4,7 @@ import io
 from typing import List, Optional,AsyncGenerator
 from fastapi import APIRouter, Query, UploadFile, File, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+import pytz
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models.export_slot_file import ExportSlotFileRecord
@@ -148,11 +149,24 @@ async def download_export_slots_csv(
             detail="start_date must be before or equal to end_date"
         )
     
+    # 🔧 FIX: Convert IST dates to UTC range
+    ist_tz = pytz.timezone("Asia/Kolkata")
+    
+    # If dates are naive (no timezone), assume they're IST dates
+    if start_date.tzinfo is None:
+        start_date = ist_tz.localize(start_date.replace(hour=0, minute=0, second=0))
+    if end_date.tzinfo is None:
+        end_date = ist_tz.localize(end_date.replace(hour=23, minute=59, second=59))
+    
+    # Convert to UTC for database query
+    start_date_utc = start_date.astimezone(pytz.UTC)
+    end_date_utc = end_date.astimezone(pytz.UTC)
+    
     # Generate filename with date range
     filename = f"truck_report_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv"
     
     return StreamingResponse(
-        generate_csv_rows_for_download_truck_in_out_by_stream(db, start_date, end_date),
+        generate_csv_rows_for_download_truck_in_out_by_stream(db, start_date_utc, end_date_utc),
         media_type="text/csv",
         headers={
             "Content-Disposition": f"attachment; filename={filename}",
