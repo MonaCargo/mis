@@ -276,7 +276,7 @@ from app.schemas.manulal_slot import (
     Pagination,
 )
 
-
+from app.utils.common.helperFunction import get_utc_now
 
 
 # --- Utility functions ---
@@ -636,7 +636,9 @@ async def mark_truck_in(
             export_slot_id=new_export_id,
             awb_id=record.awb,  # single AWB string
             pcs=record.pcs,
-            is_additional=False
+            is_additional=False,
+            created_at=get_utc_now(),
+            updated_at=get_utc_now(),
         ).returning(ExportSlotAWB.id)
 
         awb_result = await db.execute(awb_stmt)
