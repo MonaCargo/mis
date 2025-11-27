@@ -1,5 +1,5 @@
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.base import APIResponseBase
 
@@ -17,6 +17,7 @@ class UserRead(BaseModel):
     name: str
     role: str
     is_active:bool
+    created_by: Optional[int] = None   # 👈 added this
 
     class Config:
         from_attributes = True 
@@ -62,3 +63,32 @@ class UserStatusUpdate(BaseModel):
 
 class UserStatusUpdateResponse(APIResponseBase):
     user: "UserRead"  # reference to your existing read schema
+
+
+
+
+
+class UserPasswordChange(BaseModel):
+    password: str = Field(..., min_length=4, max_length=200)
+    
+    @field_validator("password", mode="before")
+    def strip_password(cls, v):
+        if isinstance(v, str):
+            v = v.strip()   # 🔥 remove leading/trailing spaces
+        return v
+
+    @field_validator("password")
+    def validate_password(cls, v):
+        if " " in v:
+            raise ValueError("Password cannot contain spaces in between.")
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters.")
+        if len(v) > 12:
+            raise ValueError("Password cannot exceed 12 characters.")
+        return v
+
+    
+
+class UserPasswordChangeResponse(APIResponseBase):
+    emp_id:str
+ 

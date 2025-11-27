@@ -506,7 +506,9 @@ async def get_export_slots_by_specific_date(
         ExportSlotFileRecord.truck_slot_from < end_utc,
         ]
     if truckOut:
-        conditions.append(ExportSlotFileRecord.is_dock_out == True)
+        # 👌👌👌👌👌👌👌👌👌👌👌👌👌👌👌👌 1 chnages
+        # conditions.append(ExportSlotFileRecord.is_dock_out == True)
+        conditions.append(ExportSlotFileRecord.is_truck_in == True)
 
     stmt = (
         select(ExportSlotFileRecord)
@@ -892,11 +894,12 @@ async def mark_truck_out(db: AsyncSession, truck_number: str, truck_slot_from: d
     if not slot_record.truck_in_date_time or not slot_record.is_truck_in:
         return None, "Truck has not been marked IN yet."
 
-    if not slot_record.is_dock_in:
-        return None, "Truck has not docked IN yet."
+#   👌👌👌👌👌👌👌👌👌👌👌👌👌👌👌👌 2 chnages
+    # if not slot_record.is_dock_in:
+    #     return None, "Truck has not docked IN yet."
 
-    if not slot_record.is_dock_out:
-        return None, "Truck has not docked OUT yet."
+    # if not slot_record.is_dock_out:
+    #     return None, "Truck has not docked OUT yet."
 
     if slot_record.truck_out_date_time is not None or slot_record.is_truck_out:
         return None, "Truck is already marked OUT."

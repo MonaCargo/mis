@@ -691,6 +691,7 @@ async def generate_and_save_gatepass(
 
             if r.oc_no in existing_map:
                 base["igp_no"] = existing_map[r.oc_no]
+                base["created_at"] = None
                 to_update.append(base)
             else:
                 base["created_at"] = get_utc_now()  # ✅ Set manually # ✅ For inserts: DO set created_at

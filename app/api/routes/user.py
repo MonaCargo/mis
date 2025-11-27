@@ -66,15 +66,16 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.dependency import require_roles
+from app.core.dependency import require_roles, verify_token_and_get_user
 from app.db.models.user import User
 from app.db.session import get_db
-from app.schemas.user import UserCreate, UserCreateResponse,UserReadResponse, UserListResponse, UserRead, UserStatusUpdate, UserStatusUpdateResponse
+from app.schemas.user import UserCreate, UserCreateResponse, UserPasswordChange, UserPasswordChangeResponse,UserReadResponse, UserListResponse, UserRead, UserStatusUpdate, UserStatusUpdateResponse
 from app.services.user_service import (
     get_all_users_paginated,
     get_all_users_paginated_filter_apply,
     get_user_by_emp_id,
     create_user as create_user_service,
+    update_user_password,
     update_user_status
 )
 
@@ -82,11 +83,14 @@ router = APIRouter(prefix="", tags=["Users"])
 
 # Create a new user
 @router.post("/", response_model=UserCreateResponse)
-async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
+async def create_user(user: UserCreate, 
+                      db: AsyncSession = Depends(get_db),
+                      current_user: User = Depends(verify_token_and_get_user)
+                      ):
     existing_user = await get_user_by_emp_id(user.emp_id, db)
     if existing_user:
         raise HTTPException(status_code=400, detail="Employee ID already registered")
-    new_user = await create_user_service(user, db)
+    new_user = await create_user_service(user, db,created_by=current_user.emp_id)
     return UserCreateResponse(success=True, message="User created successfully",  user=UserRead.model_validate(new_user))
 
 # Get a user by emp_id
@@ -199,3 +203,23 @@ async def read_all_users(
             status_code=500,
             detail="Internal server error while fetching users"
         )
+
+
+# Update/change user password
+@router.put("/{emp_id}/change-password", response_model=UserPasswordChangeResponse, summary="Update user password")
+async def update_user_password_api(
+    emp_id: str,
+    password_data: UserPasswordChange,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_roles(["super_admin"]))
+):
+    updated = await update_user_password(emp_id, password_data.password, db)
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return UserPasswordChangeResponse(
+        success=True,
+        message="Password updated successfully",
+        emp_id=emp_id
+    )

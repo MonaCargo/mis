@@ -9,7 +9,10 @@ class User(Base):
     name = Column(String(60))                 # ✅ no comma
     password = Column(String)                 # ✅ no comma
     role = Column(String, default="user")     # ✅ no comma
-    is_active = Column(Boolean,nullable=False,server_default='1') # by default active
+    is_active = Column(Boolean,nullable=False,server_default=text("TRUE")) # by default active
+
+     # 🔥 Track who created this user
+    created_by = Column(String, nullable=True, default=None)
 
        # ✅ NEW: Timestamp columns  (⚠️confirm timezone handling with your DB)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

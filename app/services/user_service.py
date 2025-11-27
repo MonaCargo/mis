@@ -1,3 +1,4 @@
+from http.client import HTTPException
 from typing import List, Optional, Tuple
 from sqlalchemy import asc, desc, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -99,7 +100,7 @@ async def get_all_users_paginated(
 
 
 
-async def create_user(user_data, db: AsyncSession):
+async def create_user(user_data, db: AsyncSession,created_by):
     print(f"Password raw value (repr): {repr(user_data.password)}")
     print(f"Password length (chars): {len(user_data.password)}")
     print(f"Password length (bytes): {len(user_data.password.encode('utf-8'))}")
@@ -108,7 +109,8 @@ async def create_user(user_data, db: AsyncSession):
         emp_id=user_data.emp_id,
         name=user_data.name,
         password=hashed_pwd,
-        role=user_data.role
+        role=user_data.role,
+        created_by=created_by
 
     )
     db.add(new_user)
@@ -212,3 +214,42 @@ async def get_all_users_paginated_filter_apply(
     total_count = total_result.scalar()
     
     return users, total_count
+
+
+
+
+
+async def update_user_password(emp_id: str, new_password: str, db: AsyncSession):
+    """
+    Update/change the password of a user by emp_id.
+    Returns the updated user object or None if not found.
+    """
+
+    # Fetch the user
+    new_password = new_password.strip()  # 🔥 ensure trimmed
+    
+    result = await db.execute(select(User).where(User.emp_id == emp_id))
+    user = result.scalar_one_or_none()
+
+    if not user:
+        return None
+    
+    # Extra backend check (security)
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    if len(new_password) > 12:
+        raise HTTPException(status_code=400, detail="Password cannot exceed 12 characters.")
+    if " " in new_password:
+        raise HTTPException(status_code=400, detail="Password cannot contain spaces.")
+
+    # Hash the new password
+    hashed_pwd = hash_password(new_password)
+
+    # Update password field
+    user.password = hashed_pwd
+
+    # Save changes
+    await db.commit()
+    await db.refresh(user)
+
+    return user

@@ -7,6 +7,10 @@ async def authenticate_user(emp_id: str, password: str, db: AsyncSession):
     user = await get_user_by_emp_id(emp_id, db)
     if not user:
         return None, None, "User not found"
+        # ⛔ Block inactive user login
+    if not user.is_active:
+        return None, None, "User is inactive. Contact Administrator."
+        
     if not verify_password(password, user.password):
         return None, None, "Invalid credentials"
 
