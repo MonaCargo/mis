@@ -314,7 +314,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import case, literal_column, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
-
+import re 
 from typing import List
 import logging
 import time
@@ -567,6 +567,7 @@ async def generate_and_save_gatepass(
                     COALESCE(hwb_no, '') AS hwb_no,
                     STRING_AGG(warehouse_location || '/' || pcs::text, ', ') AS location_pcs_pairs,
                     SUM(grs_wgt) AS weight,
+                    SUM(wgt_chg) AS chg_wgt_in_kg,
                     MAX(fltno) AS flight_number,
                     MAX(flt_date) AS flight_date_val,
                     MAX(shc) AS shc,
@@ -592,6 +593,7 @@ async def generate_and_save_gatepass(
                 oc.integrate_date_time,
                 wh.location_pcs_pairs AS locations,
                 wh.weight AS weight_in_kgs,
+                wh.chg_wgt_in_kg AS chg_wgt_in_kg,
                 wh.cne_name AS cne_name ,
                 wh.flight_number AS flight_no,
                 wh.flight_date_val AS flight_date,
@@ -674,6 +676,7 @@ async def generate_and_save_gatepass(
                 "flight_date": r.flight_date,
                 "no_of_pc": r.no_of_pc,
                 "weight_in_kgs": float(r.weight_in_kgs) if r.weight_in_kgs is not None else None,
+                "chg_wgt_in_kg": float(r.chg_wgt_in_kg) if hasattr(r,'chg_wgt_in_kg') and r.chg_wgt_in_kg is not None else None,  # NEW
                 "location": r.locations or None,
                 "irregularity_remarks": r.irregularity_remarks or None,
                 "irr_codes": r.irr_codes or None,  # ✅ ADD THIS LINE
@@ -738,6 +741,13 @@ async def generate_and_save_gatepass(
                                 insert(OcMergeGatePass).excluded.weight_in_kgs
                             ),
                             else_=OcMergeGatePass.weight_in_kgs
+                        ),
+                        "chg_wgt_in_kg": case(
+                            (
+                                OcMergeGatePass.chg_wgt_in_kg.is_(None),
+                                insert(OcMergeGatePass).excluded.chg_wgt_in_kg
+                            ),
+                            else_=OcMergeGatePass.chg_wgt_in_kg
                         ),
                         
                         # Update flight_no only if existing is NULL or empty
@@ -886,8 +896,183 @@ async def generate_and_save_gatepass(
 
 
 
-# ---------------------------------
+# ---------------version 1 upto 05/12/2025 6:00 pm ------------------
 
+# @router.get("/gatepass-by-date-range", response_model=dict)
+# async def get_gatepass_by_date_range(
+#     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
+#     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
+#     db: AsyncSession = Depends(get_db)
+# ):
+#     """
+#     Get all OcMergeGatePass records by date range (no pagination)
+#     Based on integrate_date_time.
+#     Frontend sends date in IST; convert 00:00 IST → UTC.
+#     Excludes records containing GF_03, GF_05, GF_10 in location field.
+#     """
+#     try:
+#         # Parse and validate input
+#         try:
+#             ist = pytz.timezone("Asia/Kolkata")
+
+#             # start_date: 00:00 IST → convert to UTC
+#             start_naive = datetime.strptime(start_date, "%Y-%m-%d")
+#             start_ist = ist.localize(start_naive.replace(hour=0, minute=0, second=0, microsecond=0))
+#             start_dt = start_ist.astimezone(pytz.UTC)
+
+#             # end_date: 23:59:59.999999 IST → convert to UTC
+#             end_naive = datetime.strptime(end_date, "%Y-%m-%d")
+#             end_ist = ist.localize(end_naive.replace(hour=23, minute=59, second=59, microsecond=999999))
+#             end_dt = end_ist.astimezone(pytz.UTC)
+
+#         except ValueError:
+#             raise HTTPException(
+#                 status_code=400, 
+#                 detail="Invalid date format. Use YYYY-MM-DD"
+#             )
+
+#         # Validation
+#         if start_dt > end_dt:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="Start date cannot be after end date"
+#             )
+
+#         # Fetch records from service
+#         gatepass_records = await OcMergeGatepassService.get_gatepass_by_date_range(
+#             db=db,
+#             start_date=start_dt,
+#             end_date=end_dt
+#         )
+
+#         # 🆕 Define locations to exclude
+#         # excluded_locations = ["GF_03", "GF_05", "GF_10"]/
+#         excluded_locations = ["GF_03", "GF_05", "GF_10", "IGF_1_A","IGF_21_A"]
+#         # Prefix match exclusions (starts with)
+#         excluded_location_prefixes = {
+#             "ISR",       # e.g., GF_01, GF_11_A, etc.
+#             "IUC",      # Example if needed later
+#             "TDP",      # Example if needed later
+#             "PI"
+#         }
+#         excluded_irr_codes = ["SSPD", "FDCA"] # eclude these irr_codes rows as well
+#         excluded_shc_values = ["per", "val", "hum","dgr"]  # 🚨 Case-sensitive exact match
+        
+#         # 🆕 Filter records - exclude any record that contains excluded locations in location field
+#         filtered_records = []
+#         excluded_records = []  # 🆕 Store excluded records with their OC numbers
+        
+#         for record in gatepass_records:
+#             exclude_flag = False  # 🆕 Track if record should be excluded
+
+#             # --- Check for excluded locations ---
+           
+
+            
+            
+#             if record.location:
+#                 # Extract first part and uppercase for consistent comparison
+#                 location_prefix = record.location.split("/")[0].strip().upper()
+
+#                 # -------- EXACT MATCH CHECK --------
+#                 if location_prefix in (loc.upper() for loc in excluded_locations):
+#                     exclude_flag = True
+
+#                 # -------- PREFIX MATCH CHECK --------
+#                 if any(location_prefix.startswith(prefix.upper()) for prefix in excluded_location_prefixes):
+#                     exclude_flag = True
+
+#             # if record.location:
+#             #     location_prefix = str(record.location).split("/")[0].strip().upper()
+#             #     if location_prefix in (loc.upper() for loc in excluded_locations):
+#             #         exclude_flag = True
+
+#             # --- Check for excluded SHC values (case-insensitive exact match) ---
+#             if record.shc:
+#                 shc_value = str(record.shc).strip().upper()
+#                 if shc_value in (val.upper() for val in excluded_shc_values):
+#                     exclude_flag = True
+            
+#             # --- Check for excluded irr_codes ---
+#             # # --- Exclude by IRR Codes ---
+#             if record.irr_codes:
+#                 irr_values = [v.strip().upper() for v in str(record.irr_codes).split("|")]
+#                 if any(code.upper() in irr_values for code in excluded_irr_codes):
+#                     exclude_flag = True
+
+
+#             if exclude_flag:
+#                 excluded_records.append(record)
+#                 continue  # Skip this record
+
+#             filtered_records.append(record)
+#         # 🆕 Extract excluded OC numbers
+#         excluded_oc_nos = [record.oc_no for record in excluded_records if record.oc_no]
+
+#         # Build response only with filtered records
+#         records_data = []
+#         for record in filtered_records:
+#             record_dict = {
+#                 "id": record.id,
+#                 "igp_no": record.igp_no,
+#                 "oc_no": record.oc_no,
+#                 "awb_no": record.awb_no,
+#                 "hawb": record.hawb,
+#                 "no_of_pc": record.no_of_pc,
+#                 "weight_in_kgs": record.weight_in_kgs,
+#                 "location": record.location,
+#                 "flight_no": record.flight_no,
+#                 "flight_date": record.flight_date.isoformat() if record.flight_date else None,
+                
+#                 "irregularity_remarks": record.irregularity_remarks,
+#                 "pd_in_time": record.pd_in_time.isoformat() if record.pd_in_time else None,
+#                 "no_of_pc_recd": record.no_of_pc_recd,
+#                 "verified_by": record.verified_by,
+#                 "agent_name": record.agent_name,
+#                 "customer_name": record.customer_name,
+#                 "release_zone": record.release_zone,
+#                 "integrate_date_time": record.integrate_date_time.isoformat() if record.integrate_date_time else None,
+#                 "shc": record.shc,
+#                 "igp_print_date_time": record.igp_print_date_time.isoformat() if record.igp_print_date_time else None,
+#                 "irr_codes": record.irr_codes,
+#                 "is_printed": record.is_printed
+#             }
+#             records_data.append(record_dict)
+
+#         total_count = len(records_data)
+#         excluded_count = len(excluded_records)
+#         original_count = len(gatepass_records)
+
+#         return {
+#             "success": True,
+#             "data": records_data,
+#             "total_records": total_count,
+#             "date_range": {
+#                 "start_date": start_date,
+#                 "end_date": end_date
+#             },
+#             "filter_info": {
+#                 "excluded_locations": excluded_locations,
+#                 "excluded_shc_values": excluded_shc_values,  # 🆕
+#                 "original_count": original_count,
+#                 "filtered_count": total_count,
+#                 "excluded_count": excluded_count,
+#                 "excluded_oc_nos": excluded_oc_nos,  # 🆕 Include excluded OC numbers
+#                 "excluded_oc_nos_count": len(excluded_oc_nos)  # 🆕 Count of excluded OC numbers
+#             },
+#             "message": f"Found {total_count} records between {start_date} and {end_date} (excluded {excluded_count} records containing GF_03, GF_05, or GF_10)"
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+# ----------------------------------------------------------------
+
+
+# ------------------------ 2 version with exclude reason why it exclude info added -------------------------------
 @router.get("/gatepass-by-date-range", response_model=dict)
 async def get_gatepass_by_date_range(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
@@ -898,111 +1083,125 @@ async def get_gatepass_by_date_range(
     Get all OcMergeGatePass records by date range (no pagination)
     Based on integrate_date_time.
     Frontend sends date in IST; convert 00:00 IST → UTC.
-    Excludes records containing GF_03, GF_05, GF_10 in location field.
+    Excludes records based on location, SHC, IRR codes.
+    Also returns excluded records with detailed reasons.
     """
+
     try:
-        # Parse and validate input
+        # -------------------------
+        # Parse dates (IST → UTC)
+        # -------------------------
         try:
             ist = pytz.timezone("Asia/Kolkata")
 
-            # start_date: 00:00 IST → convert to UTC
             start_naive = datetime.strptime(start_date, "%Y-%m-%d")
             start_ist = ist.localize(start_naive.replace(hour=0, minute=0, second=0, microsecond=0))
             start_dt = start_ist.astimezone(pytz.UTC)
 
-            # end_date: 23:59:59.999999 IST → convert to UTC
             end_naive = datetime.strptime(end_date, "%Y-%m-%d")
             end_ist = ist.localize(end_naive.replace(hour=23, minute=59, second=59, microsecond=999999))
             end_dt = end_ist.astimezone(pytz.UTC)
 
         except ValueError:
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid date format. Use YYYY-MM-DD"
-            )
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-        # Validation
         if start_dt > end_dt:
-            raise HTTPException(
-                status_code=400,
-                detail="Start date cannot be after end date"
-            )
+            raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
-        # Fetch records from service
+        # -------------------------
+        # Fetch records from DB
+        # -------------------------
         gatepass_records = await OcMergeGatepassService.get_gatepass_by_date_range(
             db=db,
             start_date=start_dt,
             end_date=end_dt
         )
 
-        # 🆕 Define locations to exclude
-        # excluded_locations = ["GF_03", "GF_05", "GF_10"]/
-        excluded_locations = ["GF_03", "GF_05", "GF_10", "IGF_1_A","IGF_21_A"]
-        # Prefix match exclusions (starts with)
+        # -------------------------
+        # Exclusion rules
+        # -------------------------
+        excluded_locations = ["GF_03", "GF_05", "GF_10", "IGF_1_A", "IGF_21_A"]
+
         excluded_location_prefixes = {
-            "ISR",       # e.g., GF_01, GF_11_A, etc.
-            "IUC",      # Example if needed later
-            "TDP",      # Example if needed later
+            "ISR",
+            "IUC",
+            "TDP",
             "PI"
         }
-        excluded_irr_codes = ["SSPD", "FDCA"] # eclude these irr_codes rows as well
-        excluded_shc_values = ["per", "val", "hum","dgr"]  # 🚨 Case-sensitive exact match
-        
-        # 🆕 Filter records - exclude any record that contains excluded locations in location field
+
+        excluded_irr_codes = ["SSPD", "FDCA"]
+        excluded_shc_values = ["per", "val", "hum", "dgr"]
+
         filtered_records = []
-        excluded_records = []  # 🆕 Store excluded records with their OC numbers
-        
+        excluded_records_with_reasons = []
+
+        # -------------------------
+        # Filtering Logic
+        # -------------------------
         for record in gatepass_records:
-            exclude_flag = False  # 🆕 Track if record should be excluded
 
-            # --- Check for excluded locations ---
-           
+            exclude_flag = False
+            reasons = []
 
-            
-            
+            # ----- Check LOCATION -----
+            # --- Check LOCATION (improved: checks all parts, not only first part) ---
             if record.location:
-                # Extract first part and uppercase for consistent comparison
-                location_prefix = record.location.split("/")[0].strip().upper()
+                # Split by comma or slash and clean values
+                location_parts = [
+                    part.strip().upper()
+                    for part in re.split(r"[,/]", record.location)
+                    if part.strip()
+                ]
 
-                # -------- EXACT MATCH CHECK --------
-                if location_prefix in (loc.upper() for loc in excluded_locations):
-                    exclude_flag = True
+                for part in location_parts:
 
-                # -------- PREFIX MATCH CHECK --------
-                if any(location_prefix.startswith(prefix.upper()) for prefix in excluded_location_prefixes):
-                    exclude_flag = True
+                    # Exact Match
+                    if part in (loc.upper() for loc in excluded_locations):
+                        exclude_flag = True
+                        reasons.append(f"location exact match: {part}")
 
-            # if record.location:
-            #     location_prefix = str(record.location).split("/")[0].strip().upper()
-            #     if location_prefix in (loc.upper() for loc in excluded_locations):
-            #         exclude_flag = True
+                    # Prefix Match
+                    if any(part.startswith(prefix.upper()) for prefix in excluded_location_prefixes):
+                        exclude_flag = True
+                        reasons.append(f"location prefix match: {part}")
 
-            # --- Check for excluded SHC values (case-insensitive exact match) ---
+            # ----- Check SHC -----
             if record.shc:
                 shc_value = str(record.shc).strip().upper()
                 if shc_value in (val.upper() for val in excluded_shc_values):
                     exclude_flag = True
-            
-            # --- Check for excluded irr_codes ---
-            # # --- Exclude by IRR Codes ---
+                    reasons.append(f"shc excluded: {shc_value}")
+
+            # ----- Check IRR CODES -----
             if record.irr_codes:
                 irr_values = [v.strip().upper() for v in str(record.irr_codes).split("|")]
-                if any(code.upper() in irr_values for code in excluded_irr_codes):
-                    exclude_flag = True
+                for code in excluded_irr_codes:
+                    if code.upper() in irr_values:
+                        exclude_flag = True
+                        reasons.append(f"irr_codes excluded: {code}")
+                        break
 
-
+            # ----- Add to exclusion list -----
             if exclude_flag:
-                excluded_records.append(record)
-                continue  # Skip this record
+                excluded_records_with_reasons.append({
+                    "id": record.id,
+                    "oc_no": record.oc_no,
+                    "location": record.location,
+                    "shc": record.shc,
+                    "irr_codes": record.irr_codes,
+                    "reason": reasons
+                })
+                continue
 
+            # ----- Add to valid list -----
             filtered_records.append(record)
-        # 🆕 Extract excluded OC numbers
-        excluded_oc_nos = [record.oc_no for record in excluded_records if record.oc_no]
 
-        # Build response only with filtered records
+        # -------------------------
+        # Build response
+        # -------------------------
         records_data = []
         for record in filtered_records:
-            record_dict = {
+            records_data.append({
                 "id": record.id,
                 "igp_no": record.igp_no,
                 "oc_no": record.oc_no,
@@ -1010,10 +1209,10 @@ async def get_gatepass_by_date_range(
                 "hawb": record.hawb,
                 "no_of_pc": record.no_of_pc,
                 "weight_in_kgs": record.weight_in_kgs,
+                "chg_wgt_in_kg": record.chg_wgt_in_kg,
                 "location": record.location,
                 "flight_no": record.flight_no,
                 "flight_date": record.flight_date.isoformat() if record.flight_date else None,
-                
                 "irregularity_remarks": record.irregularity_remarks,
                 "pd_in_time": record.pd_in_time.isoformat() if record.pd_in_time else None,
                 "no_of_pc_recd": record.no_of_pc_recd,
@@ -1026,31 +1225,20 @@ async def get_gatepass_by_date_range(
                 "igp_print_date_time": record.igp_print_date_time.isoformat() if record.igp_print_date_time else None,
                 "irr_codes": record.irr_codes,
                 "is_printed": record.is_printed
-            }
-            records_data.append(record_dict)
-
-        total_count = len(records_data)
-        excluded_count = len(excluded_records)
-        original_count = len(gatepass_records)
+            })
 
         return {
             "success": True,
             "data": records_data,
-            "total_records": total_count,
+            "original_count": len(gatepass_records),
+            "filtered_count": len(records_data),
+            "excluded_count": len(excluded_records_with_reasons),
+            "excluded_details": excluded_records_with_reasons,
             "date_range": {
                 "start_date": start_date,
                 "end_date": end_date
             },
-            "filter_info": {
-                "excluded_locations": excluded_locations,
-                "excluded_shc_values": excluded_shc_values,  # 🆕
-                "original_count": original_count,
-                "filtered_count": total_count,
-                "excluded_count": excluded_count,
-                "excluded_oc_nos": excluded_oc_nos,  # 🆕 Include excluded OC numbers
-                "excluded_oc_nos_count": len(excluded_oc_nos)  # 🆕 Count of excluded OC numbers
-            },
-            "message": f"Found {total_count} records between {start_date} and {end_date} (excluded {excluded_count} records containing GF_03, GF_05, or GF_10)"
+            "message": f"Found {len(records_data)} valid records (excluded {len(excluded_records_with_reasons)})"
         }
 
     except HTTPException:
@@ -1058,22 +1246,13 @@ async def get_gatepass_by_date_range(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+# --------------------------------------------------------------------------------
 
-# ----------------------------------------------------------------
-# @router.post("/mark-printed")
-# async def mark_igp_printed(
-#     request: MarkPrintedRequest,
-#     db: AsyncSession = Depends(get_db)
-# ):
-#     updated_count = await OcMergeGatepassService.update_igp_print_status_and_datetime(db, request.oc_nos)
-    
-#     if updated_count == 0:
-#         raise HTTPException(status_code=404, detail="No matching records found")
 
-#     return {
-#         "message": "IGP print status updated successfully",
-#         "total_records_updated": updated_count
-#     }
+
+
+
+
 
 # --------------------------------------------------------------------------------
 

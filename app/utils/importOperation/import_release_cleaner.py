@@ -411,6 +411,22 @@ import numpy as np
 from datetime import datetime,date, time,timedelta,timezone
 import pytz
 
+# NORMALIZE THE GATE PASS NO (remove .0, non-digits)
+def normalize_gate_pass_no(value) -> str:
+    if not value:
+        return None
+
+    value = str(value).strip()
+
+    # Remove decimals like 25240231.0
+    if value.endswith(".0"):
+        value = value[:-2]
+
+    # Remove all non-digit characters
+    cleaned = re.sub(r"\D", "", value)
+
+    return cleaned if cleaned else None
+
 
 
 
@@ -531,6 +547,44 @@ def clean_import_release_file(file, file_type: str) -> pd.DataFrame:
     # Select and rename columns
     df = df[list(column_mapping.keys())].rename(columns=column_mapping)
 
+     # ===========================New Addon 06/12/25  👌========================================
+
+    # ============================================
+    # 🔥 OC_NUM Cleaning + Duplicate Detection
+    # ============================================
+    if 'oc_num' in df.columns:
+
+        print("\n📌 Checking OC_NUM duplicates before cleaning...")
+
+        # Convert to string + strip spaces
+        df['oc_num'] = df['oc_num'].astype(str).str.strip()
+
+        # Remove blanks + non-numeric OC_NUM
+        before_clean = len(df)
+        df = df[df['oc_num'].str.match(r'^\d+$', na=False)]
+        after_clean = len(df)
+        print(f"🧹 Removed {before_clean - after_clean} invalid OC_NUM rows (blank or non-numeric)")
+
+        # Show duplicates BEFORE dropping
+        dupes = df[df.duplicated(subset=['oc_num'], keep=False)].sort_values('oc_num')
+
+        if not dupes.empty:
+            print("\n⚠️ Duplicate OC_NUM values before dedupe:")
+            print(dupes[['oc_num']].value_counts().rename("count"))
+        else:
+            print("✅ No duplicates found before dedupe")
+
+        # Drop duplicates — keep the LAST row
+        before_dedup = len(df)
+        df = df.drop_duplicates(subset=['oc_num'], keep='last')
+        after_dedup = len(df)
+
+        print(f"🔥 Removed {before_dedup - after_dedup} duplicate OC_NUM rows")
+        print("✅ OC_NUM cleaning completed successfully.\n")
+
+    # ===============================================================================================
+
+
     # ✅ Normalize AWB number
     if 'awb' in df.columns:
         df['awb'] = df['awb'].apply(normalize_awb_no)
@@ -639,10 +693,15 @@ def clean_import_release_file(file, file_type: str) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
             df[col] = df[col].replace(['nan', 'None', 'NaT', '', 'N/A'], None)
-    
+     # Normalize gate_pass_no values
+    if 'gate_pass_no' in df.columns:
+        df['gate_pass_no'] = df['gate_pass_no'].apply(normalize_gate_pass_no)
     # Replace pandas NaN/NaT with Python None for database compatibility
     df = df.replace({np.nan: None, pd.NaT: None})
     
+    print(df['gate_pass_no'].head(6))
+
+
     return df
 
 
