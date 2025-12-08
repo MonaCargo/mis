@@ -17,6 +17,7 @@ class OcMergeGatePassCreate(BaseModel):
     flight_date: Optional[datetime]
     no_of_pc: Optional[int]
     weight_in_kgs: Optional[float]
+    chg_wgt_in_kg : Optional[float]
     location: Optional[str]
     oc_no: str
     irregularity_remarks: Optional[str]
