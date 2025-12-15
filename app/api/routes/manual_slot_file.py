@@ -62,6 +62,7 @@ async def put_manual_slot_truck_in(
     """
     PUT API to mark a truck as 'in' for a manual slot record.
     """
+    print()
     try:
         record = await mark_truck_in(
             db=db,
@@ -69,6 +70,7 @@ async def put_manual_slot_truck_in(
             tc_no=request.tc_no,
             emp_id=request.emp_id,  # assuming UserRead has `id`
             truck_number=request.truck_number,
+            truck_in_device = request.truck_in_device
         )
 
         # if not record:

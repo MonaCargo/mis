@@ -31,6 +31,8 @@ class ExportManualSlotFileRecord(Base):
     is_dock_in = Column(Boolean, default=False, nullable=False)
     is_dock_out = Column(Boolean, default=False, nullable=False)
 
+    truck_in_device = Column(String, nullable=True)
+
     # Dock/Truck info
     dock_number = Column(String, nullable=True)
     truck_in_by = Column(String, nullable=True)

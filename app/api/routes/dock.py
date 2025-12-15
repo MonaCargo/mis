@@ -4,10 +4,10 @@ from fastapi import APIRouter, Depends, Query
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
-from app.schemas.export_slot_file import AWBSequenceResponse, AddAWBSequenceRequest, AddAWBSequenceResponse, ExportSlotFileListResponse, ExportSlotFullResponse
+from app.schemas.export_slot_file import AWBSequenceResponse, AddAWBSequenceRequest, AddAWBSequenceResponse, ExportSlotFileListResponseForDock, ExportSlotFullResponse
 from app.schemas.user import UserRead
 from app.services.dock_service import DockService
-from app.schemas.dock import DockInRevertResponse, DockOutResponse, DockScanRequest, DockScanResponse, RevertDockInRequest
+from app.schemas.dock import DockInRevertResponse, DockOutRequest, DockOutResponse, DockScanRequest, DockScanResponse, RevertDockInRequest
 from app.core.dependency import verify_token_and_get_user
 
 router = APIRouter()
@@ -23,9 +23,9 @@ async def dock_scan_in(
     """
     try:
         print("scan data====================================",scan_data.dict())
+        print("scan data====================================",scan_data)
         # Use emp_id from request if provided, else fallback to current_user
         user_id = scan_data.emp_id or current_user.emp_id
-
         data = await DockService.process_dock_scan(db, scan_data, emp_id=user_id)
 
         return DockScanResponse(
@@ -42,13 +42,14 @@ async def dock_scan_in(
 
 @router.post("/dock-out", response_model=DockOutResponse)
 async def dock_out(
-    scan_data: DockScanRequest,
+    scan_data: DockOutRequest,
     db: AsyncSession = Depends(get_db),
     current_user: UserRead = Depends(verify_token_and_get_user),
 ):
     """
     Route for dock-out
     """
+    print("scan_data req in dockout",scan_data)
     try:
         emp_id = scan_data.emp_id or current_user.emp_id
         data = await DockService.process_dock_out(db, scan_data, emp_id=emp_id)
@@ -77,7 +78,8 @@ async def add_awb_sequences(
     - Adds multiple sequence scans per AWB
     - Validates truck-in and dock-in status
     """
-    data = await DockService.add_awb_sequences(db, request)
+    # print(request,"REQ")
+    data = await DockService.add_awb_sequences(db, request,emp_id=current_user.emp_id)
     return AddAWBSequenceResponse(
             success=True,
             message="AWB sequences added successfully",
@@ -121,7 +123,7 @@ async def revert_dock_in(
 
 # -------------------------------------------
 
-@router.get("/by-date", response_model=ExportSlotFileListResponse)
+@router.get("/by-date", response_model=ExportSlotFileListResponseForDock)
 async def get_export_slots_by_date(
     date: Optional[datetime] = Query(None, description="Date (UTC, defaults to today)"),
     limit: Optional[int] = Query(None, ge=1, le=100, description="Number of records per page (optional)"),
@@ -143,12 +145,27 @@ async def get_export_slots_by_date(
             dockOut=isdockOut
         )
 
+        if not data:
+            return {
+                "success": True,
+                "message": "No records found for the selected date.",
+                "data": [],
+                "pagination": pagination,
+            }
+
         return {
             "success": True,
             "message": f"Fetched {len(data)} record(s) successfully for the selected date.",
             "data": data,
             "pagination": pagination,
         }
+
+        # return {
+        #     "success": True,
+        #     "message": f"Fetched {len(data)} record(s) successfully for the selected date.",
+        #     "data": data,
+        #     "pagination": pagination,
+        # }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching date-based data: {str(e)}")

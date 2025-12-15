@@ -192,7 +192,7 @@ async def update_truck_in_time(
 ):
     service = ExportSlotService()
 
-    print("🚚 Marking truck in:", request.truck_number, request.token_no, request.truck_slot_from)
+    print("🚚 Marking truck in:", request.truck_number, request.token_no, request.truck_slot_from,request)
     
     unresolved_slots = await service.get_unresolved_truck_ins(db, request.truck_number)
     print("⚠️ Unresolved slots:", unresolved_slots)
@@ -224,7 +224,7 @@ async def update_truck_in_time(
     emp_id = request.emp_id if request.emp_id else current_user.emp_id
     print('--------------------------------',emp_id)
     slot_record = await service.mark_truck_in(
-        db, request.truck_number, request.token_no, request.truck_slot_from, emp_id
+        db, request.truck_number, request.token_no, request.truck_slot_from, emp_id,request.truck_in_device
     )
     if not slot_record:
         return {
@@ -254,8 +254,9 @@ async def update_truck_out_time(
     current_user: UserRead = Depends(verify_token_and_get_user),
 ):
     emp_id = request.emp_id if request.emp_id else current_user.emp_id
-
-    slot_record, message = await mark_truck_out(db, request.truck_number, request.truck_slot_from, emp_id)
+    print("emp_id",emp_id)
+    print("current_user emp_id",current_user.emp_id)
+    slot_record, message = await mark_truck_out(db, request.truck_number, request.truck_slot_from,request.truck_out_device, emp_id)
 
     if not slot_record:
         return {
