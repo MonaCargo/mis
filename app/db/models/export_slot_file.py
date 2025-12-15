@@ -349,7 +349,7 @@ class ExportSlotAWB(Base):
     # 🔥 MANY-TO-MANY with dock session
     dock_operations = relationship(
         "AWBDockOperation",
-        secondary="dock_operation_awb_link",
+        secondary="export_dock_operation_awb_link",
         back_populates="awbs"
     )
 
@@ -365,7 +365,7 @@ class ExportSlotAWB(Base):
 # 3) Dock Operation Session (Can have multiple AWBs)
 # ----------------------------------------------------
 class AWBDockOperation(Base):
-    __tablename__ = "awb_dock_operation"
+    __tablename__ = "export_awb_dock_operation"
 
     id = Column(Integer, primary_key=True, index=True)
     dock_number = Column(String, nullable=False)
@@ -386,7 +386,7 @@ class AWBDockOperation(Base):
     # 🔥 Multiple AWBs inside same dock session
     awbs = relationship(
         "ExportSlotAWB",
-        secondary="dock_operation_awb_link",
+        secondary="export_dock_operation_awb_link",
         back_populates="dock_operations"
     )
 
@@ -400,7 +400,7 @@ class AWBDockOperation(Base):
 
 
     __table_args__ = (
-        Index('idx_dock_date', 'dock_number', 'dock_in_date_time'),
+        Index('idx_export_dock_date', 'dock_number', 'dock_in_date_time'),
     )
 
 
@@ -408,10 +408,10 @@ class AWBDockOperation(Base):
 # 4) Link Table → Dock Session <-> AWB Mapping
 # ----------------------------------------------------
 class DockOperationAWBLink(Base):
-    __tablename__ = "dock_operation_awb_link"
+    __tablename__ = "export_dock_operation_awb_link"
 
     id = Column(Integer, primary_key=True, index=True)
-    dock_operation_id = Column(Integer, ForeignKey("awb_dock_operation.id", ondelete="CASCADE"))
+    dock_operation_id = Column(Integer, ForeignKey("export_awb_dock_operation.id", ondelete="CASCADE"))
     awb_record_id = Column(Integer, ForeignKey("export_slot_awb.id", ondelete="CASCADE"))
 
 
@@ -419,11 +419,11 @@ class DockOperationAWBLink(Base):
 # 5) Sequence / Scan Table (Every single scan event)
 # ----------------------------------------------------
 class AWBSequence(Base):
-    __tablename__ = "awb_sequence"
+    __tablename__ = "export_awb_sequence"
 
     id = Column(Integer, primary_key=True, index=True)
     awb_record_id = Column(Integer, ForeignKey("export_slot_awb.id", ondelete="CASCADE"))
-    dock_operation_id = Column(Integer, ForeignKey("awb_dock_operation.id", ondelete="SET NULL"))
+    dock_operation_id = Column(Integer, ForeignKey("export_awb_dock_operation.id", ondelete="SET NULL"))
 
     seq_number = Column(String, nullable=False)
     seq_time = Column(DateTime(timezone=True), nullable=False)
@@ -439,6 +439,6 @@ class AWBSequence(Base):
     dock_operation = relationship("AWBDockOperation", back_populates="sequences")
 
     __table_args__ = (
-        Index('idx_awb_record_id_seq_number', 'awb_record_id', 'seq_number'),
-        Index('idx_dock_operation_seq', 'dock_operation_id', 'seq_number'),
+        Index('idx_export_awb_record_id_seq_number', 'awb_record_id', 'seq_number'),
+        Index('idx_export_dock_operation_seq', 'dock_operation_id', 'seq_number'),
     )
