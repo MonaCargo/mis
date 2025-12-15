@@ -19,13 +19,13 @@
 # def ensure_utc_aware(dt):
 #     """Convert pandas Timestamp to tz-aware UTC datetime."""
 #     if pd.isnull(dt):
-#         return None
+#         return NoneŚ
 #     if dt.tzinfo is None:
 #         return dt.tz_localize("UTC")
 #     return dt.tz_convert("UTC")
 
 # def generate_token_number(db_count: int, prefix: str = "DCSC") -> str:
-#     """Generate a unique token number like DCSC20251103001 based on DB count."""
+#     """Generate a unique token number like DCŚSC20251103001 based on DB count."""
 #     today = datetime.utcnow().strftime("%Y%m%d")
 #     base = f"{prefix}{today}"
 #     serial = f"{db_count + 1:03d}"
@@ -292,12 +292,12 @@ def ensure_utc_aware(dt):
         return dt.tz_localize("UTC")
     return dt.tz_convert("UTC")
 
-def generate_token_number(db_count: int, prefix: str = "DCSC") -> str:
+def generate_token_number(db_count: int, prefix: str = "M") -> str:
     """Generate a unique token number like DCSC20251103001 based on DB count."""
     ist = pytz.timezone('Asia/Kolkata')
     today = datetime.now(ist).strftime("%Y%m%d")
     base = f"{prefix}{today}"
-    serial = f"{db_count + 1:03d}"
+    serial = f"{db_count + 1:04d}"
     return f"{base}{serial}"
 
 # ---  Mian Handler-----------------------
@@ -400,7 +400,7 @@ async def handle_manual_file_upload(file: UploadFile, db: AsyncSession) -> dict:
                     }
 
                 # Count existing tokens for today once
-                today_prefix = f"DCSC{datetime.utcnow().strftime('%Y%m%d')}"
+                today_prefix = f"M{datetime.utcnow().strftime('%Y%m%d')}"
                 count_result = await db.execute(
                     select(ExportManualSlotFileRecord.token_number).where(
                         ExportManualSlotFileRecord.token_number.like(f"{today_prefix}%")
@@ -558,6 +558,7 @@ async def mark_truck_in(
     tc_no: str,
     emp_id: str,
     truck_number: str,
+    truck_in_device:Optional[str] =None
 ) -> ExportManualSlotFileRecordResponse | None:
 
     try:
@@ -600,6 +601,7 @@ async def mark_truck_in(
         record.is_truck_in = True
         record.truck_number = truck_number
         record.updated_at = utc_now
+        record.truck_in_device = truck_in_device
 
         # ====== INSERT INTO export_slot_file TABLE ======
         stmt = insert(ExportSlotFileRecord).values(
@@ -610,22 +612,31 @@ async def mark_truck_in(
             truck_number=truck_number,
             status="BOOKED",
             remarks="Manual Slot - Truck In",
-            cargo_type=None,
+            cargo_type='M_NORMAL',
             rescheduled=None,
             rescheduled_by=None,
             truck_slot_from=record.merge_datetime,
             truck_in_date_time=record.truck_in_date_time,
             is_truck_in=True,
-            dock_in_date_time=None,
-            dock_out_date_time=None,
-            is_dock_in=False,
-            is_dock_out=False,
             is_truck_out=False,
-            dock_number=None,
-            truck_in_by=emp_id,
+            # is_dock_in=False,
+            # is_dock_out=False,
+            # dock_in_date_time=None,
+            # dock_out_date_time=None,
+            # dock_in_by=None,
+            # dock_out_by=None,
+            # dock_number=None,
+            current_dock_in_date_time=None,
+            current_dock_out_date_time=None,
+            current_is_dock_in=False,
+            current_is_dock_out=False,
+                 current_dock_number=None,
+            current_dock_in_by=None,
+            current_dock_out_by=None,
+            truck_in_device = truck_in_device,
+
             truck_out_by=None,
-            dock_in_by=None,
-            dock_out_by=None,
+            truck_in_by=emp_id,
         ).returning(ExportSlotFileRecord.id)
 
         export_result = await db.execute(stmt)

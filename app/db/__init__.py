@@ -17,6 +17,10 @@ __all__ = [
     'ImportWhereHouseInventry',
     'ExportManualSlotFileRecord',
     'DockAvailability',
+
+    'DockOperationAWBLink',
+    'AWBDockOperation',
+    
     'OcReport',
     'IrrReport',
     'Irregularity',

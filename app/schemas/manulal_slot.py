@@ -20,6 +20,7 @@ class ExportManualSlotFileRecordBase(BaseModel):
     truck_out_date_time: Optional[datetime] = None
     dock_in_date_time: Optional[datetime] = None
     dock_out_date_time: Optional[datetime] = None
+    
 
     # Status flags
     is_truck_in: bool = False
@@ -30,6 +31,8 @@ class ExportManualSlotFileRecordBase(BaseModel):
     # Dock/Truck info
     dock_number: Optional[str] = None
     truck_in_by: Optional[str] = None
+    truck_in_device:Optional[str] = None
+
     truck_out_by: Optional[str] = None
     dock_in_by: Optional[str] = None
     dock_out_by: Optional[str] = None
@@ -62,4 +65,5 @@ class TruckInRequest(BaseModel):
     token_no: str
     tc_no: str
     truck_number: str
+    truck_in_device:Optional[str] = None
     emp_id: str

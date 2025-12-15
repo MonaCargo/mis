@@ -261,7 +261,7 @@ from sqlalchemy import and_, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 import pandas as pd
 
-from app.db.models.export_slot_file import AWBSequence, ExportSlotFileRecord, ExportSlotAWB
+from app.db.models.export_slot_file import AWBDockOperation, AWBSequence, ExportSlotFileRecord, ExportSlotAWB
 from app.schemas.base import Pagination
 from app.schemas.export_slot_file import AWBEntry, ExportSlotDownloadResponse, ExportSlotFullResponse
 from app.utils.cleaner import clean_file
@@ -510,17 +510,31 @@ async def get_export_slots_by_specific_date(
         # conditions.append(ExportSlotFileRecord.is_dock_out == True)
         conditions.append(ExportSlotFileRecord.is_truck_in == True)
 
+    # stmt = (
+    #     select(ExportSlotFileRecord)
+    #     .options(selectinload(ExportSlotFileRecord.awbs)
+    #              .selectinload(ExportSlotAWB.sequences))
+    #     .where(
+    #         and_(
+    #             *conditions
+    #         )
+    #     )
+    #     .order_by(ExportSlotFileRecord.truck_slot_from.desc())
+    # )
+
     stmt = (
-        select(ExportSlotFileRecord)
-        .options(selectinload(ExportSlotFileRecord.awbs)
-                 .selectinload(ExportSlotAWB.sequences))
-        .where(
-            and_(
-                *conditions
-            )
-        )
-        .order_by(ExportSlotFileRecord.truck_slot_from.desc())
+    select(ExportSlotFileRecord)
+    .options(
+        selectinload(ExportSlotFileRecord.awbs)
+            .selectinload(ExportSlotAWB.sequences),
+        selectinload(ExportSlotFileRecord.awbs)
+            .selectinload(ExportSlotAWB.dock_operations)
+            .selectinload(AWBDockOperation.sequences),
     )
+    .where(and_(*conditions))
+    .order_by(ExportSlotFileRecord.truck_slot_from.desc())
+)
+
 
     # Pagination defaults
     if limit is None:
@@ -845,7 +859,7 @@ class ExportSlotService:
         return unresolved_stmt.all() 
 
     @staticmethod
-    async def mark_truck_in(db: AsyncSession, truck_number: str, token_no: str, truck_slot_from: datetime,emp_id: str ):
+    async def mark_truck_in(db: AsyncSession, truck_number: str, token_no: str, truck_slot_from: datetime,emp_id: str,truck_in_device: Optional[str] = None ):
         """Marks the truck in for a given slot. Returns the slot record object or None."""
         slot_stmt = await db.execute(
             select(ExportSlotFileRecord)
@@ -865,6 +879,7 @@ class ExportSlotService:
         slot_record.truck_in_date_time = now_utc
         slot_record.is_truck_in = True
         slot_record.truck_in_by = emp_id  # ✅ Set the user who marked i
+        slot_record.truck_in_device = truck_in_device  
         db.add(slot_record)
         await db.commit()
         await db.refresh(slot_record)
@@ -874,7 +889,7 @@ class ExportSlotService:
 
 
 
-async def mark_truck_out(db: AsyncSession, truck_number: str, truck_slot_from: datetime, emp_id: str):
+async def mark_truck_out(db: AsyncSession, truck_number: str, truck_slot_from: datetime,emp_id: str,truck_out_device: Optional[str] = None):
     """Marks the truck out for a given slot. Returns (slot_record, message)."""
 
     # Fetch the latest matching slot for the truck and slot time
@@ -909,6 +924,7 @@ async def mark_truck_out(db: AsyncSession, truck_number: str, truck_slot_from: d
     slot_record.truck_out_date_time = now_utc
     slot_record.is_truck_out = True
     slot_record.truck_out_by = emp_id
+    slot_record.truck_out_device = truck_out_device 
 
     db.add(slot_record)
     await db.commit()
@@ -918,103 +934,125 @@ async def mark_truck_out(db: AsyncSession, truck_number: str, truck_slot_from: d
 
 
 
+# ------------------------------------------
 
+
+@staticmethod
 async def get_daily_summary(db: AsyncSession, summary_date: date):
-    """Fetch daily summary of truck and dock activity for a given date."""
-
-    # Convert date to start/end datetime in UTC
+    """
+    Daily summary using NEW dock session model (AWBDockOperation).
+    """
     start_dt = datetime.combine(summary_date, time.min, tzinfo=timezone.utc)
     end_dt = datetime.combine(summary_date, time.max, tzinfo=timezone.utc)
 
     try:
-        # 1️⃣ Trucks that came IN on this date
-        result_in = await db.execute(
-            select(func.count(ExportSlotFileRecord.id)).where(
-                ExportSlotFileRecord.truck_in_date_time.between(start_dt, end_dt)
+        # -------------------- 1) TRUCK IN --------------------
+        truck_in_count = (
+            await db.execute(
+                select(func.count(ExportSlotFileRecord.id)).where(
+                    ExportSlotFileRecord.truck_in_date_time.between(start_dt, end_dt)
+                )
             )
-        )
-        truck_in_count = result_in.scalar() or 0
+        ).scalar() or 0
 
-        # 2️⃣ Trucks that went OUT on this date
-        result_out = await db.execute(
-            select(func.count(ExportSlotFileRecord.id)).where(
-                ExportSlotFileRecord.truck_out_date_time.between(start_dt, end_dt)
+
+        # -------------------- 2) TRUCK OUT --------------------
+        truck_out_count = (
+            await db.execute(
+                select(func.count(ExportSlotFileRecord.id)).where(
+                    ExportSlotFileRecord.truck_out_date_time.between(start_dt, end_dt)
+                )
             )
-        )
-        truck_out_count = result_out.scalar() or 0
+        ).scalar() or 0
 
-        # 3️⃣ Dock IN activities on this date
-        result_dock_in = await db.execute(
-            select(func.count(ExportSlotFileRecord.id)).where(
-                ExportSlotFileRecord.dock_in_date_time.between(start_dt, end_dt)
+
+        # -------------------- 3) DOCK IN events --------------------
+        dock_in_count = (
+            await db.execute(
+                select(func.count(AWBDockOperation.id)).where(
+                    AWBDockOperation.dock_in_date_time.between(start_dt, end_dt)
+                )
             )
-        )
-        dock_in_count = result_dock_in.scalar() or 0
+        ).scalar() or 0
 
-        # 4️⃣ Dock OUT activities on this date
-        result_dock_out = await db.execute(
-            select(func.count(ExportSlotFileRecord.id)).where(
-                ExportSlotFileRecord.dock_out_date_time.between(start_dt, end_dt)
+
+        # -------------------- 4) DOCK OUT events --------------------
+        dock_out_count = (
+            await db.execute(
+                select(func.count(AWBDockOperation.id)).where(
+                    AWBDockOperation.dock_out_date_time.between(start_dt, end_dt)
+                )
             )
-        )
-        dock_out_count = result_dock_out.scalar() or 0
+        ).scalar() or 0
 
-        # 5️⃣ Calculate SCANNED PCS (AWB Sequences) for this date
-        result_scanned = await db.execute(
-            select(func.count(AWBSequence.id)).where(
-                AWBSequence.seq_time.between(start_dt, end_dt)
+
+        # -------------------- 5) TOTAL SCANNED PCS --------------------
+        scanned_pcs = (
+            await db.execute(
+                select(func.count(AWBSequence.id)).where(
+                    AWBSequence.seq_time.between(start_dt, end_dt)
+                )
             )
-        )
-        scanned_pcs = result_scanned.scalar() or 0
+        ).scalar() or 0
 
-        # 6️⃣ Total PCS scheduled for this date (from AWBs linked to slots)
-        result_total_pcs = await db.execute(
-            select(func.coalesce(func.sum(ExportSlotAWB.pcs), 0))
-            .join(ExportSlotFileRecord, ExportSlotAWB.export_slot_id == ExportSlotFileRecord.id)
+
+        # -------------------- 6) TOTAL PCS SCHEDULED --------------------
+        total_pcs = (
+            await db.execute(
+                select(func.coalesce(func.sum(ExportSlotAWB.pcs), 0))
+                .join(ExportSlotFileRecord,
+                      ExportSlotAWB.export_slot_id == ExportSlotFileRecord.id)
+                .where(
+                    ExportSlotFileRecord.truck_in_date_time.between(start_dt, end_dt)
+                )
+            )
+        ).scalar() or 0
+
+        # 6️⃣ Count additional PCS scanned (only for additional AWBs)
+        result_additional_scanned = await db.execute(
+            select(func.count(AWBSequence.id))
+            .join(ExportSlotAWB, ExportSlotAWB.id == AWBSequence.awb_record_id)
             .where(
-                or_(
-                    ExportSlotFileRecord.truck_in_date_time.between(start_dt, end_dt),
-                    ExportSlotFileRecord.dock_in_date_time.between(start_dt, end_dt)
+                and_(
+                    ExportSlotAWB.is_additional == True,
+                    AWBSequence.seq_time.between(start_dt, end_dt)
                 )
             )
         )
-        total_pcs = result_total_pcs.scalar() or 0
 
-        # 7️⃣ Boolean flag counts (cross‑verification)
-        result_flags = await db.execute(
-            select(
-                func.count(ExportSlotFileRecord.id).filter(ExportSlotFileRecord.is_truck_in == True),
-                func.count(ExportSlotFileRecord.id).filter(ExportSlotFileRecord.is_truck_out == True),
-                func.count(ExportSlotFileRecord.id).filter(ExportSlotFileRecord.is_dock_in == True),
-                func.count(ExportSlotFileRecord.id).filter(ExportSlotFileRecord.is_dock_out == True),
-            ).where(
-                or_(
-                    ExportSlotFileRecord.truck_in_date_time.between(start_dt, end_dt),
-                    ExportSlotFileRecord.truck_out_date_time.between(start_dt, end_dt),
-                    ExportSlotFileRecord.dock_in_date_time.between(start_dt, end_dt),
-                    ExportSlotFileRecord.dock_out_date_time.between(start_dt, end_dt),
+        additional_scanned_pcs = result_additional_scanned.scalar() or 0
+
+        # -------------------- 7) FLAG COUNT CHECKS --------------------
+        flag_counts = (
+            await db.execute(
+                select(
+                    func.count().filter(ExportSlotFileRecord.is_truck_in == True),
+                    func.count().filter(ExportSlotFileRecord.is_truck_out == True),
+                    func.count().filter(ExportSlotFileRecord.current_is_dock_in == True),
+                    func.count().filter(ExportSlotFileRecord.current_is_dock_out == True),
                 )
             )
-        )
-        flag_counts = result_flags.first() or (0, 0, 0, 0)
-        truck_in_by_flags, truck_out_by_flags, dock_in_by_flags, dock_out_by_flags = flag_counts
+        ).first() or (0,0,0,0)
+
+        truck_in_flag, truck_out_flag, dock_in_flag, dock_out_flag = flag_counts
+
 
         return {
             "summary": {
                 "truck_in": truck_in_count,
                 "truck_out": truck_out_count,
-                "dock_in": dock_in_count,
-                "dock_out": dock_out_count,
+                "dock_in": dock_in_count,         # <-- ACCURATE
+                "dock_out": dock_out_count,       # <-- ACCURATE
                 "total_pcs": total_pcs,
                 "scanned_pcs": scanned_pcs,
+                "additional_scanned_pcs": additional_scanned_pcs,
 
-                # Cross‑verification using flags
-                "truck_in_by_flags": truck_in_by_flags,
-                "truck_out_by_flags": truck_out_by_flags,
-                "dock_in_by_flags": dock_in_by_flags,
-                "dock_out_by_flags": dock_out_by_flags,
 
-                # Date range used for query
+                "truck_in_flag": truck_in_flag,
+                "truck_out_flag": truck_out_flag,
+                "dock_in_flag": dock_in_flag,
+                "dock_out_flag": dock_out_flag,
+
                 "query_start": start_dt.isoformat(),
                 "query_end": end_dt.isoformat(),
             }
@@ -1022,4 +1060,112 @@ async def get_daily_summary(db: AsyncSession, summary_date: date):
 
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error fetching daily summary: {str(e)}")
+        raise HTTPException(500, f"Error fetching daily summary: {str(e)}")
+
+
+
+
+# async def get_daily_summary(db: AsyncSession, summary_date: date):
+#     """Fetch daily summary of truck and dock activity for a given date."""
+
+#     # Convert date to start/end datetime in UTC
+#     start_dt = datetime.combine(summary_date, time.min, tzinfo=timezone.utc)
+#     end_dt = datetime.combine(summary_date, time.max, tzinfo=timezone.utc)
+
+#     try:
+#         # 1️⃣ Trucks that came IN on this date
+#         result_in = await db.execute(
+#             select(func.count(ExportSlotFileRecord.id)).where(
+#                 ExportSlotFileRecord.truck_in_date_time.between(start_dt, end_dt)
+#             )
+#         )
+#         truck_in_count = result_in.scalar() or 0
+
+#         # 2️⃣ Trucks that went OUT on this date
+#         result_out = await db.execute(
+#             select(func.count(ExportSlotFileRecord.id)).where(
+#                 ExportSlotFileRecord.truck_out_date_time.between(start_dt, end_dt)
+#             )
+#         )
+#         truck_out_count = result_out.scalar() or 0
+
+#         # 3️⃣ Dock IN activities on this date
+#         result_dock_in = await db.execute(
+#             select(func.count(ExportSlotFileRecord.id)).where(
+#                 ExportSlotFileRecord.dock_in_date_time.between(start_dt, end_dt)
+#             )
+#         )
+#         dock_in_count = result_dock_in.scalar() or 0
+
+#         # 4️⃣ Dock OUT activities on this date
+#         result_dock_out = await db.execute(
+#             select(func.count(ExportSlotFileRecord.id)).where(
+#                 ExportSlotFileRecord.dock_out_date_time.between(start_dt, end_dt)
+#             )
+#         )
+#         dock_out_count = result_dock_out.scalar() or 0
+
+#         # 5️⃣ Calculate SCANNED PCS (AWB Sequences) for this date
+#         result_scanned = await db.execute(
+#             select(func.count(AWBSequence.id)).where(
+#                 AWBSequence.seq_time.between(start_dt, end_dt)
+#             )
+#         )
+#         scanned_pcs = result_scanned.scalar() or 0
+
+#         # 6️⃣ Total PCS scheduled for this date (from AWBs linked to slots)
+#         result_total_pcs = await db.execute(
+#             select(func.coalesce(func.sum(ExportSlotAWB.pcs), 0))
+#             .join(ExportSlotFileRecord, ExportSlotAWB.export_slot_id == ExportSlotFileRecord.id)
+#             .where(
+#                 or_(
+#                     ExportSlotFileRecord.truck_in_date_time.between(start_dt, end_dt),
+#                     ExportSlotFileRecord.dock_in_date_time.between(start_dt, end_dt)
+#                 )
+#             )
+#         )
+#         total_pcs = result_total_pcs.scalar() or 0
+
+#         # 7️⃣ Boolean flag counts (cross‑verification)
+#         result_flags = await db.execute(
+#             select(
+#                 func.count(ExportSlotFileRecord.id).filter(ExportSlotFileRecord.is_truck_in == True),
+#                 func.count(ExportSlotFileRecord.id).filter(ExportSlotFileRecord.is_truck_out == True),
+#                 func.count(ExportSlotFileRecord.id).filter(ExportSlotFileRecord.is_dock_in == True),
+#                 func.count(ExportSlotFileRecord.id).filter(ExportSlotFileRecord.is_dock_out == True),
+#             ).where(
+#                 or_(
+#                     ExportSlotFileRecord.truck_in_date_time.between(start_dt, end_dt),
+#                     ExportSlotFileRecord.truck_out_date_time.between(start_dt, end_dt),
+#                     ExportSlotFileRecord.dock_in_date_time.between(start_dt, end_dt),
+#                     ExportSlotFileRecord.dock_out_date_time.between(start_dt, end_dt),
+#                 )
+#             )
+#         )
+#         flag_counts = result_flags.first() or (0, 0, 0, 0)
+#         truck_in_by_flags, truck_out_by_flags, dock_in_by_flags, dock_out_by_flags = flag_counts
+
+#         return {
+#             "summary": {
+#                 "truck_in": truck_in_count,
+#                 "truck_out": truck_out_count,
+#                 "dock_in": dock_in_count,
+#                 "dock_out": dock_out_count,
+#                 "total_pcs": total_pcs,
+#                 "scanned_pcs": scanned_pcs,
+
+#                 # Cross‑verification using flags
+#                 "truck_in_by_flags": truck_in_by_flags,
+#                 "truck_out_by_flags": truck_out_by_flags,
+#                 "dock_in_by_flags": dock_in_by_flags,
+#                 "dock_out_by_flags": dock_out_by_flags,
+
+#                 # Date range used for query
+#                 "query_start": start_dt.isoformat(),
+#                 "query_end": end_dt.isoformat(),
+#             }
+#         }
+
+#     except Exception as e:
+#         await db.rollback()
+#         raise HTTPException(status_code=500, detail=f"Error fetching daily summary: {str(e)}")
