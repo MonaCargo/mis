@@ -5,7 +5,7 @@ from sqlalchemy.orm import declarative_base
 from app.db.base import Base
 
 class DockAvailability(Base):
-    __tablename__ = "dock_availability"
+    __tablename__ = "export_dock_availability"
 
     id = Column(Integer, primary_key=True, index=True)
     dock_no = Column(String(50), unique=True, nullable=False, index=True)
