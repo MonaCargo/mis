@@ -71,7 +71,13 @@ class OcMergeGatepassService:
                     and_(
                         OcMergeGatePass.integrate_date_time >= start_date,
                         OcMergeGatePass.integrate_date_time <= end_date
-                    )
+                    ),
+          # ❌ EXCLUDE rows where all three fields are NULL
+            ~(
+                (OcMergeGatePass.weight_in_kgs.is_(None)) &
+                (OcMergeGatePass.chg_wgt_in_kg.is_(None)) &
+                (OcMergeGatePass.location.is_(None))
+            )
                 )
                 .order_by(OcMergeGatePass.igp_print_date_time.desc())
             )

@@ -12,11 +12,13 @@ from .manual_slot_file import router as manual_slot_file_router
 from .dock_availability import router as dock_availability_router
 from .app_version import router as app_version_router
 
+from .importOperation.temp_irm_oc_merge_creation import router as temp_irm_oc_merge_creation
+
 # You can add more routes here as your app grows
 
 api_v1_router = APIRouter()
 
-# Include individual route modules
+#======= Include individual route modules
 api_v1_router.include_router(user_router, prefix="/users", tags=["Users"])
 api_v1_router.include_router(auth_router, prefix="/auth", tags=["Auth"])
 api_v1_router.include_router(dock_router, prefix="/dock", tags=["DOCK"])
@@ -27,14 +29,20 @@ api_v1_router.include_router(dock_availability_router, prefix="/dockAvailability
 
 
 
-# IMPORT OPERATION RELATED ROUTER
+#======= IMPORT OPERATION RELATED ROUTER
 api_v1_router.include_router(import_release_report, prefix="/import", tags=["Import release report"])
 api_v1_router.include_router(import_wherehouse_inventry, prefix="/import", tags=["import_wherehouse_inventry"])
 api_v1_router.include_router(oc_report, prefix="/import", tags=["oc-report"])
 api_v1_router.include_router(irregularity_report, prefix="/import", tags=["irregularities-report"])
 api_v1_router.include_router(oc_merge_gatepass, prefix="/import", tags=["oc-merge-gatepass-report"])
 
+# ---> Fast Track TEMP IRM OC MERGE
+api_v1_router.include_router(temp_irm_oc_merge_creation, prefix="/import", tags=["Fast Track TEMP IRM OC MERGE"])
 
-# app verion route
+# ---> 
+
+
+
+#======= app verion route
 api_v1_router.include_router(app_version_router, prefix="/version", tags=["App Version"])
 
