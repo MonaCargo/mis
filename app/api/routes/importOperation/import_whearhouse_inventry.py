@@ -95,7 +95,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.user import User
 
-router = APIRouter(prefix="/import-wherehouse-inventry", tags=[])
+router = APIRouter(prefix="/import-wherehouse-inventry", tags=[""])
 
 @router.post("/upload")
 async def process_airway_bill_file(

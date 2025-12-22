@@ -20,6 +20,7 @@ class OcMergeGatePassCreate(BaseModel):
     chg_wgt_in_kg : Optional[float]
     location: Optional[str]
     oc_no: str
+    temp_irm_oc_no: Optional[str]
     irregularity_remarks: Optional[str]
     pd_in_time: Optional[datetime]
     no_of_pc_recd: Optional[int]
