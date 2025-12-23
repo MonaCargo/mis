@@ -1,5 +1,6 @@
+import re
 import pandas as pd
-from typing import BinaryIO
+from typing import BinaryIO, Optional
 from fastapi import HTTPException
 from datetime import datetime
 import pytz
@@ -42,16 +43,19 @@ def normalize_awb_no(awb: any) -> str | None:
 # ======================================================
 # HAWB NORMALIZATION (OPTIONAL)
 # ======================================================
-def normalize_hawb_no(hawb: any) -> str | None:
-    if pd.isna(hawb) or hawb is None:
+
+def normalize_hawb_no(value) -> Optional[str]:
+    if value is None or pd.isna(value):
         return None
 
-    hawb_str = str(hawb).strip().upper()
+    value = str(value).strip()
 
-    if hawb_str in {"", "NAN", "NONE", "NULL", "N/A"}:
+    if value.upper() in {"", "NAN", "NONE", "NULL", "N/A"}:
         return None
 
-    return hawb_str
+    cleaned = re.sub(r'\s.*$', '', value)
+
+    return cleaned if cleaned else None
 
 
 # ======================================================

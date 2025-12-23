@@ -806,15 +806,48 @@ async def generate_and_save_gatepass(
         })
         records = result.fetchall()
 
+        # ─────────────────────────────────────────────
+        # NEW STEP: Skip OCs already in irr_report
+        # ─────────────────────────────────────────────
+
+        oc_list = [r.oc_no for r in records]
+
+        if oc_list:
+            irr_query = text("""
+                SELECT DISTINCT oc_num 
+                FROM irr_report
+                WHERE oc_num = ANY(:oc_list)
+            """)
+
+            irr_res = await db.execute(irr_query, {"oc_list": oc_list})
+            irr_set = {str(row.oc_num) for row in irr_res.fetchall()}
+        else:
+            irr_set = set()
+
+        # Filter OUT records that are already processed in irr_report
+        records = [r for r in records if str(r.oc_no) not in irr_set]
+
+        # If EVERYTHING was filtered → return early
         if not records:
             return OcMergeGatePassListResponse(
                 success=True,
-                message="No OC records found",
+                message="All OCs already exist in irr_report — nothing to process.",
                 data=[],
                 total_processed=0,
                 execution_time=round(time.time() - start_time, 2),
                 igp_range="None"
             )
+
+
+        # if not records:
+        #     return OcMergeGatePassListResponse(
+        #         success=True,
+        #         message="No OC records found",
+        #         data=[],
+        #         total_processed=0,
+        #         execution_time=round(time.time() - start_time, 2),
+        #         igp_range="None"
+        #     )
 
         # ─────────────────────────────────────────────
         # 3️⃣ TEMP OC lookup (AWB + HAWB safe)
