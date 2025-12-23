@@ -119,6 +119,13 @@ def clean_and_parse_oc_report(file, file_type: str) -> pd.DataFrame:
 
     # Apply UTC conversion
     df["integrate_date_time"] = df["integrate_date_time"].apply(to_utc)
+
+    # ❗ Validate missing integrate_date_time
+    missing = df[df["integrate_date_time"].isna()]
+    if not missing.empty:
+        raise ValueError(
+            f"{len(missing)} rows have missing or invalid INTEGRATE DATE & TIME."
+        )
     
     # Convert PCS to integer, handle NaN
      # ✅ Convert PCS to integer, keep NULL if missing (don't default to 0)

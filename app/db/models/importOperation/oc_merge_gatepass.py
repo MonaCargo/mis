@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, String, Integer, Float, DateTime, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, Column, Index, String, Integer, Float, DateTime, Text, UniqueConstraint, func, text
 from app.db.base import Base
 
 
@@ -7,6 +7,14 @@ class OcMergeGatePass(Base):
 
     __table_args__ = (
         UniqueConstraint('oc_no', name='uq_oc_merge_gatepass_oc_no'),
+
+        Index(
+        'uq_awb_hawb',
+        "awb_no",
+        func.coalesce(text("hawb"), ''),
+        unique=True
+    ),  
+     # Ensure unique AWB and HAWB combination for temp_oc_merge unique insertion 💀💀💀
     )
 
 
@@ -18,10 +26,14 @@ class OcMergeGatePass(Base):
     hawb = Column(String(50), nullable=True,default=None)
     flight_date = Column(DateTime(timezone=True), nullable=True)
     no_of_pc = Column(Integer, nullable=True)
-    weight_in_kgs = Column(Float, nullable=True) # 
+    weight_in_kgs = Column(Float, nullable=True) #  it is grass weight
     chg_wgt_in_kg = Column(Float, nullable=True)   # <--- NEW FIELD (NULLABLE)
     location = Column(Text, nullable=True)
     oc_no = Column(String(50), nullable=False)
+
+    temp_irm_oc_no = Column(String(50), nullable=True) # it is temporary oc no. fast track oc no.
+    is_temp_irm_oc = Column(Boolean, default=False, nullable=False)  # To identify temp IRM OCs
+
     irregularity_remarks = Column(Text, nullable=True)
     pd_in_time = Column(DateTime(timezone=True), nullable=True)
     no_of_pc_recd = Column(Integer, nullable=True)
@@ -45,6 +57,9 @@ class OcMergeGatePass(Base):
         # server_default=text("TIMEZONE('UTC', NOW())"),
         # onupdate=func.timezone('utc', func.now())  # Changed this line
     )
+
+    # 🆕 AUDIT FIELDS (it give which process and  when is get by created at)
+    uploaded_by = Column(String(100), nullable=True, default=None)  # emp_id 
 
     integrate_date_time = Column(DateTime(timezone=True), nullable=True,index=True)  # ✅ NEW FIELD
 
