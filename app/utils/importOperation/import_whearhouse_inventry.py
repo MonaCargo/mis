@@ -37,12 +37,33 @@ REQUIRED_COLUMNS = {
 import re
 import pandas as pd
 
+# def normalize_hwb_no(value) -> str:
+#     """
+#     Normalize HWB number by removing trailing single letters (like P, M, etc.)
+#     Examples:
+#         'HCN1684061 P' -> 'HCN1684061'
+#         'HCN1684061P' -> 'HCN1684061'
+#         'HCN1684061' -> 'HCN1684061'
+#     """
+#     if not value or pd.isna(value):
+#         return None
+
+#     # Convert to string and strip whitespace
+#     value = str(value).strip()
+
+#     # Remove trailing single letter (with or without space before it)
+#     cleaned = re.sub(r'\s?[A-Za-z]$', '', value)
+#     return cleaned if cleaned else None
+
 def normalize_hwb_no(value) -> str:
     """
-    Normalize HWB number by removing trailing single letters (like P, M, etc.)
+    Normalize HWB number by removing any trailing characters
+    that come after a space at the end.
+    
     Examples:
         'HCN1684061 P' -> 'HCN1684061'
-        'HCN1684061P' -> 'HCN1684061'
+        'HCN1684061 123' -> 'HCN1684061'
+        'HCN1684061P' -> 'HCN1684061P'  # keep
         'HCN1684061' -> 'HCN1684061'
     """
     if not value or pd.isna(value):
@@ -51,8 +72,9 @@ def normalize_hwb_no(value) -> str:
     # Convert to string and strip whitespace
     value = str(value).strip()
 
-    # Remove trailing single letter (with or without space before it)
-    cleaned = re.sub(r'\s?[A-Za-z]$', '', value)
+    # Remove anything after a space at the end
+    cleaned = re.sub(r'\s.+$', '', value)
+
     return cleaned if cleaned else None
 
 # Test
