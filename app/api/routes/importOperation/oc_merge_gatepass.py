@@ -315,7 +315,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import case, func, literal_column, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 import re 
-from typing import List
+from typing import List, Optional
 import logging
 import time
 from datetime import datetime, timedelta
@@ -326,6 +326,7 @@ from app.db.session import get_db
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
 from app.schemas.importOperation.oc_merge_gatepass import (
     MarkPrintedRequest,
+    OCMergeGatePassGenericSearchResponseList,
     OcMergeGatePassListResponse,
     OcMergeGatePassResponse
     
@@ -1260,3 +1261,58 @@ async def mark_igp_printed(
         "updated_rows": updated_rows
     }
 
+
+# ------------------ Search api ------------------
+@router.get("/generic-search-irm", response_model=OCMergeGatePassGenericSearchResponseList)
+async def search_oc_merge_gatepass_generic(
+    type: str = Query(..., description="awb | hawb | oc_no | temp_oc"),
+    term: str = Query(..., description="Search term"),
+    db: AsyncSession = Depends(get_db),
+):
+    # Map frontend type → backend field
+
+    term = term.strip()
+
+    if not term:
+        raise HTTPException(
+            status_code=400,
+            detail="term cannot be empty or whitespace"
+        )
+
+    awb = hawb = oc_no = temp_oc = None
+    
+    if type == "awb":
+        awb = term
+    elif type == "hawb":
+        hawb = term
+    elif type == "oc_no":
+        oc_no = term
+    elif type == "temp_oc":
+        temp_oc = term
+    else:
+        raise HTTPException(400, "Invalid search type")
+
+    try:
+        records = await OcMergeGatepassService.search_in_oc_merge_data_generic(
+            db=db,
+            awb_no=awb,
+            hawb=hawb,
+            oc_no=oc_no,
+            temp_irm_oc_no=temp_oc
+        )
+
+        if not records:
+            return {
+                "data": [],
+                "message": "No any records found",
+                "success": True
+            }
+
+        return {
+            "data": records,
+            "message": "Data fetched successfully",
+            "success": True
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Internal server error: {e}")
