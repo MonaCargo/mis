@@ -1,11 +1,14 @@
 from datetime import datetime
 from typing import List
 from zoneinfo import ZoneInfo
+from fastapi import HTTPException
 from sqlalchemy import and_, select, update
 from app.db.models.importOperation.oc_report import OcReport
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models.user import User
+from app.schemas.user import UserRead
 from app.utils.common.helperFunction import get_utc_now
 
 class OcMergeGatepassService:
@@ -167,3 +170,57 @@ class OcMergeGatepassService:
         # updated_rows.sort(key=lambda x: x["igp_no"])
 
         return updated_rows
+
+
+
+# ======================= Generic search for oc merge --------
+    @staticmethod
+    async def search_in_oc_merge_data_generic(
+        db: AsyncSession,
+        awb_no: str = None,
+        hawb: str = None,
+        oc_no: str = None,
+        temp_irm_oc_no: str = None,
+    ):
+        # -----------------------------
+        # Choose filter condition
+        # -----------------------------
+        if awb_no:
+            filter_condition = OcMergeGatePass.awb_no == awb_no
+
+        elif hawb:
+            filter_condition = OcMergeGatePass.hawb == hawb
+
+        elif oc_no:
+            filter_condition = OcMergeGatePass.oc_no == oc_no
+
+        elif temp_irm_oc_no:
+            filter_condition = OcMergeGatePass.temp_irm_oc_no == temp_irm_oc_no
+
+        else:
+            raise HTTPException(400, "At least one search parameter required")
+
+        # -----------------------------
+        # SELECT all matching rows
+        # -----------------------------
+        stmt = select(OcMergeGatePass).where(filter_condition)
+        result = await db.execute(stmt)
+        records = result.scalars().all()   # ⭐ returns list, not just one
+
+        if not records:
+            return []   # return empty list (safe for your response_model)
+
+        # -----------------------------
+        # Attach user info for each record
+        # -----------------------------
+        for rec in records:
+            if rec.uploaded_by:
+                user_stmt = select(User).where(User.emp_id == rec.uploaded_by)
+                user_res = await db.execute(user_stmt)
+                user = user_res.scalars().first()
+
+                rec.user_info = UserRead.model_validate(user) if user else None
+            else:
+                rec.user_info = None
+
+        return records
