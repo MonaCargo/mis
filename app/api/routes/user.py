@@ -64,7 +64,7 @@
 
 
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependency import require_roles, verify_token_and_get_user
 from app.db.models.user import User
@@ -78,19 +78,33 @@ from app.services.user_service import (
     update_user_password,
     update_user_status
 )
+from app.utils.common.get_request_ip import get_request_ip
 
 router = APIRouter(prefix="", tags=["Users"])
 
 # Create a new user
 @router.post("/", response_model=UserCreateResponse)
 async def create_user(user: UserCreate, 
+                      request: Request, # this is used for getting ip it is come from fast api instance
                       db: AsyncSession = Depends(get_db),
                       current_user: User = Depends(verify_token_and_get_user)
+
                       ):
     existing_user = await get_user_by_emp_id(user.emp_id, db)
+
+     # Get IP address from request
+    ip_address = get_request_ip(request)
+    user_agent=request.headers.get("user-agent")
+    device_id = None
+
     if existing_user:
         raise HTTPException(status_code=400, detail="Employee ID already registered")
-    new_user = await create_user_service(user, db,created_by=current_user.emp_id)
+    new_user = await create_user_service(user,
+                                          db,created_by=current_user.emp_id,
+                                          changed_by_role = current_user.role,
+                                          ip_address=ip_address,       # 👈 PASS HERE
+                                            user_agent=user_agent,
+                                            device_id=device_id)
     return UserCreateResponse(success=True, message="User created successfully",  user=UserRead.model_validate(new_user))
 
 # Get a user by emp_id

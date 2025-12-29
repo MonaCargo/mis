@@ -13,7 +13,7 @@ from .dock_availability import router as dock_availability_router
 from .app_version import router as app_version_router
 
 from .importOperation.temp_irm_oc_merge_creation import router as temp_irm_oc_merge_creation
-
+from .importOperation.worker_assignment import router as worker_assignment
 # You can add more routes here as your app grows
 
 api_v1_router = APIRouter()
@@ -38,8 +38,9 @@ api_v1_router.include_router(oc_merge_gatepass, prefix="/import", tags=["oc-merg
 
 # ---> Fast Track TEMP IRM OC MERGE
 api_v1_router.include_router(temp_irm_oc_merge_creation, prefix="/import", tags=["Fast Track TEMP IRM OC MERGE"])
-
 # ---> 
+# worker assignment--->
+api_v1_router.include_router(worker_assignment, prefix="/import", tags=["worker assignment"])
 
 
 
