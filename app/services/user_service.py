@@ -4,6 +4,7 @@ from sqlalchemy import asc, desc, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.db.models.user import User
+from app.services.audit_log_user_service import log_user_audit
 from app.utils.auth_helper import hash_password
 
 async def get_user_by_emp_id(emp_id: str, db: AsyncSession):
@@ -100,11 +101,17 @@ async def get_all_users_paginated(
 
 
 
-async def create_user(user_data, db: AsyncSession,created_by):
+async def create_user(user_data, db: AsyncSession,created_by,
+                      changed_by_role:str,
+                      ip_address: str | None = None,
+    user_agent: str | None = None,
+    device_id: str | None = None,
+                      ):
     print(f"Password raw value (repr): {repr(user_data.password)}")
     print(f"Password length (chars): {len(user_data.password)}")
     print(f"Password length (bytes): {len(user_data.password.encode('utf-8'))}")
     hashed_pwd = hash_password(user_data.password)  # ✅ Hash the password
+
     new_user = User(
         emp_id=user_data.emp_id,
         name=user_data.name,
@@ -114,6 +121,26 @@ async def create_user(user_data, db: AsyncSession,created_by):
 
     )
     db.add(new_user)
+    await db.flush()  # 🔥 IMPORTANT (so ID is available)
+
+    # 🧾 AUDIT LOG
+    # 🧾 AUDIT LOG (CORRECT)
+    await log_user_audit(
+        db=db,
+        user=new_user,
+        field_name="user",
+        old_value=None,
+        new_value=f"User {new_user.emp_id} created",
+        changed_by=created_by,
+        changed_by_role = changed_by_role,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        device_id=device_id,
+        db_action="CREATE",
+        source_action="user_create",
+    )
+
+  
     await db.commit()
     await db.refresh(new_user)
     return new_user
