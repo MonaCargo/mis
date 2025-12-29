@@ -9,36 +9,54 @@ import pytz
 # ======================================================
 # STRICT AWB NORMALIZATION (FAIL-FAST)
 # ======================================================
-def normalize_awb_no(awb: any) -> str | None:
-    """
-    STRICT AWB validation:
-    - ONLY digits allowed (0–9)
-    - Length must be exactly 10 or 11
-    - If 10 digits → pad leading zero
-    - Any other format → REJECT
-    """
-    if pd.isna(awb) or awb is None:
+# def normalize_awb_no(awb: any) -> str | None:
+#     """
+#     STRICT AWB validation:
+#     - ONLY digits allowed (0–9)
+#     - Length must be exactly 10 or 11
+#     - If 10 digits → pad leading zero
+#     - Any other format → REJECT
+#     """
+#     if pd.isna(awb) or awb is None:
+#         return None
+
+#     awb_str = str(awb).strip()
+
+#     if awb_str == "":
+#         return None
+
+#     if awb_str.upper() in {"NAN", "NONE", "NULL", "N/A", "NA"}:
+#         return None
+
+#     # ❌ Reject if contains anything except digits
+#     if not awb_str.isdigit():
+#         return None
+
+#     if len(awb_str) == 10:
+#         return "0" + awb_str
+#     elif len(awb_str) == 11:
+#         return awb_str
+
+#     return None
+
+def normalize_awb_no(value) -> str | None:
+    # ✅ Handle pandas NA explicitly
+    if value is None or pd.isna(value):
         return None
 
-    awb_str = str(awb).strip()
-
-    if awb_str == "":
+    value = str(value).strip()
+    if value == "":
         return None
 
-    if awb_str.upper() in {"NAN", "NONE", "NULL", "N/A", "NA"}:
+    # Remove all non-digit characters
+    cleaned = re.sub(r"\D", "", value)
+
+    if len(cleaned) == 11:
+        return cleaned
+    elif len(cleaned) == 10:
+        return "0" + cleaned
+    else:
         return None
-
-    # ❌ Reject if contains anything except digits
-    if not awb_str.isdigit():
-        return None
-
-    if len(awb_str) == 10:
-        return "0" + awb_str
-    elif len(awb_str) == 11:
-        return awb_str
-
-    return None
-
 
 # ======================================================
 # HAWB NORMALIZATION (OPTIONAL)
@@ -168,19 +186,40 @@ def clean_and_parse_fast_track_file(
         # --------------------------------------------------
         # 4️⃣ STRICT AWB VALIDATION
         # --------------------------------------------------
-        df["awb_no"] = df["awb_no"].apply(normalize_awb_no)
+        # df["awb_no"] = df["awb_no"].apply(normalize_awb_no)
 
-        invalid_awb = df[df["awb_no"].isna()]
-        if not invalid_awb.empty:
-            rows = (invalid_awb.index + 2).tolist()
-            raise ValueError(
-                "Invalid AWB number detected.\n"
-                "Rules:\n"
-                "- Only digits allowed\n"
-                "- Length must be exactly 10 or 11\n"
-                "- No spaces, letters, or special characters\n"
-                f"Invalid rows (Excel row numbers): {rows[:10]}"
-            )
+        # invalid_awb = df[df["awb_no"].isna()]
+        # if not invalid_awb.empty:
+        #     rows = (invalid_awb.index + 2).tolist()
+        #     raise ValueError(
+        #         "Invalid AWB number detected.\n"
+        #         "Rules:\n"
+        #         "- Only digits allowed\n"
+        #         "- Length must be exactly 10 or 11\n"
+        #         "- No spaces, letters, or special characters\n"
+        #         f"Invalid rows (Excel row numbers): {rows[:10]}"
+        #     )
+        normalized_awbs = []
+
+        for idx, raw_awb in df["awb_no"].items():
+            normalized = normalize_awb_no(raw_awb)
+            print('hello---------------')
+
+            # ❌ Reject if value existed but became invalid after cleaning
+            if not pd.isna(raw_awb) and raw_awb != "" and normalized is None:
+                excel_row = idx + 2  # header offset
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Invalid AWB detected at Excel row {excel_row}. "
+                        f"Original value: '{raw_awb}'. "
+                        f"After cleaning, AWB must contain exactly 10 or 11 digits."
+                    )
+                )
+
+            normalized_awbs.append(normalized)
+
+        df["awb_no"] = normalized_awbs
 
         # --------------------------------------------------
         # 5️⃣ Normalize HAWB
@@ -215,13 +254,19 @@ def clean_and_parse_fast_track_file(
 
         return df.reset_index(drop=True)
 
+    except HTTPException:
+        # ✅ Let FastAPI return it as-is
+        raise
+
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
             detail=f"File parsing error: {str(e)}"
         )
+
 
 
 # # ======================================================
