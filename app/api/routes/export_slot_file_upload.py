@@ -256,7 +256,7 @@ async def update_truck_out_time(
     emp_id = request.emp_id if request.emp_id else current_user.emp_id
     print("emp_id",emp_id)
     print("current_user emp_id",current_user.emp_id)
-    slot_record, message = await mark_truck_out(db, request.truck_number, request.truck_slot_from,request.truck_out_device, emp_id)
+    slot_record, message = await mark_truck_out(db=db, truck_number=request.truck_number, truck_slot_from=request.truck_slot_from,truck_out_device=request.truck_out_device,token_no =request.token_no, emp_id=emp_id)
 
     if not slot_record:
         return {
