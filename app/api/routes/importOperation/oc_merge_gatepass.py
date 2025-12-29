@@ -1124,7 +1124,7 @@ async def get_gatepass_by_date_range(
             "PI"
         }
 
-        excluded_irr_codes = ["SSPD", "FDCA"]
+        excluded_irr_codes = ["SSPD", "FDCA","MSCA"]
         excluded_shc_values = ["per", "val", "hum", "dgr"]
 
         filtered_records = []

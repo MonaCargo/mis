@@ -64,13 +64,14 @@
 
 
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependency import require_roles, verify_token_and_get_user
 from app.db.models.user import User
 from app.db.session import get_db
 from app.schemas.user import UserCreate, UserCreateResponse, UserPasswordChange, UserPasswordChangeResponse,UserReadResponse, UserListResponse, UserRead, UserStatusUpdate, UserStatusUpdateResponse
 from app.services.user_service import (
+    bulk_create_users,
     get_all_users_paginated,
     get_all_users_paginated_filter_apply,
     get_user_by_emp_id,
@@ -78,6 +79,7 @@ from app.services.user_service import (
     update_user_password,
     update_user_status
 )
+from app.utils.common.clean_bulck_user_excel import parse_user_excel
 from app.utils.common.get_request_ip import get_request_ip
 
 router = APIRouter(prefix="", tags=["Users"])
@@ -237,3 +239,35 @@ async def update_user_password_api(
         message="Password updated successfully",
         emp_id=emp_id
     )
+
+
+
+
+# ==================== bulk upload
+
+@router.post("/bulk-upload", summary="Bulk upload users via Excel")
+async def bulk_upload_users(
+    request: Request,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(verify_token_and_get_user),
+):
+    if not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only Excel files allowed")
+
+    users = parse_user_excel(file.file)
+
+    created_users = await bulk_create_users(
+        users=users,
+        db=db,
+        created_by=current_user.emp_id,
+        changed_by_role=current_user.role,
+        ip_address=get_request_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        device_id=None,
+    )
+
+    return {
+        "success": True,
+        "message": f"{len(created_users)} users created successfully",
+    }

@@ -889,7 +889,7 @@ class ExportSlotService:
 
 
 
-async def mark_truck_out(db: AsyncSession, truck_number: str, truck_slot_from: datetime,emp_id: str,truck_out_device: Optional[str] = None):
+async def mark_truck_out(db: AsyncSession, truck_number: str, truck_slot_from: datetime,token_no:str,emp_id: str,truck_out_device: Optional[str] = None):
     """Marks the truck out for a given slot. Returns (slot_record, message)."""
 
     # Fetch the latest matching slot for the truck and slot time
@@ -897,6 +897,7 @@ async def mark_truck_out(db: AsyncSession, truck_number: str, truck_slot_from: d
         select(ExportSlotFileRecord)
         .where(
             ExportSlotFileRecord.truck_number == truck_number,
+            ExportSlotFileRecord.token_no == token_no,
             ExportSlotFileRecord.truck_slot_from == truck_slot_from
         )
     )
