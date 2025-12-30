@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models.user import User
 from app.services.importOperation.audit_log_worker_assignment import log_worker_assignment_audit
 from app.utils.common.helperFunction import get_utc_now
+from sqlalchemy.orm import aliased
 
 
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
@@ -1027,7 +1028,7 @@ async def generate_excel_stream_export_worker_assignment(
         # 'Release Zone',
         'SHC', 'IRR Codes', 'Irregularity Remarks',
         'Gate Pass No', 'GP Issue Date', 'GP End Date',
-        'Assigned Person', 'Assigned DateTime',
+        'Assigned Person', 'Assigned Person Name','Assigned DateTime',
         'Drop Delivery Zone', 'Drop DLV DateTime',
         'From Source', 'Integrate Date', 'Created At'
     ]
@@ -1096,12 +1097,13 @@ async def generate_excel_stream_export_worker_assignment(
     18: 18,  # GP Issue Date
     19: 18,  # GP End Date
     20: 20,  # Assigned Person
-    21: 18,  # Assigned DateTime
-    22: 20,  # Drop Delivery Zone
-    23: 18,  # Drop DLV DateTime
-    24: 15,  # From IRR Table
-    25: 18,  # Integrate Date
-    26: 18   # Created At
+    21: 25,  # Assigned Person Name
+    22: 18,  # Assigned DateTime
+    23: 20,  # Drop Delivery Zone
+    24: 18,  # Drop DLV DateTime
+    25: 15,  # From IRR Table
+    26: 18,  # Integrate Date
+    27: 18   # Created At
 }
 
     
@@ -1126,7 +1128,21 @@ async def generate_excel_stream_export_worker_assignment(
         endDate=end_date
     )
 
-    base_query = filters.apply_all(select(WorkerAssignment))
+    # base_query = filters.apply_all(select(WorkerAssignment))
+    UserAlias = aliased(User)
+
+    base_query = (
+        filters.apply_all(
+            select(
+                WorkerAssignment,
+                UserAlias.name.label("assigned_person_name")
+            )
+            .outerjoin(
+                UserAlias,
+                UserAlias.emp_id == WorkerAssignment.assigned_person
+            )
+        )
+    )
 
     # SAME ORDERING AS TABLE VIEW
     base_query = base_query.order_by(
@@ -1170,13 +1186,17 @@ async def generate_excel_stream_export_worker_assignment(
         # Fetch chunk asynchronously
         chunk_query = base_query.offset(offset).limit(chunk_size)
         result = await db.execute(chunk_query)
-        chunk = result.scalars().all()
+        # chunk = result.scalars().all()
+        chunk = result.all()
+
         
         if not chunk:
             break
         
         # Write chunk to Excel
-        for assignment in chunk:
+        # for assignment in chunk:
+        for assignment, assigned_person_name in chunk:
+
             # S.No
             worksheet.write(row_num, 0, row_num, text_center)
             
@@ -1237,7 +1257,7 @@ async def generate_excel_stream_export_worker_assignment(
 
             
             # Location
-            worksheet.write(row_num, 10, assignment.location or '', text_format)
+            worksheet.write(row_num, 11, assignment.location or '', text_format)
             
             # Agent Name
             worksheet.write(row_num, 12, assignment.agent_name or '', text_format)
@@ -1274,27 +1294,35 @@ async def generate_excel_stream_export_worker_assignment(
             
             # Assigned Person
             worksheet.write(row_num, 20, assignment.assigned_person or '', text_format)
-            
+
+            # Assigned Person Name (from users table)
+            worksheet.write(
+                row_num,
+                21,
+                assigned_person_name or '',
+                text_format
+            )
+                        
             # Assigned DateTime
             if assignment.assigned_person_datetime:
-                worksheet.write_datetime(row_num, 21, to_ist_no_tz(assignment.assigned_person_datetime), date_format)
+                worksheet.write_datetime(row_num, 22, to_ist_no_tz(assignment.assigned_person_datetime), date_format)
             else:
-                worksheet.write(row_num, 21, '', text_format)
+                worksheet.write(row_num, 22, '', text_format)
             
             # Drop Delivery Zone
-            worksheet.write(row_num, 22, assignment.drop_dlv_zone or '', text_format)
+            worksheet.write(row_num, 23, assignment.drop_dlv_zone or '', text_format)
             
             # Drop DLV DateTime
             if assignment.drop_dlv_zone_datetime:
-                worksheet.write_datetime(row_num, 23, to_ist_no_tz(assignment.drop_dlv_zone_datetime), date_format)
+                worksheet.write_datetime(row_num, 24, to_ist_no_tz(assignment.drop_dlv_zone_datetime), date_format)
             else:
-                worksheet.write(row_num, 23, '', text_format)
+                worksheet.write(row_num, 24, '', text_format)
             
             # From IRR Table
             # worksheet.write(row_num, 26, 'Yes' if assignment.from_irr_table else 'No', text_center)
             worksheet.write(
                 row_num,
-                24,  # Source column index
+                25,  # Source column index
                 get_source_label(assignment),
                 text_center
             )
@@ -1302,15 +1330,15 @@ async def generate_excel_stream_export_worker_assignment(
             
             # Integrate Date
             if assignment.integrate_date_time:
-                worksheet.write_datetime(row_num, 25, to_ist_no_tz(assignment.integrate_date_time), date_format)
+                worksheet.write_datetime(row_num, 26, to_ist_no_tz(assignment.integrate_date_time), date_format)
             else:
-                worksheet.write(row_num, 25, '', text_format)
+                worksheet.write(row_num, 26, '', text_format)
             
             # Created At
             if assignment.created_at:
-                worksheet.write_datetime(row_num, 26, to_ist_no_tz(assignment.created_at), date_format)
+                worksheet.write_datetime(row_num, 27, to_ist_no_tz(assignment.created_at), date_format)
             else:
-                worksheet.write(row_num, 26, '', text_format)
+                worksheet.write(row_num, 27, '', text_format)
             
             row_num += 1
         
@@ -1324,3 +1352,101 @@ async def generate_excel_stream_export_worker_assignment(
     
     # Yield the complete file
     yield output.read()
+
+
+
+# =========== Get summary data of allocations and IRM related ==========================
+async def get_assignment_summary(db, start_utc, end_utc):
+    """
+    Dashboard summary for:
+    - OC_MERGE
+    - IRM
+    - IRR
+    Always returns all 3 categories (missing ones filled with zero values).
+    """
+
+    ALL_CATEGORIES = ["OC_MERGE", "IRM", "IRR"]
+
+    # Category mapping (NO SPACES)
+    category_case = case(
+        (WorkerAssignment.from_irr_table.is_(True), "IRR"),
+        (
+            and_(
+                WorkerAssignment.temp_irm_oc_no.isnot(None),
+                WorkerAssignment.temp_irm_oc_no != ""
+            ),
+            "IRM"
+        ),
+        else_="OC_MERGE"
+    ).label("category")
+
+    # Fallback date logic
+    date_field = func.coalesce(
+        WorkerAssignment.integrate_date_time,
+        WorkerAssignment.gate_pass_issued_date_time_combo
+    )
+
+    # Main query
+    stmt = (
+        select(
+            category_case,
+            func.count(WorkerAssignment.id).label("count"),
+
+            func.count(
+                case((WorkerAssignment.gate_pass_no.isnot(None), 1))
+            ).label("converted_to_gp"),
+
+            func.count(
+                case((WorkerAssignment.drop_dlv_zone.isnot(None), 1))
+            ).label("delivered"),
+
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignment.assigned_person.isnot(None),
+                            WorkerAssignment.assigned_person_datetime.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("assigned"),
+        )
+        .where(
+            date_field >= start_utc,
+            date_field < end_utc
+        )
+        .group_by(category_case)
+    )
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    # Convert rows → map by category
+    data_map = {row.category: row for row in rows}
+
+    # Ensure ALL categories exist in output
+    summary = []
+    for cat in ALL_CATEGORIES:
+        if cat in data_map:
+            row = data_map[cat]
+            summary.append({
+                "category": cat,
+                "count": row.count,
+                "converted_to_gp": row.converted_to_gp,
+                "delivered": row.delivered,
+                "assigned": row.assigned,
+                "balance_for_delivered": row.count - row.delivered,
+            })
+        else:
+            # Default zero values
+            summary.append({
+                "category": cat,
+                "count": 0,
+                "converted_to_gp": 0,
+                "delivered": 0,
+                "assigned": 0,
+                "balance_for_delivered": 0,
+            })
+
+    return summary
