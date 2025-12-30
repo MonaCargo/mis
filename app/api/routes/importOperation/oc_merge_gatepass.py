@@ -1215,6 +1215,7 @@ async def get_gatepass_by_date_range(
                 "agent_name": record.agent_name,
                 "customer_name": record.customer_name,
                 "release_zone": record.release_zone,
+                'temp_irm_oc_no':record.temp_irm_oc_no,
                 "integrate_date_time": record.integrate_date_time.isoformat() if record.integrate_date_time else None,
                 "shc": record.shc,
                 "igp_print_date_time": record.igp_print_date_time.isoformat() if record.igp_print_date_time else None,
