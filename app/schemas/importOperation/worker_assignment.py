@@ -62,12 +62,12 @@ class WorkerAssignmentResponseForWorkerLists(APIResponseBase):
 
 class RequestOfWorkerAssignment(BaseModel):
     oc_no: str  # The OC number
-    emp_id: str  # The employee ID to assign
+    emp_id: str | None   # The employee ID to assign
 
 
 class ResponseOfWorkerAssignment(APIResponseBase):
    oc_num:str
-   emp_id:str
+   emp_id:str | None
 
 
 # Define the structure of the request body
