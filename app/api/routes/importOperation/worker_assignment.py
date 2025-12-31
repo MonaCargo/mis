@@ -233,7 +233,7 @@ async def get_paginated_worker_assignments(
     # -------------------------------------------------------
     def validate_status(status_value: str):
         # allowed = ["all", "assigned", "unassigned", "dlv_added"]
-        allowed = ["all", "assigned", "unassigned", "dlv_added", "assigned_but_not_delivered"]
+        allowed = ["all", "assigned", "unassigned", "dlv_added", "assigned_but_not_delivered","gp_delivered"]
 
         if status_value not in allowed:
             raise HTTPException(

@@ -73,11 +73,52 @@ class WorkerAssignmentFilters:
             )
 
         return query
+# old status filter up to 31-dec-2025 01:17 pm
+    # def apply_status_filter(self, query):
+    #     model = self.model
+    #     status = self.status
 
+    #     if status == "assigned":
+    #         return query.where(model.assigned_person.isnot(None))
+
+    #     if status == "unassigned":
+    #         return query.where(model.assigned_person.is_(None))
+
+    #     if status == "assigned_but_not_delivered":
+    #         return query.where(
+    #             and_(
+    #                 model.assigned_person.isnot(None),
+    #                 or_(
+    #                     model.drop_dlv_zone.is_(None),
+    #                     func.trim(model.drop_dlv_zone) == ""
+    #                 )
+    #             )
+    #         )
+
+    #     return query
     def apply_status_filter(self, query):
         model = self.model
         status = self.status
 
+        # -----------------------------
+        # 1️⃣ GP DELIVERED (ONLY delivered)
+        # -----------------------------
+        if status == "gp_delivered":
+            return query.where(
+                model.gate_pass_end_datetime.isnot(None)
+            )
+
+        # -----------------------------
+        # 2️⃣ EXCLUDE delivered from ALL other statuses
+        # -----------------------------
+        if status != "all":
+            query = query.where(
+                model.gate_pass_end_datetime.is_(None)
+            )
+
+        # -----------------------------
+        # 3️⃣ STATUS-SPECIFIC FILTERS
+        # -----------------------------
         if status == "assigned":
             return query.where(model.assigned_person.isnot(None))
 
@@ -95,7 +136,12 @@ class WorkerAssignmentFilters:
                 )
             )
 
+        # -----------------------------
+        # 4️⃣ DEFAULT → ALL
+        # -----------------------------
         return query
+
+
 
     def apply_date_filter(self, query):
         model = self.model
@@ -556,7 +602,7 @@ async def get_worker_assignment_lists_by_emp_id(db: AsyncSession, emp_id: str) -
 
 async def assign_user_to_worker_assignment(db: AsyncSession,
             oc_no: str, 
-            emp_id: str,  # worker being assigned
+            emp_id: str | None,  # worker being assigned
             current_user_role:str,
             changed_by  : str,      # actor which perform this operation
             *,
@@ -572,29 +618,63 @@ async def assign_user_to_worker_assignment(db: AsyncSession,
     if not worker_assignment:
         raise HTTPException(status_code=404, detail=f"Worker assignment with OC No {oc_no} not found.")
     
-    # Step 2: Check if the employee exists and has the proper role (imp_gp_user)
-    user_result = await db.execute(select(User).filter(User.emp_id == emp_id, User.role == "imp_gp_user"))
-    user = user_result.scalars().first()
-
-    if not user:
-        raise HTTPException(status_code=400, detail=f"User with emp_id {emp_id} not found or invalid role.")
-    
-        # NEW: Check if user is active
-    if hasattr(user, "is_active") and not user.is_active:
-        raise HTTPException(
-            status_code=400,
-            detail=f"User with emp_id {emp_id} is Inactive."
-        )
     
     # 🔒 Capture old value BEFORE change
     old_assigned_person = worker_assignment.assigned_person
 
-    # Step 3: Update the worker assignment with the employee's ID
-    worker_assignment.assigned_person = emp_id
-    worker_assignment.assigned_person_datetime = get_utc_now()  # Set the timestamp of assignment
-    worker_assignment.updated_at=get_utc_now()
+    if emp_id == worker_assignment.assigned_person:
+        return True  # no change, skip update & audit
 
-       # 🧾 AUDIT LOG
+
+    # -----------------------------
+    # ✅ UNASSIGN CASE
+    # -----------------------------
+    if emp_id is None:
+        worker_assignment.assigned_person = None
+        worker_assignment.assigned_person_datetime = None
+        worker_assignment.updated_at = get_utc_now()
+
+        await log_worker_assignment_audit(
+            db=db,
+            assignment=worker_assignment,
+            field_name="assigned_person",
+            old_value=old_assigned_person,
+            new_value=None,
+            changed_by=changed_by,
+            changed_by_role=current_user_role,
+            device_id=device_id,
+            user_agent=user_agent,
+            ip_address=ip_address,
+            db_action="UPDATE",
+            source_action="unassign_user",
+        )
+
+        db.add(worker_assignment)
+        await db.commit()
+        return True
+    
+    # -----------------------------
+    # ✅ ASSIGN CASE
+    # -----------------------------
+    user_result = await db.execute(
+        select(User).filter(
+            User.emp_id == emp_id,
+            User.role == "imp_gp_user",
+            User.is_active.is_(True)
+        )
+    )
+    user = user_result.scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail=f"User with emp_id {emp_id} not found, inactive, or invalid role."
+        )
+
+    worker_assignment.assigned_person = emp_id
+    worker_assignment.assigned_person_datetime = get_utc_now()
+    worker_assignment.updated_at = get_utc_now()
+
     await log_worker_assignment_audit(
         db=db,
         assignment=worker_assignment,
@@ -604,17 +684,17 @@ async def assign_user_to_worker_assignment(db: AsyncSession,
         changed_by=changed_by,
         changed_by_role=current_user_role,
         device_id=device_id,
-        user_agent = user_agent,
+        user_agent=user_agent,
         ip_address=ip_address,
         db_action="UPDATE",
         source_action="assign_user",
     )
 
-    # Step 4: Commit the transaction
     db.add(worker_assignment)
     await db.commit()
-    
     return True
+    
+    # ----
 
 
 
@@ -706,7 +786,7 @@ async def add_drop_dlv_zone_by_assigned_worker(
 
 
 
-# PAGINATED WORKER ASSIGNMENT DATA WITH FILTERS AND MATRIX COUNTS (NEW)
+#=========== PAGINATED WORKER ASSIGNMENT DATA WITH FILTERS AND MATRIX COUNTS (NEW)
 
 async def get_paginated_worker_assignments_data_list(
     db: AsyncSession,
@@ -734,72 +814,9 @@ async def get_paginated_worker_assignments_data_list(
 
         return start_ist.astimezone(pytz.UTC), end_ist.astimezone(pytz.UTC)
 
-    # def apply_dlv_zone_filter(query):
-    #     if status == "dlv_added":
-    #         return query.where(
-    #             model.drop_dlv_zone.isnot(None),
-    #             func.trim(model.drop_dlv_zone) != ""
-    #         )
-    #     return query.where(
-    #         or_(
-    #             model.drop_dlv_zone.is_(None),
-    #             func.trim(model.drop_dlv_zone) == ""
-    #         )
-    #     )
-
-    def apply_dlv_zone_filter(query):
-        # 1️⃣ Show ONLY delivered rows
-        if status == "dlv_added":
-            return query.where(
-                model.drop_dlv_zone.isnot(None),
-                func.trim(model.drop_dlv_zone) != ""
-            )
-
-        # 2️⃣ Show assigned but NOT delivered
-        if status == "assigned_but_not_delivered":
-            return query.where(
-                or_(
-                    model.drop_dlv_zone.is_(None),
-                    func.trim(model.drop_dlv_zone) == ""
-                )
-            )
-
-        # 3️⃣ For all, assigned, unassigned → DO NOT FILTER BY DELIVERY
-        return query
 
 
-    def apply_status_filter(query):
-        if status == "assigned":
-            return query.where(model.assigned_person.isnot(None))
-        if status == "unassigned":
-            return query.where(model.assigned_person.is_(None))
-        if status == "assigned_but_not_delivered":
-            return query.where(
-                and_(
-                    model.assigned_person.isnot(None),
-                    or_(
-                        model.drop_dlv_zone.is_(None),
-                        func.trim(model.drop_dlv_zone) == ""
-                    )
-                )
-            )
-
-        return query
-
-    def apply_date_filter(query):
-        if not (startDate and endDate):
-            return query
-
-        utc_start, _ = convert_ist_day_to_utc_range(startDate)
-        _, utc_end = convert_ist_day_to_utc_range(endDate)
-
-        return query.where(
-            or_(
-                model.integrate_date_time.between(utc_start, utc_end),
-                model.gate_pass_issued_date_time_combo.between(utc_start, utc_end)
-            )
-        )
-
+ 
     async def calculate_matrix(base_query):
         # 1. PURE OC COUNT
         pure = base_query.where(
@@ -845,12 +862,20 @@ async def get_paginated_worker_assignments_data_list(
         }
 
     # -----------------------------------------------------
-    # STEP 1 – BUILD BASE QUERY
+    # STEP 1 – BUILD BASE QUERY (class based)
     # -----------------------------------------------------
-    base_query = select(model)
-    base_query = apply_dlv_zone_filter(base_query)
-    base_query = apply_status_filter(base_query)
-    base_query = apply_date_filter(base_query)
+    # -----------------------------------------------------
+# STEP 1 – BUILD BASE QUERY (CLASS BASED)
+# -----------------------------------------------------
+    filters = WorkerAssignmentFilters(
+        model=model,
+        status=status,
+        startDate=startDate,
+        endDate=endDate
+    )
+
+    base_query = filters.apply_all(select(model))
+
 
     # -----------------------------------------------------
     # STEP 2 – TOTAL RECORDS
