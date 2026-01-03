@@ -1475,3 +1475,84 @@ async def get_assignment_summary(db, start_utc, end_utc):
             })
 
     return summary
+
+
+
+async def get_assignment_summary_according_to_assigned_person(db, start_utc, end_utc):
+    """
+    Operator-wise assignment dashboard.
+    Date range logic:
+    COALESCE(integrate_date_time, gate_pass_issued_date_time_combo)
+    """
+
+    # Fallback date logic (same as your category summary)
+    date_field = func.coalesce(
+        WorkerAssignment.integrate_date_time,
+        WorkerAssignment.gate_pass_issued_date_time_combo
+    )
+
+    # Query grouped by assigned_person
+    stmt = (
+        select(
+            WorkerAssignment.assigned_person.label("operator"),
+
+            # Count assigned → assigned_person + assigned_person_datetime required
+            func.count(
+                case((
+                    and_(
+                        WorkerAssignment.assigned_person.isnot(None),
+                        WorkerAssignment.assigned_person_datetime.isnot(None)
+                    ),
+                    1
+                ))
+            ).label("assigned"),
+
+            # Count completed → drop_dlv_zone not null
+            func.count(
+                case((WorkerAssignment.drop_dlv_zone.isnot(None), 1))
+            ).label("completed"),
+        )
+        .where(
+            WorkerAssignment.assigned_person.isnot(None),           # must be assigned
+            WorkerAssignment.assigned_person_datetime.isnot(None), # cannot be blank
+            date_field >= start_utc,
+            date_field < end_utc
+        )
+        .group_by(WorkerAssignment.assigned_person)
+        .order_by(WorkerAssignment.assigned_person)
+    )
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    summary = []
+    total_assigned = 0
+    total_completed = 0
+
+    for row in rows:
+        assigned = row.assigned or 0
+        completed = row.completed or 0
+
+        performance = round((completed / assigned) * 100, 2) if assigned else 0
+
+        summary.append({
+            "operator": row.operator,  # example: "5234987"
+            "assigned": assigned,
+            "completed": completed,
+            "performance": performance,
+        })
+
+        total_assigned += assigned
+        total_completed += completed
+
+    # TOTAL ROW
+    total_performance = round((total_completed / total_assigned) * 100, 2) if total_assigned else 0
+
+    summary.append({
+        "operator": "TOTAL",
+        "assigned": total_assigned,
+        "completed": total_completed,
+        "performance": total_performance,
+    })
+
+    return summary
