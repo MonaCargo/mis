@@ -14,6 +14,7 @@ from .app_version import router as app_version_router
 
 from .importOperation.temp_irm_oc_merge_creation import router as temp_irm_oc_merge_creation
 from .importOperation.worker_assignment import router as worker_assignment
+from .importOperation.all_import_logs_route import router as all_import_logs_route
 # You can add more routes here as your app grows
 
 api_v1_router = APIRouter()
@@ -35,6 +36,7 @@ api_v1_router.include_router(import_wherehouse_inventry, prefix="/import", tags=
 api_v1_router.include_router(oc_report, prefix="/import", tags=["oc-report"])
 api_v1_router.include_router(irregularity_report, prefix="/import", tags=["irregularities-report"])
 api_v1_router.include_router(oc_merge_gatepass, prefix="/import", tags=["oc-merge-gatepass-report"])
+api_v1_router.include_router(all_import_logs_route, prefix="/import", tags=["logs report of imports"])
 
 # ---> Fast Track TEMP IRM OC MERGE
 api_v1_router.include_router(temp_irm_oc_merge_creation, prefix="/import", tags=["Fast Track TEMP IRM OC MERGE"])

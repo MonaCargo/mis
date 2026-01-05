@@ -15,7 +15,7 @@ from app.db.models.user import User
 from app.db.session import get_db
 from app.schemas.importOperation.worker_assignment import AssignDropDlvZoneRequest, PaginatedWorkerAssignmentResponse, RequestOfWorkerAssignment, ResponseOfWorkerAssignment, WorkerAssignmentExportRequest, WorkerAssignmentRequest, WorkerAssignmentResponseForWorker, WorkerAssignmentResponseForWorkerLists, WorkerAssignmentSearchRequest
 from app.schemas.user import UserListResponse, UserRead
-from app.services.importOperation.worker_assignment_service import add_drop_dlv_zone_by_assigned_worker, assign_user_to_worker_assignment, generate_excel_stream_export_worker_assignment, get_all_allowed_users_as_worker, get_all_worker_assignments_list, get_assignment_summary, get_paginated_worker_assignments_data_list, get_worker_assignment_lists_by_emp_id, process_worker_assignment, search_in_worker_assignments
+from app.services.importOperation.worker_assignment_service import add_drop_dlv_zone_by_assigned_worker, assign_user_to_worker_assignment, generate_excel_stream_export_worker_assignment, get_all_allowed_users_as_worker, get_all_worker_assignments_list, get_assignment_summary, get_assignment_summary_according_to_assigned_person, get_paginated_worker_assignments_data_list, get_worker_assignment_lists_by_emp_id, process_worker_assignment, search_in_worker_assignments
 from app.utils.common.get_request_ip import get_request_ip
 
 router = APIRouter(prefix="/worker-assignment", tags=[""])
@@ -537,6 +537,50 @@ async def assignment_summary(
     print(end_utc,"end.......")
     # 4️⃣ Pass DATETIMES (not strings)
     data = await get_assignment_summary(db, start_utc, end_utc)
+
+
+    return {"data": data}
+
+
+
+# Assigned person based summary with its assigned/delivered counts
+@router.get("/user-assignment-summary-based-on-assigned-person")
+async def assignment_summary(
+    start_date: str,
+    end_date: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Date range:
+    From midnight of start_date
+    To midnight AFTER end_date (end exclusive)
+    Assigned person based summary 
+    """
+
+    # 1️⃣ Validate format
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
+
+    # 2️⃣ Validate range
+    if start > end:
+        raise HTTPException(400, "start_date cannot be after end_date")
+
+    # 3️⃣ IST → UTC
+    ist = pytz.timezone("Asia/Kolkata")
+    utc = pytz.UTC
+
+    # Start: 20th 00:00 IST
+    start_utc = ist.localize(start).astimezone(utc)
+
+    # End: 31st 00:00 IST (end_date + 1)
+    end_utc = ist.localize(end + timedelta(days=1)).astimezone(utc)
+    print(start_utc,"start......")
+    print(end_utc,"end.......")
+    # 4️⃣ Pass DATETIMES (not strings)
+    data = await get_assignment_summary_according_to_assigned_person(db, start_utc, end_utc)
 
 
     return {"data": data}
