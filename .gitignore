@@ -53,5 +53,7 @@ Thumbs.db
 __pycache__/
 *.pyc
 
-
+alembic-backup/
 alembic/versions/
+
+uploads/
