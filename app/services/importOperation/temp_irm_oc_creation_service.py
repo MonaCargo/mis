@@ -129,6 +129,15 @@ class FastTrackIrmTemporaryOcMergeService:
         batch_id = str(uuid.uuid4())
         start_time = time.time()
         errors = []
+
+        # it check that if not get data like loc weigts then no need to create temp oc 
+        def has_meaningful_data(base: dict) -> bool:
+            return any([
+                base.get("location"),
+                base.get("no_of_pc"),
+                base.get("weight_in_kgs")
+            ])
+
         
         try:
             # ═══════════════════════════════════════════════════════════════
@@ -371,6 +380,17 @@ class FastTrackIrmTemporaryOcMergeService:
                     "is_temp_irm_oc": False,
                     "temp_irm_oc_no": None
                 }
+
+                # 🚫 NEW HARD BUSINESS RULE
+                if not has_meaningful_data(base):
+                    skipped_existing_unchanged += 1
+                    errors.append({
+                        "row": record["row"],
+                        "awb_no": awb,
+                        "hawb": hawb,
+                        "error": "Skipped: No shipment data found (location / pcs / weight missing)"
+                    })
+                    continue
                 
                 if key in existing_map:
                     # EXISTING RECORD → UPDATE ONLY

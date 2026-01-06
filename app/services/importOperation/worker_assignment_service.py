@@ -403,6 +403,17 @@ async def process_worker_assignment(db: AsyncSession, req):
                         ),
                         else_=WorkerAssignment.chg_wgt_in_kg
                     ),
+                     # 🔥 ADD THIS
+    "location": case(
+        (
+            or_(
+                WorkerAssignment.location.is_(None),
+                WorkerAssignment.location == ""
+            ),
+            insert(WorkerAssignment).excluded.location
+        ),
+        else_=WorkerAssignment.location
+    ),
                     "igp_no": insert(WorkerAssignment).excluded.igp_no,
                     "updated_at": get_utc_now()
                 }
