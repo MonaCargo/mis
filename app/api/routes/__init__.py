@@ -15,6 +15,8 @@ from .app_version import router as app_version_router
 from .importOperation.temp_irm_oc_merge_creation import router as temp_irm_oc_merge_creation
 from .importOperation.worker_assignment import router as worker_assignment
 from .importOperation.all_import_logs_route import router as all_import_logs_route
+from .importOperation.damage_report import router as damage_report
+
 # You can add more routes here as your app grows
 
 api_v1_router = APIRouter()
@@ -49,3 +51,5 @@ api_v1_router.include_router(worker_assignment, prefix="/import", tags=["worker 
 #======= app verion route
 api_v1_router.include_router(app_version_router, prefix="/version", tags=["App Version"])
 
+# ============= damage reason route
+api_v1_router.include_router(damage_report,prefix='/import',tags=["damage-report"])
