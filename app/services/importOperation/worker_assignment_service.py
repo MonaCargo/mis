@@ -516,6 +516,41 @@ async def process_worker_assignment(db: AsyncSession, req):
                         ),
                         else_=WorkerAssignment.gate_pass_issued_date_time_combo
                     ),
+                    # :white_check_mark: BACKFILL location if missing
+                        "location": case(
+                            (
+                                or_(
+                                    WorkerAssignment.location.is_(None),
+                                    WorkerAssignment.location == ""
+                                ),
+                                insert(WorkerAssignment).excluded.location
+                            ),
+                            else_=WorkerAssignment.location
+                        ),
+                        # :white_check_mark: BACKFILL weight if missing
+                        "weight_in_kgs": case(
+                            (
+                                WorkerAssignment.weight_in_kgs.is_(None),
+                                insert(WorkerAssignment).excluded.weight_in_kgs
+                            ),
+                            else_=WorkerAssignment.weight_in_kgs
+                        ),
+                        # :white_check_mark: BACKFILL chargeable weight
+                        "chg_wgt_in_kg": case(
+                            (
+                                WorkerAssignment.chg_wgt_in_kg.is_(None),
+                                insert(WorkerAssignment).excluded.chg_wgt_in_kg
+                            ),
+                            else_=WorkerAssignment.chg_wgt_in_kg
+                        ),
+                        # :white_check_mark: BACKFILL pcs
+                        "no_of_pc": case(
+                            (
+                                WorkerAssignment.no_of_pc.is_(None),
+                                insert(WorkerAssignment).excluded.no_of_pc
+                            ),
+                            else_=WorkerAssignment.no_of_pc
+                        ),
                     
                     "updated_at": now
                 }
