@@ -188,7 +188,7 @@ class IrrReport(Base):
     sdo_num = Column(String(100), nullable=True)
     integration_mode = Column(String(100), nullable=True)
     cosys_id = Column(String(100), nullable=True)
-    gate_pass_no = Column(String(100), nullable=True)
+    gate_pass_no = Column(String(100), nullable=False, index=True)
     gate_pass_released_by = Column(String(200), nullable=True)
     delivered_to = Column(String(200), nullable=True)
     dlv_id_typ = Column(String(50), nullable=True)
@@ -217,7 +217,11 @@ class IrrReport(Base):
     updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=text("NOW()"))
 
     __table_args__ = (
-        UniqueConstraint('oc_num', name='uq_irr_report_oc_num'),
+        # UniqueConstraint('oc_num', name='uq_irr_report_oc_num'),
+        UniqueConstraint(
+        'gate_pass_no',
+        name='uq_irr_report_gate_pass_no'
+    ),
        
     )
 
@@ -225,8 +229,8 @@ class IrrReport(Base):
 Index('idx_irr_awb_date', IrrReport.awb, IrrReport.date)
 Index('idx_irr_hwb_date', IrrReport.hwb, IrrReport.date)
 Index('idx_irr_boe_oc', IrrReport.boe_num, IrrReport.oc_num)
-Index('idx_irr_flight_date', IrrReport.flight_no, IrrReport.flight_date)
-Index('idx_irr_consolidator_date', IrrReport.consolidator, IrrReport.date)
+# Index('idx_irr_flight_date', IrrReport.flight_no, IrrReport.flight_date)
+# Index('idx_irr_consolidator_date', IrrReport.consolidator, IrrReport.date)
 
 
 

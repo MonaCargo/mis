@@ -8,14 +8,18 @@ from app.db.models.importOperation.irregularity_report import Irregularity
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
 from app.db.models.manual_slot import ExportManualSlotFileRecord
 from app.db.models.dock_availability import DockAvailability
-from app.db.models.importOperation.worker_assignment import WorkerAssignment 
+# from app.db.models.importOperation.worker_assignment import WorkerAssignment 
+from app.db.models.importOperation.worker_assignment import WorkerAssignmentShipment, WorkerAssignmentHeader
 from app.db.models.importOperation.audit_log_worker_assignment import WorkerAssignmentAuditLog 
 from app.db.models.audit_log_user import UserAuditLog 
 from app.db.models.importOperation.damage_report import DamageReason,DamageReport,DamageReportAuditLog,DamageReportImage,DamageReportReason
 
 
 __all__ = [
-    'WorkerAssignment',
+    # 'WorkerAssignment',
+
+    'WorkerAssignmentShipment',
+    'WorkerAssignmentHeader',
 
     'WorkerAssignmentAuditLog',
     'UserAuditLog',
