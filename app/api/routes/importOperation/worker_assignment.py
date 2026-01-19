@@ -586,8 +586,12 @@ from app.schemas.user import UserListResponse, UserRead
 from app.services.importOperation.worker_assignment_service import (
     add_drop_dlv_zone_by_assigned_worker,
     assign_user_to_worker_assignment,
+    auto_assign_pom_shipments,
     generate_excel_stream_export_worker_assignment,
     get_all_allowed_users_as_worker,
+    get_assignment_category_summary,
+    get_assignment_overall_summary,
+    get_assignment_summary_according_to_assigned_person,
     get_paginated_worker_assignments_data_list,
     get_worker_assignment_lists_by_emp_id,
     process_worker_assignment,
@@ -959,3 +963,120 @@ async def export_worker_assignments_stream(
     except ValueError as e:
         raise HTTPException(400, f"Invalid date format: {e}")
 
+
+
+
+#👌 =========================  USER / WORKER ASSIGNMENT SUMMARY ============================
+
+@router.get("/user-assignment-summary-based-workers")
+async def assignment_summary(
+    start_date: str,
+    end_date: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Shipment-based operator summary (NEW structure)
+    Date range:
+    From start_date 00:00 IST
+    To end_date + 1 day 00:00 IST (exclusive)
+    """
+
+    # 1️⃣ Validate date format
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
+
+    if start > end:
+        raise HTTPException(400, "start_date cannot be after end_date")
+
+    # 2️⃣ IST → UTC conversion
+    ist = pytz.timezone("Asia/Kolkata")
+    utc = pytz.UTC
+
+    start_utc = ist.localize(start).astimezone(utc)
+    end_utc = ist.localize(end + timedelta(days=1)).astimezone(utc)
+
+    # 3️⃣ Fetch summary
+    data = await get_assignment_summary_according_to_assigned_person(
+        db=db,
+        start_utc=start_utc,
+        end_utc=end_utc,
+    )
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "data": data
+    }
+
+
+
+@router.get("/assignment-category-summary")
+async def assignment_category_summary(
+    start_date: str,
+    end_date: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Shipment-based category summary (NEW structure)
+    """
+
+    # 1️⃣ Validate dates
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
+
+    if start > end:
+        raise HTTPException(400, "start_date cannot be after end_date")
+
+    # 2️⃣ IST → UTC
+    ist = pytz.timezone("Asia/Kolkata")
+    utc = pytz.UTC
+
+    start_utc = ist.localize(start).astimezone(utc)
+    end_utc = ist.localize(end + timedelta(days=1)).astimezone(utc)
+
+    # 3️⃣ Fetch summary
+    category_summary = await get_assignment_category_summary(
+        db=db,
+        start_utc=start_utc,
+        end_utc=end_utc,
+    )
+
+    overall_summary = await get_assignment_overall_summary(
+        db=db,
+        start_utc=start_utc,
+        end_utc=end_utc
+    )
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "overall": overall_summary,
+        "by_category": category_summary
+    }
+
+
+# 👌============================ AUTO ASSIGN POM OC SHIPMENT TO PERTICULAR EMPLOYEE =====================
+
+@router.post("/auto-assign-pom")
+async def auto_assign_pom_api(
+    date: date = Query(..., description="IST date (same logic as process-and-save)"),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    result = await auto_assign_pom_shipments(
+        db=db,
+        process_date=date, # IST date letter I chnage it to utc date range in service layer
+        assigned_by=current_user.emp_id,
+    )
+
+    return {
+        "success": True,
+        "date": str(date),
+        "stats": result,
+    }

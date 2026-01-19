@@ -61,7 +61,7 @@
 
 
 
-# ================================== NEW ARCHITECTURE LOG VIEW ==========================
+# ================================== NEW ARCHITECTURE LOG VIEW  V2==========================
 
 
 # app/models/worker_assignment_audit.py

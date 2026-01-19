@@ -9,6 +9,7 @@ import uuid
 import time
 from pydantic import BaseModel
 
+from app.db.models.importOperation.import_release_report import IrrReport
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
 from app.services.importOperation.igp_number_generator import IGPNumberGenerator
 from app.utils.importOperation.temp_irm_oc_file_cleaner import clean_and_parse_fast_track_file
@@ -314,6 +315,35 @@ class FastTrackIrmTemporaryOcMergeService:
                         "oc_no": row.oc_no,
                         "igp_no": row.igp_no
                     }
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 4.5: Check existing AWB+HAWB in IRR table (HARD SKIP RULE)
+            # ═══════════════════════════════════════════════════════════════
+
+            irr_conditions = []
+
+            for awb, hawb in awb_hawb_pairs:
+                irr_conditions.append(
+                    and_(
+                        IrrReport.awb == awb,
+                        func.coalesce(IrrReport.hwb, '') == (hawb or '')
+                    )
+                )
+
+            irr_existing_map = set()
+
+            for condition_chunk in chunk_list(irr_conditions, 500):
+                irr_query = select(
+                    IrrReport.awb,
+                    IrrReport.hwb
+                ).where(or_(*condition_chunk))
+
+                irr_result = await db.execute(irr_query)
+
+                for row in irr_result.fetchall():
+                    key = (row.awb, row.hwb if row.hwb else None)
+                    irr_existing_map.add(key)
+
 
             # ═══════════════════════════════════════════════════════════════
             # STEP 5: Generate Temp OC & IGP for NEW Records
@@ -338,6 +368,16 @@ class FastTrackIrmTemporaryOcMergeService:
                         "awb_no": awb,
                         "hawb": hawb,
                         "error": "Missing integrate_date_time"
+                    })
+                    continue
+                # 🚫 HARD SKIP: EXISTS IN IRR → DO NOT PROCESS
+                if key in irr_existing_map:
+                    skipped_existing_unchanged += 1
+                    errors.append({
+                        "row": record["row"],
+                        "awb_no": awb,
+                        "hawb": hawb,
+                        "error": "Skipped: Shipment already exists in IRR (OC Merge not allowed)"
                     })
                     continue
 
