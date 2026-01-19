@@ -17,6 +17,10 @@ from .importOperation.worker_assignment import router as worker_assignment
 from .importOperation.all_import_logs_route import router as all_import_logs_route
 from .importOperation.damage_report import router as damage_report
 
+
+from .domesticOperation.domestic_xray_report import router as domestic_xray_report_route
+
+
 # You can add more routes here as your app grows
 
 api_v1_router = APIRouter()
@@ -53,3 +57,6 @@ api_v1_router.include_router(app_version_router, prefix="/version", tags=["App V
 
 # ============= damage reason route
 api_v1_router.include_router(damage_report,prefix='/import',tags=["damage-report"])
+
+# =============================== DOMESTIC OPERATION ==========================================================
+api_v1_router.include_router(domestic_xray_report_route,prefix='/domestic',tags=['Domestic X-ray'])

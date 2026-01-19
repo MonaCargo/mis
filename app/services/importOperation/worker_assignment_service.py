@@ -3464,26 +3464,19 @@ async def get_assignment_summary_according_to_assigned_person(
 # 👌==================== Assignment summary based on categories like IRR, IRM, OC MERGE ===================
 
 
+
 # async def get_assignment_category_summary(
 #     db: AsyncSession,
 #     start_utc,
 #     end_utc,
 # ):
 #     """
-#     Dashboard summary by category:
-#     - OC_MERGE
-#     - IRM
-#     - IRR
-
-#     Shipment-based counting (NEW structure)
+#     Category-wise shipment summary
+#     (OC_MERGE / IRM / IRR)
 #     """
 
 #     ALL_CATEGORIES = ["OC_MERGE", "IRM", "IRR"]
-#     print("start_utc",start_utc)
-#     print("end_utc",end_utc)
-#     print("something come")
 
-#     # 🔑 Category logic (shipment + header)
 #     category_case = case(
 #         (WorkerAssignmentShipment.from_irr_table.is_(True), "IRR"),
 #         (
@@ -3496,7 +3489,6 @@ async def get_assignment_summary_according_to_assigned_person(
 #         else_="OC_MERGE"
 #     ).label("category")
 
-#     # 🔑 Date fallback logic
 #     date_field = func.coalesce(
 #         WorkerAssignmentShipment.integrate_date_time,
 #         WorkerAssignmentShipment.gate_pass_issued_date_time_combo
@@ -3506,35 +3498,119 @@ async def get_assignment_summary_according_to_assigned_person(
 #         select(
 #             category_case,
 
-#             # total shipment rows
-#             func.count(WorkerAssignmentShipment.id).label("count"),
+#             # =========================
+#             # BASIC COUNTS
+#             # =========================
+#             func.count(WorkerAssignmentShipment.id).label("total_data"),
 
-#             # gate pass generated
 #             func.count(
-#                 case(
-#                     (WorkerAssignmentShipment.gate_pass_no.isnot(None), 1)
-#                 )
+#                 case((WorkerAssignmentShipment.gate_pass_no.isnot(None), 1))
 #             ).label("converted_to_gp"),
 
-#             # delivered
+#             func.count(
+#                 case((WorkerAssignmentShipment.gate_pass_no.is_(None), 1))
+#             ).label("gp_not_generated"),
+
+#             # =========================
+#             # ASSIGNMENT / DELIVERY
+#             # =========================
 #             func.count(
 #                 case(
-#                     (WorkerAssignmentShipment.drop_dlv_zone.isnot(None), 1)
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.assigned_person.is_(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+#                         ),
+#                         1
+#                     )
 #                 )
-#             ).label("delivered"),
+#             ).label("unassigned"),
 
-#             # assigned
 #             func.count(
 #                 case(
 #                     (
 #                         and_(
 #                             WorkerAssignmentShipment.assigned_person.isnot(None),
-#                             WorkerAssignmentShipment.assigned_person_datetime.isnot(None)
+#                             WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
 #                         ),
 #                         1
 #                     )
 #                 )
-#             ).label("assigned"),
+#             ).label("assigned_but_not_dropped_at_lift"),
+
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.assigned_person.isnot(None),
+#                             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("assigned_and_dropped_at_lift"),
+
+#             # =========================
+#             # GATE PASS END
+#             # =========================
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.gate_pass_no.isnot(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("gatepass_end_date_present_means_delivered"),
+
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+#                             WorkerAssignmentShipment.assigned_person.isnot(None),
+#                             # WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("assigned_and_dropped_at_lift"),
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+#                             WorkerAssignmentShipment.assigned_person.isnot(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("droped_at_lift_with_gatepass_end_date_present"),
+
+#             # =========================
+#             # SLA (4 HOURS)
+#             # =========================
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.gate_pass_issued_date_time_combo.isnot(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
+#                             func.extract(
+#                                 "epoch",
+#                                 WorkerAssignmentShipment.gate_pass_end_datetime
+#                                 - WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+#                             ) <= 14400
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("delivered_within_defined_hours"),
 #         )
 #         .join(
 #             WorkerAssignmentHeader,
@@ -3547,33 +3623,31 @@ async def get_assignment_summary_according_to_assigned_person(
 #         .group_by(category_case)
 #     )
 
-#     result = await db.execute(stmt)
-#     rows = result.all()
+#     rows = (await db.execute(stmt)).all()
 
-#     # Map results
 #     data_map = {row.category: row for row in rows}
 
 #     summary = []
 #     for cat in ALL_CATEGORIES:
-#         if cat in data_map:
-#             row = data_map[cat]
-#             summary.append({
-#                 "category": cat,
-#                 "count": row.count,
-#                 "converted_to_gp": row.converted_to_gp,
-#                 "delivered": row.delivered,
-#                 "assigned": row.assigned,
-#                 "balance_for_delivered": row.count - row.delivered,
-#             })
-#         else:
-#             summary.append({
-#                 "category": cat,
-#                 "count": 0,
-#                 "converted_to_gp": 0,
-#                 "delivered": 0,
-#                 "assigned": 0,
-#                 "balance_for_delivered": 0,
-#             })
+#         row = data_map.get(cat)
+
+#         summary.append({
+#             "category": cat,
+#             "total_data": row.total_data if row else 0,
+#             "converted_to_gp": row.converted_to_gp if row else 0,
+#             "gp_not_generated": row.gp_not_generated if row else 0,
+#             "unassigned": row.unassigned if row else 0,
+#             "assigned_but_not_dropped_at_lift": row.assigned_but_not_dropped_at_lift if row else 0,
+#             "assigned_and_dropped_at_lift": row.assigned_and_dropped_at_lift if row else 0,
+#             "gatepass_end_date_present_means_delivered": row.gatepass_end_date_present_means_delivered if row else 0,
+#             "droped_at_lift_with_gatepass_end_date_present": row.droped_at_lift_with_gatepass_end_date_present if row else 0,
+#             "delivered_within_defined_hours": row.delivered_within_defined_hours if row else 0,
+#             "balance_for_delivered": (
+#                 row.total_data - row.assigned_and_dropped_at_lift
+#                 if row else 0
+#             ),
+#         })
+
 #     return summary
 
 async def get_assignment_category_summary(
@@ -3648,7 +3722,7 @@ async def get_assignment_category_summary(
                         1
                     )
                 )
-            ).label("assigned_but_not_delivered"),
+            ).label("assigned_but_not_dropped_at_lift"),
 
             func.count(
                 case(
@@ -3661,7 +3735,7 @@ async def get_assignment_category_summary(
                         1
                     )
                 )
-            ).label("assigned_and_delivered"),
+            ).label("assigned_and_dropped_at_lift"),
 
             # =========================
             # GATE PASS END
@@ -3676,19 +3750,32 @@ async def get_assignment_category_summary(
                         1
                     )
                 )
-            ).label("gatepass_end_date_present"),
+            ).label("gatepass_end_date_present_means_delivered"),
 
             func.count(
                 case(
                     (
                         and_(
                             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
+                            # WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("assigned_and_dropped_at_lift"),
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
                         ),
                         1
                     )
                 )
-            ).label("delivered_with_gatepass_end_date_present"),
+            ).label("dropped_at_lift_with_gatepass_end_date_present"),
 
             # =========================
             # SLA (4 HOURS)
@@ -3735,19 +3822,18 @@ async def get_assignment_category_summary(
             "converted_to_gp": row.converted_to_gp if row else 0,
             "gp_not_generated": row.gp_not_generated if row else 0,
             "unassigned": row.unassigned if row else 0,
-            "assigned_but_not_delivered": row.assigned_but_not_delivered if row else 0,
-            "assigned_and_delivered": row.assigned_and_delivered if row else 0,
-            "gatepass_end_date_present": row.gatepass_end_date_present if row else 0,
-            "delivered_with_gatepass_end_date_present": row.delivered_with_gatepass_end_date_present if row else 0,
+            "assigned_but_not_dropped_at_lift": row.assigned_but_not_dropped_at_lift if row else 0,
+            "assigned_and_dropped_at_lift": row.assigned_and_dropped_at_lift if row else 0,
+            "gatepass_end_date_present_means_delivered": row.gatepass_end_date_present_means_delivered if row else 0,
+            "dropped_at_lift_with_gatepass_end_date_present": row.dropped_at_lift_with_gatepass_end_date_present if row else 0,
             "delivered_within_defined_hours": row.delivered_within_defined_hours if row else 0,
             "balance_for_delivered": (
-                row.total_data - row.delivered_with_gatepass_end_date_present
+                row.total_data - row.assigned_and_dropped_at_lift
                 if row else 0
             ),
         })
 
     return summary
-
 
 async def get_assignment_overall_summary(
     db: AsyncSession,
@@ -3794,7 +3880,7 @@ async def get_assignment_overall_summary(
                         1
                     )
                 )
-            ).label("assigned_but_not_delivered"),
+            ).label("assigned_but_not_dropped_at_lift"),
 
             # ASSIGNED AND DELIVERED
             func.count(
@@ -3808,7 +3894,7 @@ async def get_assignment_overall_summary(
                         1
                     )
                 )
-            ).label("assigned_and_delivered"),
+            ).label("assigned_and_dropped_at_lift"),
 
             # DELIVERED WITH GP END DATE
             func.count(
@@ -3822,7 +3908,7 @@ async def get_assignment_overall_summary(
                         1
                     )
                 )
-            ).label("delivered_with_gatepass_end_date_present"),
+            ).label("dropped_at_lift_with_gatepass_end_date_present"),
             func.count(
                 case(
                     (
@@ -3833,7 +3919,7 @@ async def get_assignment_overall_summary(
                         1
                     )
                 )
-            ).label("gatepass_end_date_present"),
+            ).label("gatepass_end_date_present_means_delivered"),
         # 🆕 DELIVERED WITHIN 4 HOURS
             func.count(
                 case(
@@ -3876,15 +3962,152 @@ async def get_assignment_overall_summary(
         "converted_to_gp": row.converted_to_gp,
         "gp_not_generated": row.gp_not_generated,
         "unassigned": row.unassigned,
-        "assigned_but_not_delivered": row.assigned_but_not_delivered,
-        "assigned_and_delivered": row.assigned_and_delivered,
-        "gatepass_end_date_present": row.gatepass_end_date_present,
+        "assigned_but_not_dropped_at_lift": row.assigned_but_not_dropped_at_lift,
+        "assigned_and_dropped_at_lift": row.assigned_and_dropped_at_lift,
+        "gatepass_end_date_present_means_delivered": row.gatepass_end_date_present_means_delivered,
         "delivered_within_defined_hours": row.delivered_within_defined_hours,
         # FIXED: Use the correct label name
-        "delivered_with_gatepass_end_date_present": row.delivered_with_gatepass_end_date_present,
+        "dropped_at_lift_with_gatepass_end_date_present": row.dropped_at_lift_with_gatepass_end_date_present,
         "info":"we exclude shipments having gate pass end datetime from assigned and delivered related count",
         "Hints":"delivered:drop_dlv_zone present, assigned:assigned_person present, unassigned:assigned_person absent and gate_pass_end_datetime not present"
     }
+
+# async def get_assignment_overall_summary(
+#     db: AsyncSession,
+#     start_utc,
+#     end_utc,
+# ):
+#     """
+#     Overall shipment summary (ALL categories combined)
+#     """
+
+#     date_field = func.coalesce(
+#         WorkerAssignmentShipment.integrate_date_time,
+#         WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+#     )
+
+#     stmt = (
+#         select(
+#             # TOTAL SHIPMENTS
+#             func.count(WorkerAssignmentShipment.id).label("total_data"),
+
+#             # GP GENERATED
+#             func.count(
+#                 case(
+#                     (WorkerAssignmentShipment.gate_pass_no.isnot(None), 1)
+#                 )
+#             ).label("converted_to_gp"),
+
+#             # GP NOT GENERATED
+#             func.count(
+#                 case(
+#                     (WorkerAssignmentShipment.gate_pass_no.is_(None), 1)
+#                 )
+#             ).label("gp_not_generated"),
+
+#             # ASSIGNED BUT NOT DELIVERED
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.assigned_person.isnot(None),
+#                             WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("assigned_but_not_dropped_at_lift"),
+
+#             # ASSIGNED AND DELIVERED
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.assigned_person.isnot(None),
+#                             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+#                              WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("assigned_and_droped_at_lift"),
+
+#             # DELIVERED WITH GP END DATE
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("droped_at_lift_with_gatepass_end_date_present"),
+#             func.count(
+#                 case(
+#                     (
+#                         and_(  
+#                             WorkerAssignmentShipment.gate_pass_no.isnot(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("gatepass_end_date_present_means_delivered"),
+#         # 🆕 DELIVERED WITHIN 4 HOURS
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.gate_pass_issued_date_time_combo.isnot(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
+#                             func.extract(
+#                                 'epoch',
+#                                 WorkerAssignmentShipment.gate_pass_end_datetime - WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+#                             ) <= 14400  # 4 hours = 14400 seconds
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("delivered_within_defined_hours"),
+#         # 🆕 unassigned
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.assigned_person.is_(None),
+#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("unassigned"),
+#         )
+#         .where(
+#             date_field >= start_utc,
+#             date_field < end_utc
+#         )
+#     )
+
+#     row = (await db.execute(stmt)).one()
+
+#     return {
+#         "total_data": row.total_data,
+#         "converted_to_gp": row.converted_to_gp,
+#         "gp_not_generated": row.gp_not_generated,
+#         "unassigned": row.unassigned,
+#         "assigned_but_not_dropped_at_lift": row.assigned_but_not_dropped_at_lift,
+#         "assigned_and_droped_at_lift": row.assigned_and_droped_at_lift,
+#         "gatepass_end_date_present_means_delivered": row.gatepass_end_date_present_means_delivered,
+#         "delivered_within_defined_hours": row.delivered_within_defined_hours,
+#         # FIXED: Use the correct label name
+#         "droped_at_lift_with_gatepass_end_date_present": row.droped_at_lift_with_gatepass_end_date_present,
+#         "info":"we exclude shipments having gate pass end datetime from assigned and delivered related count",
+#         "Hints":"delivered:drop_dlv_zone present, assigned:assigned_person present, unassigned:assigned_person absent and gate_pass_end_datetime not present"
+#     }
 
 
 
