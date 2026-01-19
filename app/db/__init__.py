@@ -14,6 +14,7 @@ from app.db.models.importOperation.audit_log_worker_assignment import WorkerAssi
 from app.db.models.audit_log_user import UserAuditLog 
 from app.db.models.importOperation.damage_report import DamageReason,DamageReport,DamageReportAuditLog,DamageReportImage,DamageReportReason
 
+from app.db.models.domesticOperation.domestic_xray_report import DomesticXray
 
 __all__ = [
     # 'WorkerAssignment',
@@ -47,6 +48,8 @@ __all__ = [
     'DamageReportAuditLog',
     'DamageReportImage',
     'DamageReportReason',
+
+    'DomesticXray',
 ]
 
 
