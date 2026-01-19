@@ -121,6 +121,8 @@ class WorkerAssignmentHeader(Base):
             name="uq_worker_assignment_header_oc_no"
         ),
 
+         Index("idx_oc_no", "oc_no"),  # Regular index for query performance
+         
         # 2️⃣ AWB + HAWB unique (NULL-safe)
         Index(
             "uq_worker_assignment_header_awb_hawb",

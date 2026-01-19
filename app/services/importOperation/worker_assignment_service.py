@@ -1960,6 +1960,18 @@ async def process_worker_assignment(db: AsyncSession, req):
             headers_inserted += 1
         else:
             headers_updated += 1
+        
+         # 🔒 IF IRR shipment already exists for this header → SKIP OC shipment
+        irr_exists = (await db.execute(
+            select(WorkerAssignmentShipment.id).where(
+                WorkerAssignmentShipment.assignment_header_id == header_id,
+                WorkerAssignmentShipment.from_irr_table == True
+            )
+        )).first()
+
+        if irr_exists:
+            # OC merge shipment is obsolete once IRR exists
+            continue
 
         # ---- OC EVENT UPSERT
         event_stmt = (
@@ -1998,6 +2010,17 @@ async def process_worker_assignment(db: AsyncSession, req):
                         (WorkerAssignmentShipment.no_of_pc.is_(None),
                          insert(WorkerAssignmentShipment).excluded.no_of_pc),
                         else_=WorkerAssignmentShipment.no_of_pc
+                    ),
+                        "location": case(
+                                 (
+                            or_(
+                                WorkerAssignmentShipment.location.is_(None),
+                                func.trim(WorkerAssignmentShipment.location) == "",
+                                func.trim(WorkerAssignmentShipment.location) == "-"
+                            ),
+                            insert(WorkerAssignmentShipment).excluded.location
+                        ),
+                        else_=WorkerAssignmentShipment.location
                     ),
                     "updated_at": now
                 }
@@ -2080,7 +2103,35 @@ async def process_worker_assignment(db: AsyncSession, req):
 #------------ ---- CASE A: OC EVENT EXISTS
         if oc_event:
             # print("🟦 OC EVENT FOUND → APPLY OC-FIRST LOGIC")
+              # 🛡️ GLOBAL GP DUPLICATE GUARD (MUST BE HERE)
+            existing_gp_event = (
+                await db.execute(
+                    select(WorkerAssignmentShipment).where(
+                        WorkerAssignmentShipment.assignment_header_id == header_id,
+                        WorkerAssignmentShipment.gate_pass_no == irr.gate_pass_no,
+                        WorkerAssignmentShipment.id != oc_event.id
+                    )
+                )
+            ).scalars().first()
 
+            if existing_gp_event:
+                print(
+                    f"⚠️ DUPLICATE GP BLOCKED → "
+                    f"header={header_id}, gp={irr.gate_pass_no}, "
+                    f"existing_event_id={existing_gp_event.id}"
+                )
+
+                errors.append({
+                    "type": "DUPLICATE_GP_CONFLICT",
+                    "awb": irr.awb,
+                    "hawb": irr.hwb,
+                    "gate_pass_no": irr.gate_pass_no,
+                    "existing_event_id": existing_gp_event.id,
+                    "action": "oc_update_skipped"
+                })
+
+                continue  # 🔴 DO NOT UPDATE OC EVENT
+            
             # CASE A1: OC has no gate pass yet → FIRST IRR ARRIVAL
             if oc_event.gate_pass_no is None:
                 # print("🟩 FIRST IRR FOR OC → UPDATE OC EVENT WITH NEW GP")
@@ -3308,3 +3359,611 @@ async def generate_excel_stream_export_worker_assignment(
     
     # Yield the complete file
     yield output.read()
+
+
+#👌 =========================  USER / WORKER ASSIGNMENT SUMMARY ============================
+
+async def get_assignment_summary_according_to_assigned_person(
+    db: AsyncSession,
+    start_utc,
+    end_utc,
+):
+    """
+    Operator-wise shipment summary (NEW multi-level structure)
+
+    Date logic:
+    COALESCE(
+        shipment.integrate_date_time,
+        shipment.gate_pass_issued_date_time_combo
+    )
+    """
+
+    # 🔑 Date fallback logic
+    date_field = func.coalesce(
+        WorkerAssignmentShipment.integrate_date_time,
+        WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+    )
+
+    stmt = (
+        select(
+            WorkerAssignmentShipment.assigned_person.label("operator"),
+
+            # ✅ Assigned count
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
+                            WorkerAssignmentShipment.assigned_person_datetime.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("assigned"),
+
+            # ✅ Completed count
+            func.count(
+                case(
+                    (WorkerAssignmentShipment.drop_dlv_zone.isnot(None), 1)
+                )
+            ).label("completed"),
+        )
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentHeader.id == WorkerAssignmentShipment.assignment_header_id
+        )
+        .where(
+            WorkerAssignmentShipment.assigned_person.isnot(None),
+            WorkerAssignmentShipment.assigned_person_datetime.isnot(None),
+            date_field >= start_utc,
+            date_field < end_utc,
+        )
+        .group_by(WorkerAssignmentShipment.assigned_person)
+        .order_by(WorkerAssignmentShipment.assigned_person)
+    )
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    summary = []
+    total_assigned = 0
+    total_completed = 0
+
+    for row in rows:
+        assigned = row.assigned or 0
+        completed = row.completed or 0
+
+        performance = round(
+            (completed / assigned) * 100, 2
+        ) if assigned else 0
+
+        summary.append({
+            "operator": row.operator,
+            "assigned": assigned,
+            "completed": completed,
+            "performance": performance,
+        })
+
+        total_assigned += assigned
+        total_completed += completed
+
+    # ✅ TOTAL ROW
+    total_performance = round(
+        (total_completed / total_assigned) * 100, 2
+    ) if total_assigned else 0
+
+    summary.append({
+        "operator": "TOTAL",
+        "assigned": total_assigned,
+        "completed": total_completed,
+        "performance": total_performance,
+    })
+
+    return summary
+
+# 👌==================== Assignment summary based on categories like IRR, IRM, OC MERGE ===================
+
+
+# async def get_assignment_category_summary(
+#     db: AsyncSession,
+#     start_utc,
+#     end_utc,
+# ):
+#     """
+#     Dashboard summary by category:
+#     - OC_MERGE
+#     - IRM
+#     - IRR
+
+#     Shipment-based counting (NEW structure)
+#     """
+
+#     ALL_CATEGORIES = ["OC_MERGE", "IRM", "IRR"]
+#     print("start_utc",start_utc)
+#     print("end_utc",end_utc)
+#     print("something come")
+
+#     # 🔑 Category logic (shipment + header)
+#     category_case = case(
+#         (WorkerAssignmentShipment.from_irr_table.is_(True), "IRR"),
+#         (
+#             and_(
+#                 WorkerAssignmentHeader.temp_irm_oc_no.isnot(None),
+#                 WorkerAssignmentHeader.temp_irm_oc_no != ""
+#             ),
+#             "IRM"
+#         ),
+#         else_="OC_MERGE"
+#     ).label("category")
+
+#     # 🔑 Date fallback logic
+#     date_field = func.coalesce(
+#         WorkerAssignmentShipment.integrate_date_time,
+#         WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+#     )
+
+#     stmt = (
+#         select(
+#             category_case,
+
+#             # total shipment rows
+#             func.count(WorkerAssignmentShipment.id).label("count"),
+
+#             # gate pass generated
+#             func.count(
+#                 case(
+#                     (WorkerAssignmentShipment.gate_pass_no.isnot(None), 1)
+#                 )
+#             ).label("converted_to_gp"),
+
+#             # delivered
+#             func.count(
+#                 case(
+#                     (WorkerAssignmentShipment.drop_dlv_zone.isnot(None), 1)
+#                 )
+#             ).label("delivered"),
+
+#             # assigned
+#             func.count(
+#                 case(
+#                     (
+#                         and_(
+#                             WorkerAssignmentShipment.assigned_person.isnot(None),
+#                             WorkerAssignmentShipment.assigned_person_datetime.isnot(None)
+#                         ),
+#                         1
+#                     )
+#                 )
+#             ).label("assigned"),
+#         )
+#         .join(
+#             WorkerAssignmentHeader,
+#             WorkerAssignmentHeader.id == WorkerAssignmentShipment.assignment_header_id
+#         )
+#         .where(
+#             date_field >= start_utc,
+#             date_field < end_utc
+#         )
+#         .group_by(category_case)
+#     )
+
+#     result = await db.execute(stmt)
+#     rows = result.all()
+
+#     # Map results
+#     data_map = {row.category: row for row in rows}
+
+#     summary = []
+#     for cat in ALL_CATEGORIES:
+#         if cat in data_map:
+#             row = data_map[cat]
+#             summary.append({
+#                 "category": cat,
+#                 "count": row.count,
+#                 "converted_to_gp": row.converted_to_gp,
+#                 "delivered": row.delivered,
+#                 "assigned": row.assigned,
+#                 "balance_for_delivered": row.count - row.delivered,
+#             })
+#         else:
+#             summary.append({
+#                 "category": cat,
+#                 "count": 0,
+#                 "converted_to_gp": 0,
+#                 "delivered": 0,
+#                 "assigned": 0,
+#                 "balance_for_delivered": 0,
+#             })
+#     return summary
+
+async def get_assignment_category_summary(
+    db: AsyncSession,
+    start_utc,
+    end_utc,
+):
+    """
+    Category-wise shipment summary
+    (OC_MERGE / IRM / IRR)
+    """
+
+    ALL_CATEGORIES = ["OC_MERGE", "IRM", "IRR"]
+
+    category_case = case(
+        (WorkerAssignmentShipment.from_irr_table.is_(True), "IRR"),
+        (
+            and_(
+                WorkerAssignmentHeader.temp_irm_oc_no.isnot(None),
+                WorkerAssignmentHeader.temp_irm_oc_no != ""
+            ),
+            "IRM"
+        ),
+        else_="OC_MERGE"
+    ).label("category")
+
+    date_field = func.coalesce(
+        WorkerAssignmentShipment.integrate_date_time,
+        WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+    )
+
+    stmt = (
+        select(
+            category_case,
+
+            # =========================
+            # BASIC COUNTS
+            # =========================
+            func.count(WorkerAssignmentShipment.id).label("total_data"),
+
+            func.count(
+                case((WorkerAssignmentShipment.gate_pass_no.isnot(None), 1))
+            ).label("converted_to_gp"),
+
+            func.count(
+                case((WorkerAssignmentShipment.gate_pass_no.is_(None), 1))
+            ).label("gp_not_generated"),
+
+            # =========================
+            # ASSIGNMENT / DELIVERY
+            # =========================
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.is_(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("unassigned"),
+
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
+                            WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("assigned_but_not_delivered"),
+
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
+                            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("assigned_and_delivered"),
+
+            # =========================
+            # GATE PASS END
+            # =========================
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.gate_pass_no.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("gatepass_end_date_present"),
+
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("delivered_with_gatepass_end_date_present"),
+
+            # =========================
+            # SLA (4 HOURS)
+            # =========================
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
+                            func.extract(
+                                "epoch",
+                                WorkerAssignmentShipment.gate_pass_end_datetime
+                                - WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+                            ) <= 14400
+                        ),
+                        1
+                    )
+                )
+            ).label("delivered_within_defined_hours"),
+        )
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentHeader.id == WorkerAssignmentShipment.assignment_header_id
+        )
+        .where(
+            date_field >= start_utc,
+            date_field < end_utc
+        )
+        .group_by(category_case)
+    )
+
+    rows = (await db.execute(stmt)).all()
+
+    data_map = {row.category: row for row in rows}
+
+    summary = []
+    for cat in ALL_CATEGORIES:
+        row = data_map.get(cat)
+
+        summary.append({
+            "category": cat,
+            "total_data": row.total_data if row else 0,
+            "converted_to_gp": row.converted_to_gp if row else 0,
+            "gp_not_generated": row.gp_not_generated if row else 0,
+            "unassigned": row.unassigned if row else 0,
+            "assigned_but_not_delivered": row.assigned_but_not_delivered if row else 0,
+            "assigned_and_delivered": row.assigned_and_delivered if row else 0,
+            "gatepass_end_date_present": row.gatepass_end_date_present if row else 0,
+            "delivered_with_gatepass_end_date_present": row.delivered_with_gatepass_end_date_present if row else 0,
+            "delivered_within_defined_hours": row.delivered_within_defined_hours if row else 0,
+            "balance_for_delivered": (
+                row.total_data - row.delivered_with_gatepass_end_date_present
+                if row else 0
+            ),
+        })
+
+    return summary
+
+
+async def get_assignment_overall_summary(
+    db: AsyncSession,
+    start_utc,
+    end_utc,
+):
+    """
+    Overall shipment summary (ALL categories combined)
+    """
+
+    date_field = func.coalesce(
+        WorkerAssignmentShipment.integrate_date_time,
+        WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+    )
+
+    stmt = (
+        select(
+            # TOTAL SHIPMENTS
+            func.count(WorkerAssignmentShipment.id).label("total_data"),
+
+            # GP GENERATED
+            func.count(
+                case(
+                    (WorkerAssignmentShipment.gate_pass_no.isnot(None), 1)
+                )
+            ).label("converted_to_gp"),
+
+            # GP NOT GENERATED
+            func.count(
+                case(
+                    (WorkerAssignmentShipment.gate_pass_no.is_(None), 1)
+                )
+            ).label("gp_not_generated"),
+
+            # ASSIGNED BUT NOT DELIVERED
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
+                            WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("assigned_but_not_delivered"),
+
+            # ASSIGNED AND DELIVERED
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
+                            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("assigned_and_delivered"),
+
+            # DELIVERED WITH GP END DATE
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("delivered_with_gatepass_end_date_present"),
+            func.count(
+                case(
+                    (
+                        and_(  
+                            WorkerAssignmentShipment.gate_pass_no.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("gatepass_end_date_present"),
+        # 🆕 DELIVERED WITHIN 4 HOURS
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
+                            func.extract(
+                                'epoch',
+                                WorkerAssignmentShipment.gate_pass_end_datetime - WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+                            ) <= 14400  # 4 hours = 14400 seconds
+                        ),
+                        1
+                    )
+                )
+            ).label("delivered_within_defined_hours"),
+        # 🆕 unassigned
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.is_(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("unassigned"),
+        )
+        .where(
+            date_field >= start_utc,
+            date_field < end_utc
+        )
+    )
+
+    row = (await db.execute(stmt)).one()
+
+    return {
+        "total_data": row.total_data,
+        "converted_to_gp": row.converted_to_gp,
+        "gp_not_generated": row.gp_not_generated,
+        "unassigned": row.unassigned,
+        "assigned_but_not_delivered": row.assigned_but_not_delivered,
+        "assigned_and_delivered": row.assigned_and_delivered,
+        "gatepass_end_date_present": row.gatepass_end_date_present,
+        "delivered_within_defined_hours": row.delivered_within_defined_hours,
+        # FIXED: Use the correct label name
+        "delivered_with_gatepass_end_date_present": row.delivered_with_gatepass_end_date_present,
+        "info":"we exclude shipments having gate pass end datetime from assigned and delivered related count",
+        "Hints":"delivered:drop_dlv_zone present, assigned:assigned_person present, unassigned:assigned_person absent and gate_pass_end_datetime not present"
+    }
+
+
+
+
+# 👌⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️========================= AUTO ASSIGN POM OC SHIPMENT TO PERTICULAR EMPLOYEE =====================
+
+AUTO_ASSIGN_EMP_ID_POM = "523560"
+
+async def auto_assign_pom_shipments(
+    db: AsyncSession,
+    process_date: date,
+    assigned_by: str
+):
+    """
+    Auto-assign unassigned POM shipments
+    using hybrid date logic:
+    integrate_date_time OR gate_pass_issued_date_time_combo
+    """
+#   Also check comming emp_id have appropriate role to auto assign POM shipments (role = 'imp_gp_user)
+
+    # check role of user
+    user = await db.execute(select(User).where(User.emp_id == AUTO_ASSIGN_EMP_ID_POM))  
+    user_obj = user.scalars().first()
+
+    if not user_obj:
+        return {
+            "total_found": 0,
+            "assigned": 0,
+            "message": "Auto-assign user not found."
+        }
+
+    # ✅ Check if role is exactly "imp_gp_user"
+    if user_obj.role != "imp_gp_user":
+        return {
+            "total_found": 0,
+            "assigned": 0,
+            "message": "User does not have 'imp_gp_user' role required for auto-assigning POM shipments."
+        }
+
+    utc_start, utc_end = ist_day_to_utc_range(process_date)
+    now = get_utc_now()
+
+    result = await db.execute(
+        select(WorkerAssignmentShipment)
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentShipment.assignment_header_id
+            == WorkerAssignmentHeader.id,
+        )
+        .where(
+            # 🔹 POM OC only
+            WorkerAssignmentHeader.oc_no.ilike("POM%"),
+
+            # 🔹 Not assigned yet
+            WorkerAssignmentShipment.assigned_person.is_(None),
+
+            # 🔹 HYBRID DATE CONDITION (SAME AS REFERENCE)
+            or_(
+                WorkerAssignmentShipment.integrate_date_time.between(
+                    utc_start, utc_end
+                ),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                    utc_start, utc_end
+                ),
+            ),
+        )
+    )
+
+    shipments = result.scalars().all()
+
+    for shipment in shipments:
+        shipment.assigned_person = AUTO_ASSIGN_EMP_ID_POM
+        shipment.assigned_person_datetime = now
+        shipment.updated_at = now
+
+    if shipments:
+        await db.commit()
+
+    return {
+        "total_found": len(shipments),
+        "assigned": len(shipments),
+    }
