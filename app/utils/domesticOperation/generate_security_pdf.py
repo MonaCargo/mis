@@ -116,7 +116,7 @@ def generate_security_pdf(data: dict, output_dir: str = "static/pdfs") -> str:
     filename = f"{data['awb_no']}.pdf"
     filepath = os.path.join(output_dir, filename)
 
-    print('check ===================')
+    # print('check ===================')
 
     print(data.get('employee_id'))
 

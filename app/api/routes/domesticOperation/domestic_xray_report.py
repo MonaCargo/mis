@@ -2,6 +2,7 @@
 from io import BytesIO
 import math
 from fastapi import APIRouter, Body, Depends, HTTPException, UploadFile, File, Form, Query,BackgroundTasks
+from fastapi.responses import StreamingResponse
 import pandas as pd
 import pytz
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,7 @@ from app.schemas.user import UserRead
 from app.services.domesticOperation.domestic_xray_report import DomesticXrayService
 from app.schemas.domesticOperation.domestic_xray_report import (
     DomesticXrayResponse,
+    DomesticXrayStatisticsResponse,
     DomesticXrayUpdate,
     DomesticXrayUploadResponse,
     DomesticXrayFilterParams,
@@ -24,6 +26,7 @@ from app.schemas.domesticOperation.domestic_xray_report import (
     PdfGenerateStatusUpdate,
     EmailStatusUpdate,
     BulkActionResponse,
+    XrayExportRequest,
     # SecurityDeclarationCreate
 )
 from app.db.models.domesticOperation.domestic_xray_report import DomesticXray, DomesticXrayEmployee
@@ -353,19 +356,26 @@ def delete_domestic_xray_record(
         'message': f'Record {record_id} deleted successfully'
     }
 
-@router.get("/statistics")
-def get_statistics(
-    start_date: Optional[date] = Query(None, description="Statistics from date"),
-    end_date: Optional[date] = Query(None, description="Statistics to date"),
+@router.get("/summary/statistics",
+    response_model=DomesticXrayStatisticsResponse
+)
+async def get_statistics_and_summary(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Get statistics for domestic x-ray reports.
     
-    Returns counts, distributions, and other aggregate data.
-    """
-    stats = DomesticXrayService.get_statistics(db, start_date, end_date)
-    return stats
+
+            # 🔹 Convert IST date → UTC datetime range
+    start_utc, _ = convert_ist_day_to_utc_range(start_date)
+    _, end_utc = convert_ist_day_to_utc_range(end_date)
+
+
+    return await DomesticXrayService.get_statistics(
+        db=db,
+        start_utc=start_utc,
+        end_utc=end_utc
+    )
 
 @router.get("/destinations")
 def get_unique_destinations(db: AsyncSession = Depends(get_db)):
@@ -446,3 +456,84 @@ async def get_employee(user_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Employee not found")
     return emp
 
+# ==================== Export stream data in excel api =====================================
+
+
+@router.post("/export-records-by-filters-or-selection", description="Export Domestic Xray data to Excel (stramming data)")
+async def export_xray_data(
+    request: XrayExportRequest,
+    uploaded_by: str | None = None,
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        # Validate dates
+         # 🔹 Validate dates ONLY for FILTER export
+        if request.export_type == "FILTER":
+            filters = request.filters
+            if not filters:
+                raise HTTPException(400, "filters are required for FILTER export")
+
+            if filters.startDate and filters.endDate:
+                start = datetime.strptime(filters.startDate, "%Y-%m-%d")
+                end = datetime.strptime(filters.endDate, "%Y-%m-%d")
+
+                if start > end:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="startDate cannot be greater than endDate"
+                    )
+
+        filename = f"xray_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        def build_xray_export_query(request: XrayExportRequest):
+            query = select(DomesticXray)
+
+            if request.export_type == "SELECTED":
+                if not request.selected_ids:
+                    raise ValueError("selected_ids required")
+
+                return query.where(
+                    DomesticXray.id.in_(request.selected_ids)
+                ).order_by(DomesticXray.id.asc())
+
+            if request.export_type == "FILTER":
+                filters = request.filters
+                if not filters:
+                    raise ValueError("filters required")
+
+                if filters.startDate:
+                    start_utc, _ = convert_ist_day_to_utc_range(
+                        datetime.strptime(filters.startDate, "%Y-%m-%d").date()
+                    )
+                    query = query.where(DomesticXray.xray_date_time >= start_utc)
+
+                if filters.endDate:
+                    _, end_utc = convert_ist_day_to_utc_range(
+                        datetime.strptime(filters.endDate, "%Y-%m-%d").date()
+                    )
+                    query = query.where(DomesticXray.xray_date_time <= end_utc)
+
+                if filters.xray_filter_status == "pdf_generated":
+                    query = query.where(DomesticXray.is_pdf_generated.is_(True))
+
+                elif filters.xray_filter_status == "email_sent":
+                    query = query.where(DomesticXray.is_email_sent.is_(True))
+
+                return query.order_by(DomesticXray.xray_date_time.desc())
+
+            raise ValueError("Invalid export type")
+
+        base_query = build_xray_export_query(request)
+
+        filename = f"xray_export_{request.export_type.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        return StreamingResponse(
+            DomesticXrayService.generate_xray_excel_stream(db=db, base_query=base_query),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "no-cache"
+            }
+        )
+    except ValueError as e:
+        raise HTTPException(400, f"Invalid date format: {e}")

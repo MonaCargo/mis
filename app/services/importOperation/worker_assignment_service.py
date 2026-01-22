@@ -1691,6 +1691,15 @@ class WorkerAssignmentFilters:
         shipment = self.shipment
         status = self.status
 
+         # ------------------------------------------------
+        # 🔥 NEW: GP GENERATED (ignore everything except date)
+        # ------------------------------------------------
+        if status == "gp_generated":
+            return query.where(
+                shipment.gate_pass_no.isnot(None),
+                func.trim(shipment.gate_pass_no) != ""
+            )
+
         # -----------------------------
         # 1️⃣ GP DELIVERED (ONLY delivered)
         # -----------------------------
@@ -3650,6 +3659,7 @@ async def get_assignment_summary_according_to_assigned_person(
 
 #     return summary
 
+
 async def get_assignment_category_summary(
     db: AsyncSession,
     start_utc,
@@ -3802,8 +3812,12 @@ async def get_assignment_category_summary(
             WorkerAssignmentHeader.id == WorkerAssignmentShipment.assignment_header_id
         )
         .where(
-            date_field >= start_utc,
-            date_field < end_utc
+            # date_field >= start_utc,
+            # date_field < end_utc
+             or_(
+                WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(start_utc, end_utc)
+            )
         )
         .group_by(category_case)
     )
@@ -3948,14 +3962,104 @@ async def get_assignment_overall_summary(
                     )
                 )
             ).label("unassigned"),
+             # 🆕 Gatepass End date not present(not delivered ) 
+            func.count(
+                case(
+                    (
+                        and_(
+                            # WorkerAssignmentShipment.assigned_person.is_(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+                            WorkerAssignmentShipment.gate_pass_no.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("not_gatepass_end_date_but_have_gp_no"),
+                         # 🆕 Gatepass End date not present(not delivered ) and how many are unassigned
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.is_(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+                            WorkerAssignmentShipment.gate_pass_no.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("not_gatepass_end_date_but_have_gp_no_and_unassigned"),
+
+                        # 🆕 Gatepass End date not present(not delivered ) and how many are assigned and not drop at lift
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
+                            WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+                            WorkerAssignmentShipment.gate_pass_no.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("not_gatepass_end_date_but_have_gp_no_and_assigned_notdropatlift"),
+                 # 🆕 Gatepass End date not present(not delivered ) and how many are assigned and not drop at lift
+            func.count(
+                case(
+                    (
+                        and_(
+                            WorkerAssignmentShipment.assigned_person.isnot(None),
+                            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+                            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+                            WorkerAssignmentShipment.gate_pass_no.isnot(None)
+                        ),
+                        1
+                    )
+                )
+            ).label("not_gatepass_end_date_but_have_gp_no_and_assigned_dropatlift"),
         )
         .where(
-            date_field >= start_utc,
-            date_field < end_utc
+            # date_field >= start_utc,
+            # date_field < end_utc
+             or_(
+                WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(start_utc, end_utc)
+            )
         )
     )
 
+
+
     row = (await db.execute(stmt)).one()
+
+    ton_stmt = (
+        select(
+            WorkerAssignmentShipment.drop_dlv_zone.label("ton_category"),
+            func.count(WorkerAssignmentShipment.id).label("count"),
+        )
+        .where(
+            # ✅ SAME business logic written DIRECTLY
+            WorkerAssignmentShipment.assigned_person.isnot(None),
+            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+            WorkerAssignmentShipment.gate_pass_no.isnot(None),
+
+            # ✅ SAME date filter you already use
+            or_(
+                WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                    start_utc, end_utc
+                ),
+            )
+        )
+        .group_by(WorkerAssignmentShipment.drop_dlv_zone)
+    )
+
+    ton_rows = (await db.execute(ton_stmt)).all()
+    have_gatepass_and_assigned_drop_at_lift_ton_split = {
+        row.ton_category: row.count
+        for row in ton_rows
+    }
 
     return {
         "total_data": row.total_data,
@@ -3967,10 +4071,126 @@ async def get_assignment_overall_summary(
         "gatepass_end_date_present_means_delivered": row.gatepass_end_date_present_means_delivered,
         "delivered_within_defined_hours": row.delivered_within_defined_hours,
         # FIXED: Use the correct label name
+        "not_gatepass_end_date_but_have_gp_no_and_assigned_dropatlift": row.not_gatepass_end_date_but_have_gp_no_and_assigned_dropatlift,
+        "not_gatepass_end_date_but_have_gp_no_and_assigned_notdropatlift": row.not_gatepass_end_date_but_have_gp_no_and_assigned_notdropatlift,
+        "not_gatepass_end_date_but_have_gp_no_and_unassigned": row.not_gatepass_end_date_but_have_gp_no_and_unassigned,
+        "not_gatepass_end_date_but_have_gp_no": row.not_gatepass_end_date_but_have_gp_no,
+        "have_gatepass_and_assigned_drop_at_lift_ton_split":have_gatepass_and_assigned_drop_at_lift_ton_split,
+        # ---------
         "dropped_at_lift_with_gatepass_end_date_present": row.dropped_at_lift_with_gatepass_end_date_present,
         "info":"we exclude shipments having gate pass end datetime from assigned and delivered related count",
         "Hints":"delivered:drop_dlv_zone present, assigned:assigned_person present, unassigned:assigned_person absent and gate_pass_end_datetime not present"
     }
+
+
+async def get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no(
+    db: AsyncSession,
+    start_date: str,
+    end_date: str,
+):
+    """
+    Worker-wise breakdown for:
+    - assigned
+    - GP present
+    - NOT delivered (gate_pass_end_datetime IS NULL)
+    - NOT dropped at lift (drop_dlv_zone IS NULL)`
+    """
+
+    # 🔁 Convert IST → UTC using your existing util
+    utc_start, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    _, utc_end = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+    # stmt = (
+    #     select(
+    #         User.id.label("user_id"),
+    #         User.name.label("user_name"),
+    #         func.count(WorkerAssignmentShipment.id).label("assigned_count"),
+    #     )
+    #    .join(
+    #         User,
+    #         User.emp_id == WorkerAssignmentShipment.assigned_person
+    #     )
+    #     .where(
+    #         # Core business conditions
+    #         WorkerAssignmentShipment.assigned_person.isnot(None),
+    #         WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+    #         WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+    #         WorkerAssignmentShipment.gate_pass_no.isnot(None),
+
+    #         # Date filter (same as summary)
+    #         or_(
+    #             WorkerAssignmentShipment.integrate_date_time.between(utc_start, utc_end),
+    #             WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+    #                 utc_start, utc_end
+    #             ),
+    #         )
+    #     )
+    #     .group_by(User.id, User.name)
+    #     .order_by(func.count(WorkerAssignmentShipment.id).desc())
+    # )
+
+    stmt = (
+        select(
+            User.id.label("user_id"),
+            User.name.label("user_name"),
+            User.emp_id.label("emp_id"),
+
+            # count
+            func.count(WorkerAssignmentShipment.id).label("assigned_count"),
+
+            # ✅ separate sums
+            func.coalesce(
+                func.sum(WorkerAssignmentShipment.chg_wgt_in_kg), 0
+            ).label("total_chargeable_weight"),
+
+            func.coalesce(
+                func.sum(WorkerAssignmentShipment.weight_in_kgs), 0
+            ).label("total_gross_weight"),
+
+            func.coalesce(
+                func.sum(WorkerAssignmentShipment.no_of_pc), 0
+            ).label("total_pcs"),
+        )
+        .join(
+            User,
+            User.emp_id == WorkerAssignmentShipment.assigned_person
+        )
+        .where(
+            WorkerAssignmentShipment.assigned_person.isnot(None),
+            WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+            WorkerAssignmentShipment.gate_pass_no.isnot(None),
+
+            or_(
+                WorkerAssignmentShipment.integrate_date_time.between(utc_start, utc_end),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                    utc_start, utc_end
+                ),
+            )
+        )
+        .group_by(User.id, User.name)
+        .order_by(func.count(WorkerAssignmentShipment.id).desc())
+    )
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    return {
+        "total_workers": len(rows),
+        "data": [
+            {
+                "user_id": row.user_id,
+                "emp_id":row.emp_id,
+                "name": row.user_name,
+                "assigned_count": row.assigned_count,
+                "total_gross_weight":row.total_gross_weight,
+                "total_chargeable_weight":row.total_chargeable_weight,
+                "total_pcs":row.total_pcs
+            }
+            for row in rows
+        ],
+    }
+
 
 # async def get_assignment_overall_summary(
 #     db: AsyncSession,
@@ -4108,6 +4328,275 @@ async def get_assignment_overall_summary(
 #         "info":"we exclude shipments having gate pass end datetime from assigned and delivered related count",
 #         "Hints":"delivered:drop_dlv_zone present, assigned:assigned_person present, unassigned:assigned_person absent and gate_pass_end_datetime not present"
 #     }
+
+
+# ✌️========Get accuracy summary based on time (on unassigned ands assigned shipments):==============
+
+# async def get_shipment_delay_dashboard_data(db):
+#     now = get_utc_now()
+#     not_assigned_threshold = now - timedelta(minutes=15)
+#     assigned_threshold = now - timedelta(minutes=30)
+
+#     # ---------------------------
+#     # COUNT QUERIES
+#     # ---------------------------
+#     not_assigned_count_stmt = select(func.count()).where(
+#         WorkerAssignmentShipment.assigned_person.is_(None),
+#         WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+#         WorkerAssignmentShipment.created_at <= not_assigned_threshold,
+#     )
+
+#     assigned_not_delivered_count_stmt = select(func.count()).where(
+#         WorkerAssignmentShipment.assigned_person.isnot(None),
+#         WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+#         WorkerAssignmentShipment.assigned_person_datetime <= assigned_threshold,
+#     )
+
+#     not_assigned_count = await db.scalar(not_assigned_count_stmt)
+#     assigned_not_delivered_count = await db.scalar(
+#         assigned_not_delivered_count_stmt
+#     )
+
+#     # ---------------------------
+#     # LIST QUERIES
+#     # ---------------------------
+#     not_assigned_list_stmt = (
+#         select(WorkerAssignmentShipment)
+#         .where(
+#             WorkerAssignmentShipment.assigned_person.is_(None),
+#             WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+#             WorkerAssignmentShipment.created_at <= not_assigned_threshold,
+#         )
+#         .order_by(WorkerAssignmentShipment.created_at)
+#     )
+
+#     assigned_not_delivered_list_stmt = (
+#         select(WorkerAssignmentShipment)
+#         .where(
+#             WorkerAssignmentShipment.assigned_person.isnot(None),
+#             WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+#             WorkerAssignmentShipment.assigned_person_datetime <= assigned_threshold,
+#         )
+#         .order_by(WorkerAssignmentShipment.assigned_person_datetime)
+#     )
+
+#     not_assigned_rows = (
+#         await db.execute(not_assigned_list_stmt)
+#     ).scalars().all()
+
+#     assigned_not_delivered_rows = (
+#         await db.execute(assigned_not_delivered_list_stmt)
+#     ).scalars().all()
+
+#     return {
+#         "counts": {
+#             "not_assigned_15_min": not_assigned_count,
+#             "assigned_not_delivered_30_min": assigned_not_delivered_count,
+#         },
+#         "data": {
+#             "not_assigned_15_min": not_assigned_rows,
+#             "assigned_not_delivered_30_min": assigned_not_delivered_rows,
+#         },
+#     }
+
+
+def build_pagination(total: int, limit: int, offset: int):
+    return {
+        "total_records": total,
+        "limit": limit,
+        "offset": offset,
+        "current_page": (offset // limit) + 1,
+        "total_pages": (total + limit - 1) // limit if limit else 0,
+        "has_next": offset + limit < total,
+        "has_prev": offset > 0,
+    }
+
+async def get_shipment_delay_details(
+    db,
+    sla_type: str,
+    lookback_days: int = 3,
+    limit: int = 20,
+    offset: int = 0,
+):
+    MAX_LIMIT = 200
+    lookback_days = min(lookback_days, 20)
+    limit = min(limit, MAX_LIMIT)
+
+    now = get_utc_now()
+    data_start_time = now - timedelta(days=lookback_days)
+
+    not_assigned_threshold = now - timedelta(minutes=15)
+    assigned_threshold = now - timedelta(minutes=30)
+
+    # ----------------------------
+    # SLA: NOT ASSIGNED 15 MIN
+    # ----------------------------
+    if sla_type == "NOT_ASSIGNED_15_MIN":
+        base_filter = [
+            WorkerAssignmentShipment.created_at >= data_start_time,
+            WorkerAssignmentShipment.assigned_person.is_(None),
+            WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+            WorkerAssignmentShipment.created_at <= not_assigned_threshold,
+        ]
+
+        total_stmt = select(func.count()).where(*base_filter)
+
+        data_stmt = (
+            select(
+                WorkerAssignmentShipment.id,
+                WorkerAssignmentShipment.created_at,
+                WorkerAssignmentHeader.awb_no,
+                WorkerAssignmentHeader.hawb,
+                WorkerAssignmentHeader.oc_no,
+            )
+            .join(
+                WorkerAssignmentHeader,
+                WorkerAssignmentHeader.id
+                == WorkerAssignmentShipment.assignment_header_id,
+            )
+            .where(*base_filter)
+            .order_by(WorkerAssignmentShipment.created_at)
+            .limit(limit)
+            .offset(offset)
+        )
+
+    # ----------------------------
+    # SLA: ASSIGNED NOT DELIVERED 30 MIN
+    # ----------------------------
+    elif sla_type == "ASSIGNED_NOT_DELIVERED_30_MIN":
+        base_filter = [
+            WorkerAssignmentShipment.created_at >= data_start_time,
+            WorkerAssignmentShipment.assigned_person.isnot(None),
+            WorkerAssignmentShipment.assigned_person_datetime.isnot(None),
+            WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+            WorkerAssignmentShipment.assigned_person_datetime <= assigned_threshold,
+        ]
+
+        total_stmt = select(func.count()).where(*base_filter)
+
+        data_stmt = (
+            select(
+                WorkerAssignmentShipment.id,
+                WorkerAssignmentShipment.assigned_person,
+                WorkerAssignmentShipment.assigned_person_datetime,
+                WorkerAssignmentHeader.awb_no,
+                WorkerAssignmentHeader.hawb,
+                WorkerAssignmentHeader.oc_no,
+            )
+            .join(
+                WorkerAssignmentHeader,
+                WorkerAssignmentHeader.id
+                == WorkerAssignmentShipment.assignment_header_id,
+            )
+            .where(*base_filter)
+            .order_by(WorkerAssignmentShipment.assigned_person_datetime)
+            .limit(limit)
+            .offset(offset)
+        )
+
+    else:
+        raise ValueError("Invalid SLA type")
+
+    total = await db.scalar(total_stmt)
+    rows = (await db.execute(data_stmt)).all()
+
+    return {
+        "sla_type": sla_type,
+        "pagination": build_pagination(total, limit, offset),
+        "records": [dict(r._mapping) for r in rows],
+    }
+
+
+async def get_shipment_delay_dashboard_counts(
+    db,
+    lookback_days: int = 3,
+):
+    lookback_days = min(lookback_days, 20)
+
+    now = get_utc_now()
+    data_start_time = now - timedelta(days=lookback_days)
+
+    not_assigned_threshold = now - timedelta(minutes=15)
+    assigned_threshold = now - timedelta(minutes=30)
+
+    not_assigned_count_stmt = select(func.count()).where(
+        WorkerAssignmentShipment.created_at >= data_start_time,
+        WorkerAssignmentShipment.assigned_person.is_(None),
+        WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+        WorkerAssignmentShipment.created_at <= not_assigned_threshold,
+    )
+
+    assigned_not_delivered_count_stmt = select(func.count()).where(
+        WorkerAssignmentShipment.created_at >= data_start_time,
+        WorkerAssignmentShipment.assigned_person.isnot(None),
+        WorkerAssignmentShipment.assigned_person_datetime.isnot(None),
+        WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+        WorkerAssignmentShipment.assigned_person_datetime <= assigned_threshold,
+    )
+
+    return {
+        "info": {
+            "lookback_days": lookback_days,
+            "data_from": data_start_time,
+            "data_upto": now,
+            "sla_rules": {
+                "not_assigned_minutes": 15,
+                "assigned_not_delivered_minutes": 30,
+            },
+        },
+        "counts": {
+            "not_assigned_15_min": await db.scalar(not_assigned_count_stmt),
+            "assigned_not_delivered_30_min": await db.scalar(
+                assigned_not_delivered_count_stmt
+            ),
+        },
+    }
+
+    # =====================================================
+    # RESPONSE
+    # =====================================================
+    return {
+        "info": {
+            "lookback_days": lookback_days,
+            "data_from": data_start_time,
+            "data_upto": now,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+            },
+            "sla_rules": {
+                "not_assigned_minutes": 15,
+                "assigned_not_delivered_minutes": 30,
+            },
+        },
+        "counts": {
+            "not_assigned_15_min": not_assigned_count,
+            "assigned_not_delivered_30_min": assigned_not_delivered_count,
+        },
+        "data": {
+            "not_assigned_15_min": [
+                {
+                    "shipment_id": r.id,
+                    "awb_no": r.awb_no,
+                    "hawb": r.hawb,
+                    "oc_no": r.oc_no,
+                    "created_at": r.created_at,
+                }
+                for r in not_assigned_rows
+            ],
+            "assigned_not_delivered_30_min": [
+                {
+                    "shipment_id": r.id,
+                    "awb_no": r.awb_no,
+                    "hawb": r.hawb,
+                    "oc_no": r.oc_no,
+                    "assigned_person": r.assigned_person,
+                    "assigned_person_datetime": r.assigned_person_datetime,
+                }
+                for r in assigned_not_delivered_rows
+            ],
+        },
+    }
 
 
 
