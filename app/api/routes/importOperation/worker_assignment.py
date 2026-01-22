@@ -592,7 +592,10 @@ from app.services.importOperation.worker_assignment_service import (
     get_assignment_category_summary,
     get_assignment_overall_summary,
     get_assignment_summary_according_to_assigned_person,
+    get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no,
     get_paginated_worker_assignments_data_list,
+    get_shipment_delay_dashboard_counts,
+    get_shipment_delay_details,
     get_worker_assignment_lists_by_emp_id,
     process_worker_assignment,
     search_in_worker_assignments,
@@ -709,7 +712,11 @@ async def get_paginated_worker_assignments(
             "unassigned",
             "dlv_added",
             "assigned_but_not_delivered",
-            "gp_delivered",
+     
+            "gp_generated", # those who have gatepass no. irrespective of gate pass enddate time present or not
+            "gp_delivered", # those who have gatepass end date time
+
+
         ]
 
         if status_value not in allowed:
@@ -1059,6 +1066,69 @@ async def assignment_category_summary(
         "overall": overall_summary,
         "by_category": category_summary
     }
+
+
+# Assigned and not droped at lift user level counts (which have gatepass no. only those data taken here)
+@router.get("/assigned_not-dropped-at-lift/by-worker")
+async def get_not_dropped_at_lift_by_worker(
+    start_date: str = Query(..., example="2026-01-01"),
+    end_date: str = Query(..., example="2026-01-31"),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
+
+    if start_date > end_date:
+        raise HTTPException(400, "start_date cannot be after end_date")
+
+    return await get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no(
+        db=db,
+        start_date=start_date,   # ✅ STRING
+        end_date=end_date,       # ✅ STRING
+    )
+
+
+
+
+# Get time based (delayed in assigned or unassigned and drop dlv zone added time) shipment data
+@router.get(
+    "/shipment-delay/dashboard/counts",
+    summary="Shipment SLA dashboard (counts only)",
+)
+async def shipment_delay_dashboard(
+    lookback_days: int = Query(3, ge=1, le=20),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_shipment_delay_dashboard_counts(
+        db=db,
+        lookback_days=lookback_days,
+    )
+
+
+@router.get(
+    "/shipment-delay/details",
+    summary="Shipment SLA delayed shipments (paginated)",
+)
+async def shipment_delay_details(
+    sla_type: str = Query(
+        ...,
+        description="NOT_ASSIGNED_15_MIN | ASSIGNED_NOT_DELIVERED_30_MIN",
+    ),
+    lookback_days: int = Query(3, ge=1, le=20),
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_shipment_delay_details(
+        db=db,
+        sla_type=sla_type,
+        lookback_days=lookback_days,
+        limit=limit,
+        offset=offset,
+    )
 
 
 # 👌============================ AUTO ASSIGN POM OC SHIPMENT TO PERTICULAR EMPLOYEE =====================
