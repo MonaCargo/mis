@@ -1,19 +1,23 @@
 # services/domestic_xray_service.py
 import asyncio
+import io
 from fastapi import BackgroundTasks
+import pytz
 import os, base64, msal, requests
 import re
 import time
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func, select, update, delete
+from sqlalchemy import and_, case, or_, func, select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException, UploadFile
-from typing import Optional, List
+from typing import AsyncGenerator, Optional, List
 from datetime import datetime, date, timedelta, timezone ,time as dt_time
 import pandas as pd
+import xlsxwriter
 from app.db.models.domesticOperation.domestic_xray_report import DomesticXrayEmployee
 
 from app.db.models.domesticOperation.domestic_xray_report import DomesticXray
+from app.db.models.user import User
 from app.schemas.domesticOperation.domestic_xray_report import (
     DomesticXrayCreate,
     DomesticXrayUpdate,
@@ -28,11 +32,14 @@ from app.utils.domesticOperation.generate_security_pdf import generate_security_
 from app.utils.domesticOperation.xray_report_cleaner import DomesticXrayDataCleaner
 from dotenv import load_dotenv
 
-
-RECIPIENT_098 = "dcsc.developer@cscindia.in" 
-RECIPIENT_775 = "dcsc.developer@cscindia.in"
+RECIPIENT_098 = "Deldm.domcgo@airindia.com" 
+RECIPIENT_775 = "del.cgo@spicejet.com"
 VIKASH_EMAIL = "vikas.kanodia@cscindia.in"
-
+# AI_EMAIL = ''
+# SPICEJET_EMAIL = ''
+VINEET_EMAIL = 'vineet.tiwari@cscindia.in'
+SECURITY_EMAIL = 'security.dcsc@cscindia.in'
+DEVELOPER_EMAIL = 'dcsc.developer@cscindia.in'
 
 load_dotenv()
 def get_env_variable(name: str) -> str:
@@ -47,7 +54,7 @@ CLIENT_ID = get_env_variable("CLIENT_ID")
 CLIENT_SECRET = get_env_variable("CLIENT_SECRET")
 SENDER_EMAIL = get_env_variable("SENDER_EMAIL")
 
-print(f"TENANT_ID: {TENANT_ID} CLIENT_ID: {CLIENT_ID} SENDER_EMAIL: {SENDER_EMAIL} cLIENT_SECRET: {CLIENT_SECRET}")
+# print(f"TENANT_ID: {TENANT_ID} CLIENT_ID: {CLIENT_ID} SENDER_EMAIL: {SENDER_EMAIL} cLIENT_SECRET: {CLIENT_SECRET}")
 
 # Helper functions for safe type conversion
 def safe_int(value):
@@ -369,16 +376,16 @@ class DomesticXrayService:
                 res = await DomesticXrayService.get_domestic_employee_by_user_id(db=db, user_id=user_id)
                 employee_id = res.employee_id if res else None
 
-            print("payload ===================", payload)
+            # print("payload ===================", payload)
 
             data = transform_backend_payload(payload, employee_id)
-            print("transformed data ===================", data)
+            # print("transformed data ===================", data)
 
             pdf_path = generate_security_pdf(data)
-            print(f"Generated PDF at: {pdf_path}")
+            # print(f"Generated PDF at: {pdf_path}")
 
             elapsed = time.perf_counter() - start_time
-            print(f"PDF processing took {elapsed:.2f} seconds")
+            # print(f"PDF processing took {elapsed:.2f} seconds")
 
             awb = data["awb_no"].replace("-", "") if "-" in data["awb_no"] else data["awb_no"]
 
@@ -438,6 +445,7 @@ class DomesticXrayService:
 
                 # Recipient logic
                 if awb_no_clean.startswith("098"):
+                    # recipient_email = RECIPIENT_098
                     recipient_email = RECIPIENT_098
                     receipient_name = "Air India Cargo"
 
@@ -472,6 +480,7 @@ class DomesticXrayService:
                         },
                         "toRecipients": [{"emailAddress": {"address": recipient_email}}],
                         "ccRecipients": [{"emailAddress": {"address": VIKASH_EMAIL}}],
+                        #"bccRecipients": [{"emailAddress": {"address": DEVELOPER_EMAIL}}],
                         "attachments": [{
                             "@odata.type": "#microsoft.graph.fileAttachment",
                             "name": os.path.basename(pdf_path),
@@ -493,10 +502,10 @@ class DomesticXrayService:
                         .where(and_(DomesticXray.awb_no == awb_no_clean, DomesticXray.seq_num == doc_no))
                         .values(
                             is_email_sent=True,
-                            email_sent_date_time=datetime.utcnow(),
+                            email_sent_date_time=get_utc_now,
                             retry_count=attempt,
                             email_error_message=None,
-                            updated_at=datetime.utcnow()
+                            updated_at=get_utc_now()
                         )
                     )
                     await db.execute(stmt)
@@ -509,7 +518,7 @@ class DomesticXrayService:
                         print(f"Failed to delete PDF: {e}")
 
                     elapsed = time.perf_counter() - start_time
-                    print(f"✅ Email processing took {elapsed:.2f} seconds")
+                    # print(f"✅ Email processing took {elapsed:.2f} seconds")
                     return  # Exit after success
 
                 # ❌ API error (non-202 response)
@@ -884,83 +893,112 @@ class DomesticXrayService:
     @staticmethod
     async def get_statistics(
         db: AsyncSession,
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None
-    ) -> dict:
-        """Get statistics for domestic x-ray reports"""
-        # Build base query with filters
-        conditions = []
-        
-        if start_date:
-            start_datetime = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
-            conditions.append(DomesticXray.xray_date_time >= start_datetime)
-        
-        if end_date:
-            end_datetime = datetime.combine(end_date, datetime.max.time(), tzinfo=timezone.utc)
-            conditions.append(DomesticXray.xray_date_time <= end_datetime)
-        
-        # Total records
-        count_query = select(func.count()).select_from(DomesticXray)
-        if conditions:
-            count_query = count_query.where(and_(*conditions))
-        
-        total_result = await db.execute(count_query)
-        total_records = total_result.scalar()
-        
-        # Printed records
-        printed_query = select(func.count()).select_from(DomesticXray).where(DomesticXray.is_pdf_generated == True)
-        if conditions:
-            printed_query = printed_query.where(and_(*conditions))
-        
-        printed_result = await db.execute(printed_query)
-        printed_records = printed_result.scalar()
-        
-        # Emailed records
-        emailed_query = select(func.count()).select_from(DomesticXray).where(DomesticXray.is_email_sent == True)
-        if conditions:
-            emailed_query = emailed_query.where(and_(*conditions))
-        
-        emailed_result = await db.execute(emailed_query)
-        emailed_records = emailed_result.scalar()
-        
-        # Unique counts
-        unique_awbs_query = select(func.count(func.distinct(DomesticXray.awb_no)))
-        unique_dest_query = select(func.count(func.distinct(DomesticXray.destination)))
-        unique_agents_query = select(func.count(func.distinct(DomesticXray.agent_name)))
-        
-        if conditions:
-            unique_awbs_query = unique_awbs_query.where(and_(*conditions))
-            unique_dest_query = unique_dest_query.where(and_(*conditions))
-            unique_agents_query = unique_agents_query.where(and_(*conditions))
-        
-        unique_awbs = (await db.execute(unique_awbs_query)).scalar()
-        unique_destinations = (await db.execute(unique_dest_query)).scalar()
-        unique_agents = (await db.execute(unique_agents_query)).scalar()
-        
-        # X-ray type distribution
-        xray_query = select(
-            DomesticXray.xray_type,
-            func.count(DomesticXray.id).label('count')
-        ).group_by(DomesticXray.xray_type)
-        
-        if conditions:
-            xray_query = xray_query.where(and_(*conditions))
-        
-        xray_result = await db.execute(xray_query)
-        xray_types = xray_result.all()
-        
+        start_utc: date | None,
+        end_utc: date | None
+    ):
+        filters = []
+
+
+        if start_utc:
+            filters.append(DomesticXray.xray_date_time >= start_utc)
+
+        if end_utc:
+            filters.append(DomesticXray.xray_date_time <= end_utc)
+
+        # ==========================
+        # OVERALL STATS
+        # ==========================
+        overall_stmt = select(
+            func.count(DomesticXray.id).label("total"),
+            func.sum(
+                case((DomesticXray.is_email_sent.is_(True), 1), else_=0)
+            ).label("email_sent"),
+            func.sum(
+                case((DomesticXray.is_email_sent.is_(False), 1), else_=0)
+            ).label("email_not_sent"),
+        ).where(*filters)
+
+        overall_result = await db.execute(overall_stmt)
+        overall = overall_result.one()
+
+        # ==========================
+        # AIRLINE BASED STATS
+        # ==========================
+        airline_stmt = select(
+            case(
+                (DomesticXray.awb_no.like("098%"), "Air India"),
+                (DomesticXray.awb_no.like("775%"), "SpiceJet"),
+                else_="Other"
+            ).label("airline"),
+
+            func.count(DomesticXray.id).label("total"),
+            func.sum(
+                case((DomesticXray.is_email_sent.is_(True), 1), else_=0)
+            ).label("email_sent"),
+            func.sum(
+                case((DomesticXray.is_email_sent.is_(False), 1), else_=0)
+            ).label("email_not_sent"),
+        ).where(
+            *filters,
+            DomesticXray.awb_no.isnot(None)
+        ).group_by("airline")
+
+        airline_result = await db.execute(airline_stmt)
+        airline_rows = airline_result.all()
+
+        airline_summary = {
+            row.airline: {
+                "total": row.total,
+                "email_sent": row.email_sent,
+                "email_not_sent": row.email_not_sent
+            }
+            for row in airline_rows
+        }
+
+        # ==========================
+        # USER BASED EMAIL STATS
+        # ==========================
+        user_stmt = (
+            select(
+                User.emp_id.label("emp_id"),
+                User.name.label("name"),
+                func.count(DomesticXray.id).label("email_sent_count"),
+            )
+            .join(
+                User,
+                DomesticXray.email_sent_by == User.emp_id
+            )
+            .where(
+                *filters,
+                DomesticXray.is_email_sent.is_(True)
+            )
+            .group_by(User.emp_id, User.name)
+            .order_by(func.count(DomesticXray.id).desc())
+        )
+
+        user_result = await db.execute(user_stmt)
+        user_rows = user_result.all()
+
+        user_summary = [
+            {
+                "emp_id": row.emp_id,
+                "name": row.name,
+                "email_sent_count": row.email_sent_count
+            }
+            for row in user_rows
+        ]
+
+
         return {
-            'total_records': total_records,
-            'printed_records': printed_records,
-            'emailed_records': emailed_records,
-            'unique_awbs': unique_awbs,
-            'unique_destinations': unique_destinations,
-            'unique_agents': unique_agents,
-            'xray_type_distribution': [{'type': xt[0], 'count': xt[1]} for xt in xray_types if xt[0]]
+            "overall_summary": {
+                "total": overall.total or 0,
+                "email_sent": overall.email_sent or 0,
+                "email_not_sent": overall.email_not_sent or 0
+            },
+            "airline_summary": airline_summary,
+            "user_email_summary": user_summary
         }
     
-
-
 # =================== Domestic X- ray User ====================================
 # services.py
 
@@ -1005,3 +1043,121 @@ class DomesticXrayService:
         )
         emp = result.scalar_one_or_none()
         return EmployeeResponse.model_validate(emp) if emp else None
+
+
+# ==================== export streaming data based on comming flag =====================
+    @staticmethod
+    async def generate_xray_excel_stream(
+        db: AsyncSession,
+        base_query,
+        uploaded_by: str = None,
+        chunk_size: int = 1000
+    ) -> AsyncGenerator[bytes, None]:
+
+        output = io.BytesIO()
+        workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+        worksheet = workbook.add_worksheet("Xray Report")
+
+        # --------------
+        # utils/xray_excel_columns.py
+        DYNAMIC_XRAY_COLUMNS = [
+            # header_name, source, field_name, format_type
+            ("S.No", "computed", "s_no", "center"),
+            ("Seq No", "model", "seq_num", "text"),
+            ("AWB No", "model", "awb_no", "text"),
+            ("Destination", "model", "destination", "text"),
+            # ("Acceptance Date", "model", "accp_date", "date"),
+            ("Acceptance DateTime", "model", "merge_acceptance_date_time", "date"),
+            ("Accepted Pcs", "model", "accp_pcs", "int"),
+            ("Rejected Pcs", "model", "rej_pcs", "int"),
+            ("Gross Weight", "model", "gross_weight", "number"),
+            ("Rejected Gross Weight", "model", "rej_gross_weight", "number"),
+            ("Chargeable Weight", "model", "chg_weight", "number"),
+            ("SHC", "model", "shc", "text"),
+            ("Name of Goods", "model", "name_of_goods", "text"),
+            ("Agent Name", "model", "agent_name", "text"),
+            ("Freighter Type", "model", "freighter_type", "text"),
+            ("X-ray Type", "model", "xray_type", "text"),
+            ("PHS Pcs", "model", "phs_pcs", "int"),
+            ("ETD Pcs", "model", "etd_pcs", "int"),
+            ("EDS Pcs", "model", "eds_pcs", "int"),
+            ("EDD Pcs", "model", "edd_pcs", "int"),
+            ("VCK Pcs", "model", "vck_pcs", "int"),
+            ("CMD Pcs", "model", "cmd_pcs", "int"),
+            ("X-ray DateTime", "model", "xray_date_time", "date"),
+            ("X-ray User", "model", "xray_user", "text"),
+            ("Serial No", "model", "serial_no", "text"),
+            ("Remarks", "model", "remarks", "text"),
+            ("PDF Generated", "model", "is_pdf_generated", "center"),
+            ("PDF Generated DateTime", "model", "pdf_generated_date_time", "date"),
+            ("Email Sent", "model", "is_email_sent", "center"),
+            ("Email Sent DateTime", "model", "email_sent_date_time", "date"),
+            # ("Uploaded By", "model", "uploaded_by", "text"),
+            # ("Retry Count", "model", "retry_count", "int"),
+            # ("Email Error Message", "model", "email_error_message", "text"),
+            ("Created At", "model", "created_at", "date"),
+            # ("Updated At", "model", "updated_at", "date"),
+        ]
+
+        # -----------
+        
+        # Create formats
+        formats = {
+            "header": workbook.add_format({'bold': True, 'border': 1, 'align': 'center', 'valign': 'vcenter'}),
+            "text": workbook.add_format({'align': 'left', 'valign': 'top', 'text_wrap': True}),
+            "number": workbook.add_format({'num_format': '0.00', 'align': 'right'}),
+            "int": workbook.add_format({'num_format': '0', 'align': 'right'}),
+            "date": workbook.add_format({'num_format': 'dd/mm/yyyy hh:mm', 'align': 'left'}),
+            "center": workbook.add_format({'align': 'center', 'valign': 'vcenter'}),
+        }
+
+        # headers
+        for col_num, (header_name, *_rest) in enumerate(DYNAMIC_XRAY_COLUMNS):
+            worksheet.write(0, col_num, header_name, formats["header"])
+
+        worksheet.freeze_panes(1, 0)
+        worksheet.set_column(0, len(DYNAMIC_XRAY_COLUMNS) - 1, 18)
+
+        row_num = 1
+        offset = 0
+
+        while True:
+            paginated_query = base_query.offset(offset).limit(chunk_size)
+            result = await db.execute(paginated_query)
+            records = result.scalars().all()
+
+            if not records:
+                break
+
+            for record in records:
+                for col_num, (_, source, field_name, fmt_type) in enumerate(DYNAMIC_XRAY_COLUMNS):
+
+                    if fmt_type == "date":
+                        val = getattr(record, field_name)
+                        if val:
+                            ist_val = val.astimezone(
+                                pytz.timezone("Asia/Kolkata")
+                            ).replace(tzinfo=None)
+                            worksheet.write_datetime(row_num, col_num, ist_val, formats["date"])
+                        else:
+                            worksheet.write_blank(row_num, col_num, None)
+
+                    elif fmt_type == "int":
+                        worksheet.write_number(row_num, col_num, getattr(record, field_name) or 0, formats["int"])
+
+                    elif fmt_type == "number":
+                        worksheet.write_number(row_num, col_num, getattr(record, field_name) or 0.0, formats["number"])
+
+                    elif fmt_type == "center":
+                        worksheet.write(row_num, col_num, row_num if field_name == "s_no" else getattr(record, field_name), formats["center"])
+
+                    else:
+                        worksheet.write(row_num, col_num, getattr(record, field_name) or "", formats["text"])
+
+                row_num += 1
+
+            offset += chunk_size
+
+        workbook.close()
+        output.seek(0)
+        yield output.read()

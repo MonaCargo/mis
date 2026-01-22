@@ -256,7 +256,7 @@
 
 # schemas/domestic_xray.py
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from typing import List, Optional, Any
+from typing import Dict, List, Literal, Optional, Any
 from datetime import datetime, date, time
 
 from app.schemas.base import APIResponseBase
@@ -429,6 +429,7 @@ class DomesticXrayBaseForResponse(BaseModel):
     is_email_sent: Optional[bool] = Field(False, description="Is email sent")
     email_sent_date_time: Optional[datetime] = Field(None, description="Email sent date and time")
     uploaded_by: Optional[str] = Field(None, description="User who uploaded the report")
+    email_sent_by: Optional[str] = Field(None, description="User who sent email")
     
     model_config = ConfigDict(from_attributes=True)
     
@@ -467,3 +468,58 @@ class EmployeeResponse(BaseModel):
     employee_id: str
     employee_name: str
     xray_user_id: str | None
+
+
+
+# ======== Export related -----------
+
+class XrayExportFilters(BaseModel):
+    xray_filter_status: Optional[str] = "all"
+    startDate: Optional[str]
+    endDate: Optional[str]
+
+class XrayExportRequest(BaseModel):
+    export_type: Literal["FILTER", "SELECTED"]
+    filters: Optional[XrayExportFilters] = None
+    selected_ids: Optional[List[int]] = None
+
+
+
+# ===============================
+# OVERALL SUMMARY
+# ===============================
+class OverallEmailStats(BaseModel):
+    total: int
+    email_sent: int
+    email_not_sent: int
+
+
+# ===============================
+# AIRLINE SUMMARY
+# ===============================
+class AirlineEmailStats(BaseModel):
+    total: int
+    email_sent: int
+    email_not_sent: int
+
+
+# ===============================
+# DATE RANGE
+# ===============================
+class StatisticsDateRange(BaseModel):
+    start_date: Optional[str]
+    end_date: Optional[str]
+
+class UserEmailSummary(BaseModel):
+    emp_id: str
+    name: str
+    email_sent_count: int
+
+
+# ===============================
+# MAIN RESPONSE SCHEMA
+# ===============================
+class DomesticXrayStatisticsResponse(BaseModel):
+    overall_summary: OverallEmailStats
+    airline_summary: Dict[str, AirlineEmailStats]
+    user_email_summary:List[UserEmailSummary]
