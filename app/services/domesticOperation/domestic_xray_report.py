@@ -415,7 +415,7 @@ class DomesticXrayService:
 
     
     @staticmethod
-    async def background_send_email(db: AsyncSession, awb_no: str, doc_no: str, pdf_path: str):
+    async def background_send_email(db: AsyncSession, awb_no: str, doc_no: str, pdf_path: str,email_set_by:str):
         """
         Background task: send email with retry, update DB, delete PDF.
         Handles success, API errors, and Python exceptions.
@@ -479,7 +479,7 @@ class DomesticXrayService:
                             )
                         },
                         "toRecipients": [{"emailAddress": {"address": recipient_email}}],
-                        "ccRecipients": [{"emailAddress": {"address": VIKASH_EMAIL}}],
+                        "ccRecipients": [{"emailAddress": {"address": SECURITY_EMAIL}}],
                         #"bccRecipients": [{"emailAddress": {"address": DEVELOPER_EMAIL}}],
                         "attachments": [{
                             "@odata.type": "#microsoft.graph.fileAttachment",
@@ -502,10 +502,11 @@ class DomesticXrayService:
                         .where(and_(DomesticXray.awb_no == awb_no_clean, DomesticXray.seq_num == doc_no))
                         .values(
                             is_email_sent=True,
-                            email_sent_date_time=get_utc_now,
+                            email_sent_date_time=get_utc_now(),
                             retry_count=attempt,
                             email_error_message=None,
-                            updated_at=get_utc_now()
+                            updated_at=get_utc_now(),
+                            email_set_by=email_set_by
                         )
                     )
                     await db.execute(stmt)
@@ -539,7 +540,8 @@ class DomesticXrayService:
                             is_email_sent=False,
                             retry_count=attempt,
                             email_error_message=error_msg,
-                            updated_at=datetime.utcnow()
+                            updated_at=get_utc_now(),
+                            email_set_by=None
                         )
                     )
                     await db.execute(stmt)
@@ -556,7 +558,7 @@ class DomesticXrayService:
                         is_email_sent=False,
                         retry_count=attempt,
                         email_error_message=str(e),
-                        updated_at=datetime.utcnow()
+                        updated_at=get_utc_now()
                     )
                 )
                 await db.execute(stmt)

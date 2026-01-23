@@ -57,3 +57,6 @@ alembic-backup/
 alembic/versions/
 
 uploads/
+
+logo.png
+static/pdfs/

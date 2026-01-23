@@ -163,14 +163,20 @@ async def get_domestic_xray_records(
 
 
 @router.post("/generate-pdf")
-async def generate_pdf(payload: dict, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def generate_pdf(payload: dict, 
+                       background_tasks: BackgroundTasks, 
+                       db: AsyncSession = Depends(get_db),
+                       current_user: UserRead = Depends(verify_token_and_get_user)
+                       ):
+    
     result = await DomesticXrayService.generate_and_save_pdf(payload, db)
 
     # Trigger background email+delete
     if result["success"]:
         background_tasks.add_task(
             DomesticXrayService.background_send_email,
-            db, result["awb_no"], result["doc_no"], result["pdf_path"]
+            db, result["awb_no"], result["doc_no"], result["pdf_path"],
+            current_user.emp_id
         )
 
     return result
@@ -181,7 +187,8 @@ async def generate_security_pdf_batch_route(
     background_tasks: BackgroundTasks,
     start_date: str ,
     end_date: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user)
 ):
     """
     Generate PDFs and send emails for all records in date range
@@ -210,7 +217,7 @@ async def generate_security_pdf_batch_route(
                 total_pdf_generated += 1
                 background_tasks.add_task(
                     DomesticXrayService.background_send_email,
-                    db, res["awb_no"], res["doc_no"], res["pdf_path"]
+                    db, res["awb_no"], res["doc_no"], res["pdf_path"],current_user.emp_id
                 )
                 res["email_status"] = {
                     "queued": True, "awb_no": res["awb_no"], "doc_no": res["doc_no"]
