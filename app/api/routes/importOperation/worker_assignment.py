@@ -589,6 +589,7 @@ from app.services.importOperation.worker_assignment_service import (
     auto_assign_pom_shipments,
     generate_excel_stream_export_worker_assignment,
     get_all_allowed_users_as_worker,
+    get_all_shipments_by_ton_category_value_particular_date_range,
     get_assignment_category_summary,
     get_assignment_overall_summary,
     get_assignment_summary_according_to_assigned_person,
@@ -597,6 +598,7 @@ from app.services.importOperation.worker_assignment_service import (
     get_shipment_delay_dashboard_counts,
     get_shipment_delay_details,
     get_worker_assignment_lists_by_emp_id,
+    get_worker_shipment_details_by_empid_which_assigned_not_dropatlift,
     process_worker_assignment,
     search_in_worker_assignments,
 )
@@ -1092,8 +1094,39 @@ async def get_not_dropped_at_lift_by_worker(
 
 
 
+@router.get("/assigned_not-dropped-at-lift/by-worker/emp_id/details")
+async def get_worker_shipment_details(
+    emp_id: str,  # ✅ String because it's stored as string in DB
+    start_date: str = Query(..., example="2026-01-01"),
+    end_date: str = Query(..., example="2026-01-31"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(30, ge=1, le=100, description="Items per page"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Drill-down: Get detailed shipment list for a specific worker
+    Used when user clicks on a worker's count
+    Path param is emp_id (e.g., "EMP001")
+    """
+    try:
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
 
-# Get time based (delayed in assigned or unassigned and drop dlv zone added time) shipment data
+    if start_date > end_date:
+        raise HTTPException(400, "start_date cannot be after end_date")
+
+    return await get_worker_shipment_details_by_empid_which_assigned_not_dropatlift(
+        db=db,
+        emp_id=emp_id,  # ✅ Pass emp_id directly
+        start_date=start_date,
+        end_date=end_date,
+        page=page,
+        page_size=page_size,
+    )
+# =================================================================
+#======== Get time based (delayed in assigned or unassigned and drop dlv zone added time) shipment data
 @router.get(
     "/shipment-delay/dashboard/counts",
     summary="Shipment SLA dashboard (counts only)",
@@ -1129,6 +1162,52 @@ async def shipment_delay_details(
         limit=limit,
         offset=offset,
     )
+
+@router.get("/shipments/by-ton-category-value")
+async def get_shipments_by_ton(
+    start_date: str,
+    end_date: str,
+    ton_category: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Drill-down API for TON category
+    """
+    def normalize_ton_category(value: str) -> str:
+        """
+        Convert frontend ton formats to DB format.
+        Example:
+        5_TON  -> 5 TON
+        5-ton  -> 5 TON
+        5_ton  -> 5 TON
+        5 ton  -> 5 TON
+        """
+        return value
+        if not value:
+            return value
+
+        return (
+        value
+        .replace("_", " ")
+        .replace("-", " ")
+        .strip()
+        .upper()
+        )
+
+    narmalizeTonCategory = normalize_ton_category(ton_category)
+
+    data = await get_all_shipments_by_ton_category_value_particular_date_range(
+        db,
+        start_date,
+        end_date,
+        ton_category=narmalizeTonCategory
+    )
+
+    return {
+        "success": True,
+        "count": len(data),
+        "data": data,
+    }
 
 
 # 👌============================ AUTO ASSIGN POM OC SHIPMENT TO PERTICULAR EMPLOYEE =====================

@@ -43,7 +43,7 @@ class DomesticXray(Base):
     pdf_generated_date_time = Column(DateTime(timezone=True), nullable=True)
     is_email_sent = Column(Boolean, default=False, nullable=False)
     email_sent_date_time = Column(DateTime(timezone=True), nullable=True)
-    email_sent_by = Column(String(100), nullable=False, index=True) # emp_id of dcsc employee 
+    email_sent_by = Column(String(100), nullable=True, index=True) # emp_id of dcsc employee 
     
     # For tracing the user and report date
     # cosys_report_date = Column(DateTime(timezone=True), nullable=False, index=True)

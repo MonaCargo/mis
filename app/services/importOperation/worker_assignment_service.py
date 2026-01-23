@@ -4031,35 +4031,90 @@ async def get_assignment_overall_summary(
 
 
     row = (await db.execute(stmt)).one()
+# ----------- previous -------------------
+    # ton_stmt = (
+    #     select(
+    #         WorkerAssignmentShipment.drop_dlv_zone.label("ton_category"),
+    #         func.count(WorkerAssignmentShipment.id).label("count"),
+    #     )
+    #     .where(
+    #         # ✅ SAME business logic written DIRECTLY
+    #         WorkerAssignmentShipment.assigned_person.isnot(None),
+    #         WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+    #         WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+    #         WorkerAssignmentShipment.gate_pass_no.isnot(None),
+
+    #         # ✅ SAME date filter you already use
+    #         or_(
+    #             WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+    #             WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+    #                 start_utc, end_utc
+    #             ),
+    #         )
+    #     )
+    #     .group_by(WorkerAssignmentShipment.drop_dlv_zone)
+    # )
+
+    # ton_rows = (await db.execute(ton_stmt)).all()
+    # have_gatepass_and_assigned_drop_at_lift_ton_split = {
+    #     row.ton_category: row.count
+    #     for row in ton_rows
+    # }
+# -------------------------------------
 
     ton_stmt = (
-        select(
-            WorkerAssignmentShipment.drop_dlv_zone.label("ton_category"),
-            func.count(WorkerAssignmentShipment.id).label("count"),
-        )
-        .where(
-            # ✅ SAME business logic written DIRECTLY
-            WorkerAssignmentShipment.assigned_person.isnot(None),
-            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
-            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
-            WorkerAssignmentShipment.gate_pass_no.isnot(None),
+    select(
+        WorkerAssignmentShipment.drop_dlv_zone.label("ton_category"),
 
-            # ✅ SAME date filter you already use
-            or_(
-                WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
-                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
-                    start_utc, end_utc
-                ),
-            )
-        )
-        .group_by(WorkerAssignmentShipment.drop_dlv_zone)
+        # COUNT
+        func.count(WorkerAssignmentShipment.id).label("shipment_count"),
+
+        # ✅ SUMS
+        func.coalesce(func.sum(WorkerAssignmentShipment.no_of_pc), 0).label("total_pcs"),
+        func.coalesce(func.sum(WorkerAssignmentShipment.weight_in_kgs), 0).label("total_gross_weight"),
+        func.coalesce(func.sum(WorkerAssignmentShipment.chg_wgt_in_kg), 0).label("total_chargeable_weight"),
     )
+    .where(
+        WorkerAssignmentShipment.assigned_person.isnot(None),
+        WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+        WorkerAssignmentShipment.gate_pass_no.isnot(None),
+        # WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+
+        or_(
+            WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                start_utc, end_utc
+            ),
+        )
+    )
+    .group_by(WorkerAssignmentShipment.drop_dlv_zone)
+)
 
     ton_rows = (await db.execute(ton_stmt)).all()
-    have_gatepass_and_assigned_drop_at_lift_ton_split = {
-        row.ton_category: row.count
-        for row in ton_rows
+
+    category_summary = {}
+    overall_totals = {
+        "shipment_count": 0,
+        "total_pcs": 0,
+        "total_gross_weight": 0.0,
+        "total_chargeable_weight": 0.0,
     }
+
+    for ton_row in ton_rows:
+        category_summary[ton_row.ton_category] = {
+            "shipment_count": ton_row.shipment_count,
+            "total_pcs": int(ton_row.total_pcs),
+            "total_gross_weight": float(ton_row.total_gross_weight),
+            "total_chargeable_weight": float(ton_row.total_chargeable_weight),
+        }
+
+        overall_totals["shipment_count"] += ton_row.shipment_count
+        overall_totals["total_pcs"] += ton_row.total_pcs
+        overall_totals["total_gross_weight"] += ton_row.total_gross_weight
+        overall_totals["total_chargeable_weight"] += ton_row.total_chargeable_weight
+
+
+
 
     return {
         "total_data": row.total_data,
@@ -4075,11 +4130,23 @@ async def get_assignment_overall_summary(
         "not_gatepass_end_date_but_have_gp_no_and_assigned_notdropatlift": row.not_gatepass_end_date_but_have_gp_no_and_assigned_notdropatlift,
         "not_gatepass_end_date_but_have_gp_no_and_unassigned": row.not_gatepass_end_date_but_have_gp_no_and_unassigned,
         "not_gatepass_end_date_but_have_gp_no": row.not_gatepass_end_date_but_have_gp_no,
-        "have_gatepass_and_assigned_drop_at_lift_ton_split":have_gatepass_and_assigned_drop_at_lift_ton_split,
+    # 🆕 CATEGORY + TOTAL SUMMARY
+    # -------------------------
+    "have_gatepass_and_assigned_drop_at_lift_summary": {
+        "by_category": category_summary,
+        "overall_total": overall_totals
+    },
         # ---------
         "dropped_at_lift_with_gatepass_end_date_present": row.dropped_at_lift_with_gatepass_end_date_present,
         "info":"we exclude shipments having gate pass end datetime from assigned and delivered related count",
-        "Hints":"delivered:drop_dlv_zone present, assigned:assigned_person present, unassigned:assigned_person absent and gate_pass_end_datetime not present"
+        "hints": {
+        "delivered": "drop_dlv_zone present",
+        "assigned": "assigned_person present",
+        "unassigned": "assigned_person absent",
+        "gross_weight": "weight_in_kgs",
+        "chargeable_weight": "chg_wgt_in_kg",
+        "pcs": "no_of_pc"
+    }
     }
 
 
@@ -4192,143 +4259,125 @@ async def get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no(
     }
 
 
-# async def get_assignment_overall_summary(
+
+
+# ===============  Get all shipments of that ton(5 ton , 10 ton 3-ton like drop_dlv_zone) category drill down api service
+
+# async def get_all_shipments_by_ton_category_value_particular_date_range(
 #     db: AsyncSession,
-#     start_utc,
-#     end_utc,
+#     start_date,
+#     end_date,
+#     ton_category: str,
 # ):
 #     """
-#     Overall shipment summary (ALL categories combined)
+#     Get all shipments for given TON category + date range
 #     """
 
-#     date_field = func.coalesce(
-#         WorkerAssignmentShipment.integrate_date_time,
-#         WorkerAssignmentShipment.gate_pass_issued_date_time_combo
-#     )
+#     start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+#     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
 
 #     stmt = (
-#         select(
-#             # TOTAL SHIPMENTS
-#             func.count(WorkerAssignmentShipment.id).label("total_data"),
-
-#             # GP GENERATED
-#             func.count(
-#                 case(
-#                     (WorkerAssignmentShipment.gate_pass_no.isnot(None), 1)
-#                 )
-#             ).label("converted_to_gp"),
-
-#             # GP NOT GENERATED
-#             func.count(
-#                 case(
-#                     (WorkerAssignmentShipment.gate_pass_no.is_(None), 1)
-#                 )
-#             ).label("gp_not_generated"),
-
-#             # ASSIGNED BUT NOT DELIVERED
-#             func.count(
-#                 case(
-#                     (
-#                         and_(
-#                             WorkerAssignmentShipment.assigned_person.isnot(None),
-#                             WorkerAssignmentShipment.drop_dlv_zone.is_(None),
-#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
-#                         ),
-#                         1
-#                     )
-#                 )
-#             ).label("assigned_but_not_dropped_at_lift"),
-
-#             # ASSIGNED AND DELIVERED
-#             func.count(
-#                 case(
-#                     (
-#                         and_(
-#                             WorkerAssignmentShipment.assigned_person.isnot(None),
-#                             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
-#                              WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
-#                         ),
-#                         1
-#                     )
-#                 )
-#             ).label("assigned_and_droped_at_lift"),
-
-#             # DELIVERED WITH GP END DATE
-#             func.count(
-#                 case(
-#                     (
-#                         and_(
-#                             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
-#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
-#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
-#                         ),
-#                         1
-#                     )
-#                 )
-#             ).label("droped_at_lift_with_gatepass_end_date_present"),
-#             func.count(
-#                 case(
-#                     (
-#                         and_(  
-#                             WorkerAssignmentShipment.gate_pass_no.isnot(None),
-#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None)
-#                         ),
-#                         1
-#                     )
-#                 )
-#             ).label("gatepass_end_date_present_means_delivered"),
-#         # 🆕 DELIVERED WITHIN 4 HOURS
-#             func.count(
-#                 case(
-#                     (
-#                         and_(
-#                             WorkerAssignmentShipment.gate_pass_issued_date_time_combo.isnot(None),
-#                             WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
-#                             func.extract(
-#                                 'epoch',
-#                                 WorkerAssignmentShipment.gate_pass_end_datetime - WorkerAssignmentShipment.gate_pass_issued_date_time_combo
-#                             ) <= 14400  # 4 hours = 14400 seconds
-#                         ),
-#                         1
-#                     )
-#                 )
-#             ).label("delivered_within_defined_hours"),
-#         # 🆕 unassigned
-#             func.count(
-#                 case(
-#                     (
-#                         and_(
-#                             WorkerAssignmentShipment.assigned_person.is_(None),
-#                             WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
-#                         ),
-#                         1
-#                     )
-#                 )
-#             ).label("unassigned"),
-#         )
+#         select(WorkerAssignmentShipment)
 #         .where(
-#             date_field >= start_utc,
-#             date_field < end_utc
+#             # Zone filter
+#             WorkerAssignmentShipment.drop_dlv_zone == ton_category,
+
+#             # Business rules (same as summary)
+#             WorkerAssignmentShipment.assigned_person.isnot(None),
+#             WorkerAssignmentShipment.gate_pass_no.isnot(None),
+
+#             # Date filter
+#             or_(
+#                 WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+#                 WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+#                     start_utc, end_utc
+#                 ),
+#             ),
 #         )
+#         .order_by(WorkerAssignmentShipment.gate_pass_no.desc())
 #     )
 
-#     row = (await db.execute(stmt)).one()
+#     result = await db.execute(stmt)
 
-#     return {
-#         "total_data": row.total_data,
-#         "converted_to_gp": row.converted_to_gp,
-#         "gp_not_generated": row.gp_not_generated,
-#         "unassigned": row.unassigned,
-#         "assigned_but_not_dropped_at_lift": row.assigned_but_not_dropped_at_lift,
-#         "assigned_and_droped_at_lift": row.assigned_and_droped_at_lift,
-#         "gatepass_end_date_present_means_delivered": row.gatepass_end_date_present_means_delivered,
-#         "delivered_within_defined_hours": row.delivered_within_defined_hours,
-#         # FIXED: Use the correct label name
-#         "droped_at_lift_with_gatepass_end_date_present": row.droped_at_lift_with_gatepass_end_date_present,
-#         "info":"we exclude shipments having gate pass end datetime from assigned and delivered related count",
-#         "Hints":"delivered:drop_dlv_zone present, assigned:assigned_person present, unassigned:assigned_person absent and gate_pass_end_datetime not present"
-#     }
+#     return result.scalars().all()
 
+async def get_all_shipments_by_ton_category_value_particular_date_range(
+    db: AsyncSession,
+    start_date,
+    end_date,
+    ton_category: str,
+):
+
+
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+    stmt = (
+        select(
+            # 🔑 IDs
+            WorkerAssignmentShipment.id.label("shipment_id"),
+            WorkerAssignmentShipment.assignment_header_id.label("assignment_header_id"),
+
+            # =====================
+            # HEADER INFO
+            # =====================
+            WorkerAssignmentHeader.oc_no.label("oc_no"),
+            WorkerAssignmentHeader.awb_no.label("awb"),
+            WorkerAssignmentHeader.hawb.label("hawb"),
+            WorkerAssignmentHeader.igp_no.label("igp_no"),
+
+            # =====================
+            # SHIPMENT INFO
+            # =====================
+            WorkerAssignmentShipment.no_of_pc.label("pcs"),
+            WorkerAssignmentShipment.weight_in_kgs.label("gross_weight"),
+            WorkerAssignmentShipment.chg_wgt_in_kg.label("chargeable_weight"),
+
+            WorkerAssignmentShipment.flight_no.label("flight_no"),
+            WorkerAssignmentShipment.flight_date.label("flight_date"),
+
+            WorkerAssignmentShipment.drop_dlv_zone.label("drop_dlv_zone"),
+
+            WorkerAssignmentShipment.integrate_date_time.label("integrate_date_time"),
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.label("gp_issue_date_time"),
+            WorkerAssignmentShipment.gate_pass_end_datetime.label("gate_pass_end_datetime"),
+            WorkerAssignmentShipment.gate_pass_no.label("gate_pass_no"),
+
+            WorkerAssignmentShipment.assigned_person.label("assigned_person"),
+        )
+
+        # 🔥 JOIN HEADER
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentShipment.assignment_header_id
+            == WorkerAssignmentHeader.id
+        )
+
+        .where(
+            # ✅ Zone filter
+            WorkerAssignmentShipment.drop_dlv_zone == ton_category,
+
+            # ✅ Business rules
+            WorkerAssignmentShipment.gate_pass_no.isnot(None),
+            WorkerAssignmentShipment.assigned_person.isnot(None),
+
+            # ✅ Date filter
+            or_(
+                WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                    start_utc, end_utc
+                ),
+            ),
+        )
+
+        .order_by(WorkerAssignmentShipment.gate_pass_no.desc())
+    )
+
+    result = await db.execute(stmt)
+
+    # ✅ Convert to dict list
+    return result.mappings().all()
+# ===================
 
 # ✌️========Get accuracy summary based on time (on unassigned ands assigned shipments):==============
 
@@ -4552,53 +4601,112 @@ async def get_shipment_delay_dashboard_counts(
         },
     }
 
-    # =====================================================
-    # RESPONSE
-    # =====================================================
+
+
+# GET THE SHIPMENT DETAILS BY EMP ID THOSE WHO ASSIGNED But NOT DROP AT LIFT (those who have gatepass means IRR based data)
+async def get_worker_shipment_details_by_empid_which_assigned_not_dropatlift(
+   db: AsyncSession,
+    emp_id: str,  # ✅ String, not int
+    start_date: str,
+    end_date: str,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """
+    Get paginated shipment details for a specific worker by emp_id
+    Returns shipment-level records with header info,
+    Here Those counts which have gatepass no and not have end gatepass no.
+    """
+    
+    # Convert IST → UTC
+    utc_start, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    _, utc_end = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+    # ✅ NO NEED to query User table - use emp_id directly
+    # Since emp_id is already the identifier stored in WorkerAssignmentShipment.assigned_person
+
+    # Base query - same conditions as summary
+    base_conditions = [
+        WorkerAssignmentShipment.assigned_person == emp_id,  # ✅ Direct string comparison
+        WorkerAssignmentShipment.drop_dlv_zone.is_(None),
+        WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+        WorkerAssignmentShipment.gate_pass_no.isnot(None),
+        or_(
+            WorkerAssignmentShipment.integrate_date_time.between(utc_start, utc_end),
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                utc_start, utc_end
+            ),
+        )
+    ]
+
+    # Count total records
+    count_stmt = select(func.count(WorkerAssignmentShipment.id)).where(*base_conditions)
+    total_result = await db.execute(count_stmt)
+    total_count = total_result.scalar()
+
+    # Get paginated data WITH header info (JOIN)
+    offset = (page - 1) * page_size
+    
+    data_stmt = (
+        select(
+            WorkerAssignmentShipment,
+            WorkerAssignmentHeader
+        )
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentHeader.id == WorkerAssignmentShipment.assignment_header_id
+        )
+        .where(*base_conditions)
+        .order_by(WorkerAssignmentShipment.integrate_date_time.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    
+    result = await db.execute(data_stmt)
+    rows = result.all()
+
     return {
-        "info": {
-            "lookback_days": lookback_days,
-            "data_from": data_start_time,
-            "data_upto": now,
-            "pagination": {
-                "limit": limit,
-                "offset": offset,
-            },
-            "sla_rules": {
-                "not_assigned_minutes": 15,
-                "assigned_not_delivered_minutes": 30,
-            },
-        },
-        "counts": {
-            "not_assigned_15_min": not_assigned_count,
-            "assigned_not_delivered_30_min": assigned_not_delivered_count,
-        },
-        "data": {
-            "not_assigned_15_min": [
-                {
-                    "shipment_id": r.id,
-                    "awb_no": r.awb_no,
-                    "hawb": r.hawb,
-                    "oc_no": r.oc_no,
-                    "created_at": r.created_at,
-                }
-                for r in not_assigned_rows
-            ],
-            "assigned_not_delivered_30_min": [
-                {
-                    "shipment_id": r.id,
-                    "awb_no": r.awb_no,
-                    "hawb": r.hawb,
-                    "oc_no": r.oc_no,
-                    "assigned_person": r.assigned_person,
-                    "assigned_person_datetime": r.assigned_person_datetime,
-                }
-                for r in assigned_not_delivered_rows
-            ],
-        },
+        "emp_id": emp_id,  # ✅ Return emp_id as string
+        "total_count": total_count,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total_count + page_size - 1) // page_size,
+        "data": [
+            {
+                # ===== SHIPMENT LEVEL (event/part shipment) =====
+                "shipment_id": shipment.id,
+                "shipment_no_of_pc": shipment.no_of_pc,
+                "shipment_weight_in_kgs": shipment.weight_in_kgs,
+                "shipment_chg_wgt_in_kg": shipment.chg_wgt_in_kg,
+                
+                # Operational fields
+                "gate_pass_no": shipment.gate_pass_no,
+                "gate_pass_issued_date_time": shipment.gate_pass_issued_date_time_combo,
+                "integrate_date_time": shipment.integrate_date_time,
+                "assigned_person": shipment.assigned_person,
+                "assigned_person_datetime": shipment.assigned_person_datetime,
+                "drop_dlv_zone": shipment.drop_dlv_zone,
+                "location": shipment.location,
+                "flight_no": shipment.flight_no,
+                "flight_date": shipment.flight_date,
+                "from_irr_table": shipment.from_irr_table,
+                
+                # ===== HEADER LEVEL (shipment identity) =====
+                "header_id": header.id,
+                "oc_no": header.oc_no,
+                "awb_no": header.awb_no,
+                "hawb": header.hawb,
+                "igp_no": header.igp_no,
+                "is_temp_irm_oc": header.is_temp_irm_oc,
+                "temp_irm_oc_no": header.temp_irm_oc_no,
+                
+                # Metadata
+                "created_at": shipment.created_at,
+                "updated_at": shipment.updated_at,
+            }
+            for shipment, header in rows
+        ],
     }
-
-
 
 
 # 👌⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️========================= AUTO ASSIGN POM OC SHIPMENT TO PERTICULAR EMPLOYEE =====================
