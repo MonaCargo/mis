@@ -1173,28 +1173,67 @@ async def get_shipments_by_ton(
     """
     Drill-down API for TON category
     """
+    print("++++++++++++++++++++++++++++++++++++++++++++++++")
+    print(ton_category)
+    print(start_date)
+    print(end_date)
+
+    # def normalize_ton_category(value: str) -> str:
+    #     """
+    #     Convert frontend ton formats to DB format.
+    #     Example:
+    #     5_TON  -> 5 TON
+    #     5-ton  -> 5 TON
+    #     5_ton  -> 5 TON
+    #     5 ton  -> 5 TON
+    #     """
+    #     # return value
+    #     if not value:
+    #         return value
+
+    #     return (
+    #     value
+    #     .replace("_", " ")
+    #     .replace("-", " ")
+    #     .strip()
+    #     .upper()
+    #     )
+
     def normalize_ton_category(value: str) -> str:
         """
         Convert frontend ton formats to DB format.
         Example:
-        5_TON  -> 5 TON
-        5-ton  -> 5 TON
-        5_ton  -> 5 TON
-        5 ton  -> 5 TON
+        5_TON  -> 5 Ton
+        5-ton  -> 5 Ton
+        5_ton  -> 5 Ton
+        5 ton  -> 5 Ton
         """
-        return value
         if not value:
             return value
 
-        return (
-        value
-        .replace("_", " ")
-        .replace("-", " ")
-        .strip()
-        .upper()
+        # Normalize separators and casing
+        normalized = (
+            value.replace("_", " ")
+                .replace("-", " ")
+                .strip()
+                .lower()
         )
 
+        # Split into parts (e.g., ["5", "ton"])
+        parts = normalized.split()
+
+        # If the last part is 'ton', capitalize it properly
+        if parts and parts[-1] == "ton":
+            parts[-1] = "Ton"
+
+        return " ".join(parts)
+
+
     narmalizeTonCategory = normalize_ton_category(ton_category)
+    print("++++++++++++++++++++++++++++++++++++++++++++++++")
+    print(narmalizeTonCategory)
+    print(start_date)
+    print(end_date)
 
     data = await get_all_shipments_by_ton_category_value_particular_date_range(
         db,

@@ -105,6 +105,9 @@ class WorkerAssignmentAuditLog(Base):
     changed_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False)
 
+    # It define that for which theis shipment log happen (IRM/OC_MERGE/IRR ORIGINATED SOURCE)
+    origin_source_type = Column(String(30),nullable=True,default=None)
+
     __table_args__ = (
         # Index(
         #     "idx_audit_log_worker_assignment_search_v2",

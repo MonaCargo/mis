@@ -930,6 +930,10 @@ async def generate_and_save_gatepass(
                 base["igp_no"] = temp_row.igp_no
                 base["temp_irm_oc_no"] = temp_row.temp_irm_oc_no
 
+                # ✅ NEW: Preserve original integrate_date_time from temp record
+                # Remove it from base so it won't be updated
+                base.pop("integrate_date_time")  # Don't update this field
+
                 to_replace.append((temp_row.id, base))
                 continue
 
@@ -1019,6 +1023,8 @@ async def generate_and_save_gatepass(
 
                         "is_temp_irm_oc": False,  # ✅ promote to real when real oc come then it become  false
                         # 🛑 NEVER UPDATE HISTORY FIELD
+                        
+                        "integrate_date_time": OcMergeGatePass.integrate_date_time,
                         "temp_irm_oc_no": OcMergeGatePass.temp_irm_oc_no,
                         "uploaded_by": OcMergeGatePass.uploaded_by,  # ✅ NEVER overwrite
                         "created_at": OcMergeGatePass.created_at,    # ✅ Keep original creation time
