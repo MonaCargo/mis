@@ -415,7 +415,7 @@ class DomesticXrayService:
 
     
     @staticmethod
-    async def background_send_email(db: AsyncSession, awb_no: str, doc_no: str, pdf_path: str,email_set_by:str):
+    async def background_send_email(db: AsyncSession, awb_no: str, doc_no: str, pdf_path: str,email_sent_by:str):
         """
         Background task: send email with retry, update DB, delete PDF.
         Handles success, API errors, and Python exceptions.
@@ -506,7 +506,7 @@ class DomesticXrayService:
                             retry_count=attempt,
                             email_error_message=None,
                             updated_at=get_utc_now(),
-                            email_set_by=email_set_by
+                            email_sent_by=email_sent_by
                         )
                     )
                     await db.execute(stmt)
@@ -541,7 +541,7 @@ class DomesticXrayService:
                             retry_count=attempt,
                             email_error_message=error_msg,
                             updated_at=get_utc_now(),
-                            email_set_by=None
+                            email_sent_by=None
                         )
                     )
                     await db.execute(stmt)
