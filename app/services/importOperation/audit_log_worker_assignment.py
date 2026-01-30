@@ -70,6 +70,7 @@ async def log_worker_assignment_audit(
     ip_address: str | None,
     db_action: str,
     source_action: str,
+    origin_source_type: str | None = None,
 ):
     now = get_utc_now()
 
@@ -97,6 +98,7 @@ async def log_worker_assignment_audit(
 
         changed_at=now,
         created_at=now,
+        origin_source_type=origin_source_type,
     )
 
     db.add(audit_entry)

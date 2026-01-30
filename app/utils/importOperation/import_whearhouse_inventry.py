@@ -3,7 +3,7 @@
 import re
 import pandas as pd
 import numpy as np
-from typing import Literal, Dict, Any, List
+from typing import Literal, Dict, Any, List, Tuple
 from io import BytesIO
 from datetime import datetime
 import pytz
@@ -118,9 +118,139 @@ def normalize_awb_no(value) -> str:
         return None  # Invalid AWB format
 
 
-def clean_airway_bill_file_advanced(file: BytesIO, file_type: Literal["csv", "excel"]) -> List[Dict[str, Any]]:
+# def clean_airway_bill_file_advanced(file: BytesIO, file_type: Literal["csv", "excel"]) -> List[Dict[str, Any]]:
+#     """
+#     Advanced version with more control over reading the file
+#     """
+#     # Read the entire file first to inspect
+#     if file_type == "csv":
+#         df_full = pd.read_csv(file, header=None, dtype=str)
+#     elif file_type == "excel":
+#         df_full = pd.read_excel(file, header=None, dtype=str)
+    
+#     # Find the header row (row 7, which is index 6 in 0-indexed)
+#     header_row_index = 6
+    
+#     # Read file again with proper header
+#     if file_type == "csv":
+#         df = pd.read_csv(file, skiprows=header_row_index, header=0, dtype=str)
+#     elif file_type == "excel":
+#         df = pd.read_excel(file, skiprows=header_row_index, header=0, dtype=str)
+    
+#     # Remove empty rows
+#     df = df.dropna(how='all')
+    
+#     # Remove last row
+#     if len(df) > 0:
+#         df = df.iloc[:-1]
+    
+#     # Clean column names (remove extra spaces, newlines)
+#     df.columns = df.columns.str.strip()
+    
+#     # Validate required columns
+#     missing = [col for col in REQUIRED_COLUMNS.keys() if col not in df.columns]
+#     if missing:
+#         raise ValueError(f"Missing columns: {missing}")
+    
+#     # Select and rename columns
+#     df_clean = df[list(REQUIRED_COLUMNS.keys())].rename(columns=REQUIRED_COLUMNS)
+
+#     # ✅ Normalize AWB number RIGHT HERE
+#     if 'awb_no' in df_clean.columns:
+#         df_clean['awb_no'] = df_clean['awb_no'].apply(normalize_awb_no)
+        
+#     # ✅ Normalize HWB number
+#     if 'hwb_no' in df_clean.columns:
+#         df_clean['hwb_no'] = df_clean['hwb_no'].apply(normalize_hwb_no)
+    
+    
+#     # Check mandatory AWB NO
+#     for idx, row in df_clean.iterrows():
+#         actual_row_num = idx + header_row_index + 2  # +2 because header row is +1 and we want actual Excel row
+#         if pd.isna(row['awb_no']) or row['awb_no'] in [None, "", "nan", "None"]:
+#             raise ValueError(f"Row {actual_row_num}: AWB NO is mandatory but missing")
+    
+#     # Parse datetime columns
+#     # for col in ["location_date", "flt_date"]:
+#     #     if col in df_clean.columns:
+#     #         df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce')
+    
+
+#     # ✅ Parse and localize timezone for datetime fields
+#     for col in ["location_date", "flt_date"]:
+#         if col in df_clean.columns:
+#             df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce')
+#             df_clean[col] = df_clean[col].apply(convert_to_utc)
+
+#     # Convert string columnsS
+#     string_columns = ['awb_no', 'hwb_no', 'm_h', 'origin', 'destination', 'warehouse_location', 
+#                      'status', 'nature_of_goods', 'shc', 'agent', 'fltno', 'cne_name', 'cne_addr']
+    
+#     for col in string_columns:
+#         if col in df_clean.columns:
+#             df_clean[col] = df_clean[col].astype(str).str.strip()
+#             df_clean[col] = df_clean[col].replace(['nan', 'None', 'NaT', '<NA>'], None)
+#             # Convert empty strings to None
+#             df_clean[col] = df_clean[col].replace('', None)
+    
+#     # Convert numeric columns
+#     if 'pcs' in df_clean.columns:
+#         df_clean['pcs'] = pd.to_numeric(df_clean['pcs'], errors='coerce').fillna(0).astype('int64')
+#     if 'wgt_chg' in df_clean.columns:
+#         df_clean['wgt_chg'] = pd.to_numeric(df_clean['wgt_chg'], errors='coerce')
+#     if 'grs_wgt' in df_clean.columns:
+#         df_clean['grs_wgt'] = pd.to_numeric(df_clean['grs_wgt'], errors='coerce')
+    
+#     # Replace NaN/NaT with None
+#     df_clean = df_clean.replace({np.nan: None, pd.NaT: None})
+    
+#     # Convert to list of dictionaries
+#     records = df_clean.to_dict('records')
+    
+#     return records
+
+def separate_faulty_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Advanced version with more control over reading the file
+    Identifies and separates rows with non-null values in 'Unnamed:' columns.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+
+    Returns:
+        tuple: A tuple containing two DataFrames:
+            - faulty_df (pd.DataFrame): DataFrame containing rows with non-null values
+                                       in 'Unnamed:' columns.
+            - cleaned_df (pd.DataFrame): DataFrame with faulty rows removed.
+    """
+    # Identify columns that start with 'Unnamed:'
+    unnamed_cols = [col for col in df.columns if 'Unnamed:' in col]
+
+    # Collect indices of all faulty rows
+    faulty_row_indices = set()
+    for col in unnamed_cols:
+        non_null_rows_in_col = df[df[col].notna()]
+        faulty_row_indices.update(non_null_rows_in_col.index)
+
+    # Convert set of faulty row indices to a list
+    faulty_row_indices_list = list(faulty_row_indices)
+
+    # Create a DataFrame containing only the faulty rows
+    faulty_df = df.loc[faulty_row_indices_list] if faulty_row_indices_list else pd.DataFrame()
+
+    # Create a cleaned DataFrame by dropping these faulty rows
+    cleaned_df = df.drop(index=faulty_row_indices_list)
+
+    return faulty_df, cleaned_df
+
+
+def clean_airway_bill_file_advanced(file: BytesIO, file_type: Literal["csv", "excel"]) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
+    """
+    Advanced version with faulty row detection and removal
+    
+    Returns:
+        tuple: A tuple containing:
+            - records (List[Dict]): Cleaned and validated records ready for database insertion
+            - faulty_df (pd.DataFrame): DataFrame containing faulty rows that were removed
     """
     # Read the entire file first to inspect
     if file_type == "csv":
@@ -132,6 +262,7 @@ def clean_airway_bill_file_advanced(file: BytesIO, file_type: Literal["csv", "ex
     header_row_index = 6
     
     # Read file again with proper header
+    file.seek(0)  # Reset file pointer
     if file_type == "csv":
         df = pd.read_csv(file, skiprows=header_row_index, header=0, dtype=str)
     elif file_type == "excel":
@@ -144,6 +275,14 @@ def clean_airway_bill_file_advanced(file: BytesIO, file_type: Literal["csv", "ex
     if len(df) > 0:
         df = df.iloc[:-1]
     
+    # ✅ NEW: Separate faulty rows before processing
+    faulty_df, df = separate_faulty_rows(df)
+    
+    # Log faulty rows if any were found
+    if not faulty_df.empty:
+        print(f"⚠️ Warning: {len(faulty_df)} faulty row(s) detected and removed")
+        print(f"Faulty row indices: {faulty_df.index.tolist()}")
+    
     # Clean column names (remove extra spaces, newlines)
     df.columns = df.columns.str.strip()
     
@@ -155,7 +294,7 @@ def clean_airway_bill_file_advanced(file: BytesIO, file_type: Literal["csv", "ex
     # Select and rename columns
     df_clean = df[list(REQUIRED_COLUMNS.keys())].rename(columns=REQUIRED_COLUMNS)
 
-    # ✅ Normalize AWB number RIGHT HERE
+    # ✅ Normalize AWB number
     if 'awb_no' in df_clean.columns:
         df_clean['awb_no'] = df_clean['awb_no'].apply(normalize_awb_no)
         
@@ -163,26 +302,19 @@ def clean_airway_bill_file_advanced(file: BytesIO, file_type: Literal["csv", "ex
     if 'hwb_no' in df_clean.columns:
         df_clean['hwb_no'] = df_clean['hwb_no'].apply(normalize_hwb_no)
     
-    
     # Check mandatory AWB NO
     for idx, row in df_clean.iterrows():
         actual_row_num = idx + header_row_index + 2  # +2 because header row is +1 and we want actual Excel row
         if pd.isna(row['awb_no']) or row['awb_no'] in [None, "", "nan", "None"]:
             raise ValueError(f"Row {actual_row_num}: AWB NO is mandatory but missing")
     
-    # Parse datetime columns
-    # for col in ["location_date", "flt_date"]:
-    #     if col in df_clean.columns:
-    #         df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce')
-    
-
     # ✅ Parse and localize timezone for datetime fields
     for col in ["location_date", "flt_date"]:
         if col in df_clean.columns:
             df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce')
             df_clean[col] = df_clean[col].apply(convert_to_utc)
 
-    # Convert string columnsS
+    # Convert string columns
     string_columns = ['awb_no', 'hwb_no', 'm_h', 'origin', 'destination', 'warehouse_location', 
                      'status', 'nature_of_goods', 'shc', 'agent', 'fltno', 'cne_name', 'cne_addr']
     
@@ -207,4 +339,7 @@ def clean_airway_bill_file_advanced(file: BytesIO, file_type: Literal["csv", "ex
     # Convert to list of dictionaries
     records = df_clean.to_dict('records')
     
-    return records
+    return records, faulty_df
+
+
+

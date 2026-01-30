@@ -1625,7 +1625,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models.user import User
 from app.services.importOperation.audit_log_worker_assignment import log_worker_assignment_audit
-from app.utils.common.helperFunction import get_utc_now
+from app.utils.common.helperFunction import detect_origin_source, get_utc_now
 from sqlalchemy.orm import aliased
 
 
@@ -2043,6 +2043,15 @@ async def process_worker_assignment(db: AsyncSession, req):
     # 3️⃣ PROCESS IRR DATA   (THE MOST IMPORTANT PART)
     # =====================================================
     for irr in irr_rows:
+         # 🎯 DEBUG ONLY THIS GATE PASS
+        if str(irr.gate_pass_no) == "25277649":
+            print("\n================ 🎯 DEBUG GP 25277649 ================")
+            print("AWB:", irr.awb)
+            print("HAWB:", irr.hwb)
+            print("GP:", irr.gate_pass_no)
+            print("END_TIME:", irr.gate_pass_end_date_time)
+            print("PCS:", irr.pcs)
+            print("WEIGHT:", irr.grg_wt)
 
         # print("\n\n---------------------- 🟥 PROCESSING IRR ROW ----------------------")
 
@@ -2104,6 +2113,20 @@ async def process_worker_assignment(db: AsyncSession, req):
             #     f"🟨 IRR already exists → IGNORE OC update | "
             #     f"awb={irr.awb}, hawb={irr.hwb}, gp={irr.gate_pass_no}"
             # )
+            if existing_irr_event.gate_pass_end_datetime is None and irr.gate_pass_end_date_time:
+
+                await db.execute(
+                    update(WorkerAssignmentShipment)
+                    .where(WorkerAssignmentShipment.id == existing_irr_event.id)
+                    .values(
+                        gate_pass_end_datetime=irr.gate_pass_end_date_time,
+                        gate_pass_issued_date_time_combo=gp_combo,
+                        updated_at=now
+                    )
+                )
+
+                if str(irr.gate_pass_no) == "25276836":
+                    print("✅ FIX: Updated end time on existing IRR")
             continue
         # ============================================================
         # 🛡️ END — IRR EXISTENCE GUARD
@@ -2113,6 +2136,11 @@ async def process_worker_assignment(db: AsyncSession, req):
         if oc_event:
             # print("🟦 OC EVENT FOUND → APPLY OC-FIRST LOGIC")
               # 🛡️ GLOBAL GP DUPLICATE GUARD (MUST BE HERE)
+            if oc_event and str(irr.gate_pass_no) == "25277649":
+                print("✅ OC EVENT FOUND")
+                print("OC ID:", oc_event.id)
+                print("OC GP:", oc_event.gate_pass_no)
+
             existing_gp_event = (
                 await db.execute(
                     select(WorkerAssignmentShipment).where(
@@ -2124,6 +2152,10 @@ async def process_worker_assignment(db: AsyncSession, req):
             ).scalars().first()
 
             if existing_gp_event:
+                if str(irr.gate_pass_no) == "25277649":
+                    print("❌ CASE: Global GP Duplicate Blocked")
+                    print("Existing Event ID:", existing_gp_event.id)
+
                 print(
                     f"⚠️ DUPLICATE GP BLOCKED → "
                     f"header={header_id}, gp={irr.gate_pass_no}, "
@@ -2144,6 +2176,8 @@ async def process_worker_assignment(db: AsyncSession, req):
             # CASE A1: OC has no gate pass yet → FIRST IRR ARRIVAL
             if oc_event.gate_pass_no is None:
                 # print("🟩 FIRST IRR FOR OC → UPDATE OC EVENT WITH NEW GP")
+                if str(irr.gate_pass_no) == "25277649":
+                    print("✅ CASE: First IRR → Updating OC")
                 await db.execute(
                     update(WorkerAssignmentShipment)
                     .where(WorkerAssignmentShipment.id == oc_event.id)
@@ -2204,6 +2238,8 @@ async def process_worker_assignment(db: AsyncSession, req):
             # CASE A2: Same GP number (multiple IRR updates)
             if oc_event.gate_pass_no == irr.gate_pass_no:
                 # print("🟩 SAME GP FOR OC → UPDATE OC EVENT")
+                if str(irr.gate_pass_no) == "25277649":
+                    print("✅ CASE: Same GP → Updating OC")
                 await db.execute(
                     update(WorkerAssignmentShipment)
                     .where(WorkerAssignmentShipment.id == oc_event.id)
@@ -2260,6 +2296,10 @@ async def process_worker_assignment(db: AsyncSession, req):
             #     f"Invalid IRR: Different gate_pass_no '{irr.gate_pass_no}' "
             #     f"received for OC shipment with existing gate_pass_no '{oc_event.gate_pass_no}'"
             # )
+            if str(irr.gate_pass_no) == "25277649":
+                print("❌ CASE: GP MISMATCH")
+                print("OC GP:", oc_event.gate_pass_no)
+                print("IRR GP:", irr.gate_pass_no)
             print("⚠️OC EVENT HAS AN EXISTING GATE PASS BUT IRR BRINGS A DIFFERENT ONE! (INFO ONLY — PROCESS CONTINUES)")
             print( f"Info : received for OC shipment with existing gate_pass_no '{oc_event.gate_pass_no}' get different gate paas no '{irr.gate_pass_no}' on awb '{irr.awb} and hawb '{irr.hwb}''")
 
@@ -2313,6 +2353,8 @@ async def process_worker_assignment(db: AsyncSession, req):
 
         # Case B2: No matching IRR GP → Insert new event (PART SHIPMENT)
         print("🟩 NEW IRR GP → INSERT NEW IRR EVENT (PART SHIPMENT)")
+        if str(irr.gate_pass_no) == "25277649":
+            print("🆕 CASE: New IRR Insert")
 
         await db.execute(
             insert(WorkerAssignmentShipment).values(
@@ -2641,7 +2683,8 @@ async def add_drop_dlv_zone_by_assigned_worker(
                 status_code=400,
                 detail="OC number does not match header"
             )
-
+        # It check that comming dat is irm originated data
+        is_irm_shipment = bool(header.temp_irm_oc_no)
         # ─────────────────────────────────────────────
         # 2️⃣ Fetch SHIPMENT (by ID + ownership)
         # ─────────────────────────────────────────────
@@ -2675,12 +2718,13 @@ async def add_drop_dlv_zone_by_assigned_worker(
                 status_code=403,
                 detail="Shipment is assigned to another worker"
             )
-
-        if shipment.drop_dlv_zone:
+        # if irm shipment then only allow to add gaain drop dlv
+        if shipment.drop_dlv_zone and not is_irm_shipment:
             raise HTTPException(
                 status_code=400,
                 detail="Drop delivery zone already added"
             )
+        origin_source = detect_origin_source(header,shipment)
 
         # ─────────────────────────────────────────────
         # 4️⃣ Update SHIPMENT
@@ -2715,6 +2759,7 @@ async def add_drop_dlv_zone_by_assigned_worker(
             user_agent=user_agent,
             db_action="UPDATE",
             source_action="dlv_zone_update",
+            origin_source_type=origin_source.value,
         )
 
         # ─────────────────────────────────────────────
@@ -4078,7 +4123,7 @@ async def get_assignment_overall_summary(
         WorkerAssignmentShipment.assigned_person.isnot(None),
         WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
         WorkerAssignmentShipment.gate_pass_no.isnot(None),
-        # WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
+        WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
 
         or_(
             WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
@@ -4359,6 +4404,7 @@ async def get_all_shipments_by_ton_category_value_particular_date_range(
 
             # ✅ Business rules
             WorkerAssignmentShipment.gate_pass_no.isnot(None),
+            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None),
             WorkerAssignmentShipment.assigned_person.isnot(None),
 
             # ✅ Date filter
