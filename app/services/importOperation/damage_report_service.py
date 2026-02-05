@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 from fastapi import UploadFile, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select, and_, desc, func
 from sqlalchemy.orm import selectinload
 import shutil
@@ -18,7 +19,10 @@ from app.db.models.importOperation.damage_report import (
     DamageReason,
     DamageReportReason
 )
+from app.db.models.importOperation.worker_assignment import WorkerAssignmentHeader, WorkerAssignmentShipment
 from app.schemas.importOperation.damage_report import DamageReportCreate, DamageReportUpdate
+from app.utils.common.enums import DamageStatusInWorkerAssignmnet
+from app.utils.common.helperFunction import get_utc_now
 
 
 class DamageReportService:
@@ -36,186 +40,839 @@ class DamageReportService:
         Path(self.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 
+    # async def create_damage_report(
+    #     self,
+    #     report_data: DamageReportCreate,
+    #     images: List[UploadFile],
+    #     user_info: dict
+    # ) -> Tuple[DamageReport, List[DamageReportImage]]:
+    #     """
+    #     Create or update a damage report.
+    #     Tracks all changes: additions, removals, and updates.
+    #     """
+    #     saved_images: List[DamageReportImage] = []
+        
+    #     # =====================================================
+    #     # 1️⃣ Fetch Shipment + Header (CRITICAL)
+    #     # =====================================================
+
+    #     shipment_result = await self.db.execute(
+    #         select(WorkerAssignmentShipment)
+    #         .where(
+    #             WorkerAssignmentShipment.id
+    #             == report_data.assignment_shipment_id
+    #         )
+    #     )
+
+    #     shipment = shipment_result.scalar_one_or_none()
+
+    #     if not shipment:
+    #         raise HTTPException(
+    #             400,
+    #             "Invalid assignment_shipment_id"
+    #         )
+
+    #     header_id = shipment.assignment_header_id
+
+
+    #     # =====================================================
+    #     # 2️⃣ Check Existing Report
+    #     # =====================================================
+
+    #     existing_result = await self.db.execute(
+
+    #         select(DamageReport)
+    #         .options(selectinload(DamageReport.reasons))
+    #         .where(
+    #             DamageReport.assignment_shipment_id
+    #             == report_data.assignment_shipment_id,
+
+    #             DamageReport.oc_no == report_data.oc_no,
+    #             DamageReport.location == report_data.location,
+    #         )
+    #     )
+
+    #     existing_report = existing_result.scalars().first()
+
+    #     # =====================================================
+    #     # 3️⃣ Validate Images + Reasons
+    #     # =====================================================
+
+    #     if not existing_report:
+
+    #         if not report_data.reason_ids:
+    #             raise HTTPException(
+    #                 400,
+    #                 "At least one damage reason required"
+    #             )
+
+    #         if not images:
+    #             raise HTTPException(
+    #                 400,
+    #                 "At least one image required for new report"
+    #             )
+
+    #     else:
+
+    #         if not report_data.reason_ids:
+    #             raise HTTPException(
+    #                 400,
+    #                 "At least one damage reason required"
+    #             )
+
+
+    #     if images and len(images) > self.MAX_IMAGES_PER_REPORT:
+
+    #         raise HTTPException(
+    #             400,
+    #             f"Maximum {self.MAX_IMAGES_PER_REPORT} images allowed"
+    #         )
+
+
+    #     # Validate reason IDs
+    #     await self._validate_reason_ids(report_data.reason_ids)
+
+    #     try:
+    #         if existing_report:
+    #             # ========== UPDATE EXISTING REPORT ==========
+                
+    #             changes = []
+                
+    #             # Update remarks
+    #             if report_data.remarks != existing_report.remarks:
+    #                 old_remarks = existing_report.remarks
+    #                 existing_report.remarks = report_data.remarks
+    #                 if old_remarks and report_data.remarks:
+    #                     changes.append("remarks updated")
+    #                 elif report_data.remarks:
+    #                     changes.append("remarks added")
+    #                 else:
+    #                     changes.append("remarks removed")
+                
+    #             existing_report.updated_at = datetime.utcnow()
+    #             self.db.add(existing_report)
+    #             await self.db.flush()
+
+    #             # ===== SYNC REASONS (Handle Add/Remove) =====
+    #             existing_reason_ids = {r.reason_id for r in existing_report.reasons}
+    #             new_reason_ids = set(report_data.reason_ids)
+                
+    #             # Find added and removed reasons
+    #             added_reasons = new_reason_ids - existing_reason_ids
+    #             removed_reasons = existing_reason_ids - new_reason_ids
+                
+    #             # Remove old reasons that are no longer selected
+    #             if removed_reasons:
+    #                 for reason_rel in existing_report.reasons:
+    #                     if reason_rel.reason_id in removed_reasons:
+    #                         await self.db.delete(reason_rel)
+    #                 changes.append(f"{len(removed_reasons)} reason(s) removed")
+                
+    #             # Add new reasons
+    #             if added_reasons:
+    #                 for reason_id in added_reasons:
+    #                     report_reason = DamageReportReason(
+    #                         report_id=existing_report.id,
+    #                         reason_id=reason_id,
+    #                         emp_id=user_info.get("emp_id", report_data.emp_id),
+    #                         device_id=user_info.get("device_id"),
+    #                     )
+    #                     self.db.add(report_reason)
+    #                 changes.append(f"{len(added_reasons)} reason(s) added")
+
+    #             # Add new images if provided
+    #             if images:
+    #                 for idx, image in enumerate(images):
+    #                     image_record = await self._save_image(
+    #                         existing_report.id,
+    #                         image,
+    #                         idx,
+    #                         emp_id=user_info.get("emp_id", report_data.emp_id),
+    #                         device_id=user_info.get("device_id")
+    #                     )
+    #                     saved_images.append(image_record)
+    #                 changes.append(f"{len(images)} new image(s) added")
+
+    #             action = "UPDATE"
+    #             source_action = "report_updated"
+    #             description = f"Damage report updated: {', '.join(changes)}" if changes else "No changes detected"
+
+    #         else:
+    #             # ========== CREATE NEW REPORT ==========
+                
+    #             db_report = DamageReport(
+    #                 # ✅ New mapping
+    #                 assignment_header_id=header_id,
+    #                 assignment_shipment_id=shipment.id,
+
+    #                 oc_no=report_data.oc_no,
+    #                 awb_no=report_data.awb_no,
+    #                 hawb=report_data.hawb,
+    #                 location=report_data.location,
+    #                 remarks=report_data.remarks,
+    #                 reported_at=report_data.reported_at,
+    #                 created_at=get_utc_now(),
+    #                 updated_at=get_utc_now(),
+    #             )
+    #             self.db.add(db_report)
+    #             await self.db.flush()
+
+    #             # Add damage reasons
+    #             for reason_id in report_data.reason_ids:
+    #                 report_reason = DamageReportReason(
+    #                     report_id=db_report.id,
+    #                     reason_id=reason_id,
+    #                     emp_id=user_info.get("emp_id", report_data.emp_id),
+    #                     device_id=user_info.get("device_id", report_data.device_id)
+    #                 )
+    #                 self.db.add(report_reason)
+
+    #             # Save images
+    #             for idx, image in enumerate(images):
+    #                 image_record = await self._save_image(
+    #                     db_report.id,
+    #                     image,
+    #                     idx,
+    #                     emp_id=user_info.get("emp_id", report_data.emp_id),
+    #                     device_id=user_info.get("device_id")
+    #                 )
+    #                 saved_images.append(image_record)
+
+    #             existing_report = db_report
+    #             action = "CREATE"
+    #             source_action = "report_created"
+    #             description = f"Damage report created: {len(report_data.reason_ids)} reason(s), {len(saved_images)} image(s)"
+
+    #         # Commit transaction
+    #         await self.db.commit()
+    #         await self.db.refresh(existing_report, ["reasons", "images"])
+
+    #         # Create audit log
+    #         await self._create_audit_log(
+    #             damage_report_id=db_report.id,
+
+    #             assignment_header_id=header_id,
+    #             assignment_shipment_id=shipment.id,
+
+    #             oc_no=shipment.header.oc_no,
+    #             location=shipment.location,
+
+    #             db_action=action,
+    #             source_action=source_action,
+    #             changed_by=user_info.get("emp_id"),
+    #             changed_by_role=user_info.get("role"),
+    #             ip_address=user_info.get("ip_address"),
+    #             device_id=user_info.get("device_id"),
+    #             user_agent=user_info.get("user_agent"),
+    #             description=description
+    #         )
+
+    #         return existing_report, saved_images
+
+    #     except Exception as e:
+    #         await self.db.rollback()
+    #         for image in saved_images:
+    #             await self._delete_image_file(image.image_url)
+    #         raise HTTPException(status_code=500, detail=f"Failed to create/update damage report: {str(e)}")
+
+    # async def create_damage_report(
+    #     self,
+    #     report_data: DamageReportCreate,
+    #     images: List[UploadFile],
+    #     user_info: dict
+    # ) -> Tuple[DamageReport, List[DamageReportImage]]:
+
+    #     saved_images: List[DamageReportImage] = []
+
+    #     # =====================================================
+    #     # 🔴 FIX 1: Fetch Shipment + Header (DON'T TRUST CLIENT)
+    #     # =====================================================
+    #     shipment_result = await self.db.execute(
+    #         select(WorkerAssignmentShipment)
+    #         .where(
+    #             WorkerAssignmentShipment.id
+    #             == report_data.assignment_shipment_id
+    #         )
+    #     )
+
+
+    #     shipment = shipment_result.scalar_one_or_none()
+
+    #     if not shipment:
+    #         raise HTTPException(400, "Invalid assignment_shipment_id")
+
+
+    #     # 👇 MANUAL HEADER FETCH (NO RELATIONSHIP)
+    #     header_result = await self.db.execute(
+    #         select(WorkerAssignmentHeader).where(
+    #             WorkerAssignmentHeader.id == shipment.assignment_header_id
+    #         )
+    #     )
+
+    #     header = header_result.scalar_one_or_none()
+
+    #     if not header:
+    #         raise HTTPException(400, "Shipment header missing")
+
+
+    #     header_id = shipment.assignment_header_id
+
+    #     # 🔴 Validate OC from client vs header
+    #     if report_data.oc_no != header.oc_no:
+    #         raise HTTPException(
+    #             status_code=400,
+    #             detail="OC number does not match shipment header"
+    #         )
+
+
+    #     # =====================================================
+    #     # 🔴 FIX 2: Check Existing Report (Use REAL OC + Location)
+    #     # =====================================================
+    #     existing_result = await self.db.execute(
+
+    #         select(DamageReport)
+    #         .options(selectinload(DamageReport.reasons))
+    #         .where(
+    #             DamageReport.assignment_shipment_id
+    #             == shipment.id,
+
+    #             # 🔴 FIX: use DB values, not client values
+    #             DamageReport.oc_no == header.oc_no,
+    #             DamageReport.location == shipment.location,
+    #         )
+    #     )
+
+    #     existing_report = existing_result.scalars().first()
+
+
+    #     # =====================================================
+    #     # 3️⃣ Validate Images + Reasons
+    #     # =====================================================
+    #     if not existing_report:
+
+    #         if not report_data.reason_ids:
+    #             raise HTTPException(400, "At least one damage reason required")
+
+    #         if not images:
+    #             raise HTTPException(400, "At least one image required")
+
+    #     else:
+
+    #         if not report_data.reason_ids:
+    #             raise HTTPException(400, "At least one damage reason required")
+
+
+    #     if images and len(images) > self.MAX_IMAGES_PER_REPORT:
+
+    #         raise HTTPException(
+    #             400,
+    #             f"Maximum {self.MAX_IMAGES_PER_REPORT} images allowed"
+    #         )
+
+
+    #     await self._validate_reason_ids(report_data.reason_ids)
+
+
+    #     try:
+
+    #         # =================================================
+    #         # UPDATE
+    #         # =================================================
+    #         if existing_report:
+
+    #             changes = []
+
+    #             # ---- Remarks ----
+    #             if report_data.remarks != existing_report.remarks:
+
+    #                 existing_report.remarks = report_data.remarks
+    #                 changes.append("remarks updated")
+
+    #             existing_report.updated_at = get_utc_now()
+
+    #             await self.db.flush()
+
+
+    #             # ---- Sync Reasons ----
+    #             old_ids = {r.reason_id for r in existing_report.reasons}
+    #             new_ids = set(report_data.reason_ids)
+
+    #             added = new_ids - old_ids
+    #             removed = old_ids - new_ids
+
+
+    #             for rel in existing_report.reasons:
+    #                 if rel.reason_id in removed:
+    #                     await self.db.delete(rel)
+
+
+    #             for rid in added:
+
+    #                 self.db.add(
+    #                     DamageReportReason(
+    #                         report_id=existing_report.id,
+    #                         reason_id=rid,
+    #                         emp_id=user_info.get("emp_id"),
+    #                         device_id=user_info.get("device_id")
+    #                     )
+    #                 )
+
+
+    #             # ---- Add Images ----
+    #             if images:
+
+    #                 for idx, img in enumerate(images):
+
+    #                     rec = await self._save_image(
+    #                         existing_report.id,
+    #                         img,
+    #                         idx,
+    #                         emp_id=user_info.get("emp_id"),
+    #                         device_id=user_info.get("device_id")
+    #                     )
+
+    #                     saved_images.append(rec)
+
+
+    #             # 🔴 FIX 3: db_report was missing (CRASH BUG)
+    #             db_report = existing_report
+
+
+    #             action = "UPDATE"
+    #             source_action = "report_updated"
+
+    #             description = (
+    #                 "Updated: " + ", ".join(changes)
+    #                 if changes else "No changes"
+    #             )
+
+
+    #         # =================================================
+    #         # CREATE
+    #         # =================================================
+    #         else:
+
+    #             db_report = DamageReport(
+
+    #                 # 🔴 FIX 4: Save REAL assignment chain
+    #                 assignment_header_id=header_id,
+    #                 assignment_shipment_id=shipment.id,
+
+    #                 # 🔴 FIX 5: Save REAL OC + Location (NOT client)
+    #                 oc_no=report_data.oc_no,
+    #                 location=report_data.location , 
+
+    #                 awb_no=report_data.awb_no,
+    #                 hawb=report_data.hawb,
+
+    #                 remarks=report_data.remarks,
+    #                 reported_at=report_data.reported_at,
+
+    #                 created_at=get_utc_now(),
+    #                 updated_at=get_utc_now(),
+    #             )
+
+    #             self.db.add(db_report)
+
+    #             await self.db.flush()
+
+
+    #             # ---- Add Reasons ----
+    #             for rid in report_data.reason_ids:
+
+    #                 self.db.add(
+    #                     DamageReportReason(
+    #                         report_id=db_report.id,
+    #                         reason_id=rid,
+    #                         emp_id=user_info.get("emp_id"),
+    #                         device_id=user_info.get("device_id"),
+    #                     )
+    #                 )
+
+
+    #             # ---- Save Images ----
+    #             for idx, img in enumerate(images):
+
+    #                 rec = await self._save_image(
+    #                     db_report.id,
+    #                     img,
+    #                     idx,
+    #                     emp_id=user_info.get("emp_id"),
+    #                     device_id=user_info.get("device_id")
+    #                 )
+
+    #                 saved_images.append(rec)
+
+
+    #             action = "CREATE"
+    #             source_action = "report_created"
+
+    #             description = (
+    #                 f"Created with {len(report_data.reason_ids)} reasons "
+    #                 f"and {len(saved_images)} images"
+    #             )
+
+
+    #         # =====================================================
+    #         # COMMIT
+    #         # =====================================================
+    #         await self.db.commit()
+
+
+    #         result = await self.db.execute(
+    #             select(DamageReport)
+    #             .options(
+    #                 selectinload(DamageReport.reasons),
+    #                 selectinload(DamageReport.images),
+    #             )
+    #             .where(DamageReport.id == db_report.id)
+    #         )
+
+    #         db_report = result.scalar_one()
+
+    #         # =====================================================
+    #         # AUDIT
+    #         # =====================================================
+    #         await self._create_audit_log(
+
+    #             damage_report_id=db_report.id,
+
+    #             # 🔴 FIX 6: Save assignment context
+    #             assignment_header_id=header_id,
+    #             assignment_shipment_id=shipment.id,
+
+    #             oc_no=header.oc_no,
+    #             location=shipment.location,
+
+    #             db_action=action,
+    #             source_action=source_action,
+
+    #             changed_by=user_info.get("emp_id"),
+    #             changed_by_role=user_info.get("role"),
+
+    #             ip_address=user_info.get("ip_address"),
+    #             device_id=user_info.get("device_id"),
+
+    #             user_agent=user_info.get("user_agent"),
+
+    #             description=description,
+
+    #             changed_at=get_utc_now(),  # 🔴 FIX 7: mandatory
+    #         )
+
+
+    #         return db_report, saved_images
+
+
+    #     except Exception as e:
+
+    #         await self.db.rollback()
+
+    #         for img in saved_images:
+    #             await self._delete_image_file(img.image_url)
+
+    #         raise HTTPException(
+    #             500,
+    #             f"Failed to save report: {str(e)}"
+    #         )
+
     async def create_damage_report(
         self,
         report_data: DamageReportCreate,
         images: List[UploadFile],
         user_info: dict
     ) -> Tuple[DamageReport, List[DamageReportImage]]:
-        """
-        Create or update a damage report.
-        Tracks all changes: additions, removals, and updates.
-        """
+
         saved_images: List[DamageReportImage] = []
-        
-        # Check for existing report
-        existing_report_result = await self.db.execute(
+        print(report_data,"report_data")
+
+        # =====================================================
+        # 🔴 FIX 1: Fetch Shipment + Header (DON'T TRUST CLIENT)
+        # =====================================================
+        shipment_result = await self.db.execute(
+            select(WorkerAssignmentShipment)
+            .where(
+                WorkerAssignmentShipment.id
+                == report_data.assignment_shipment_id
+            )
+        )
+
+        shipment = shipment_result.scalar_one_or_none()
+
+        if not shipment:
+            raise HTTPException(400, "Invalid assignment_shipment_id")
+
+        # 👇 MANUAL HEADER FETCH (NO RELATIONSHIP)
+        header_result = await self.db.execute(
+            select(WorkerAssignmentHeader).where(
+                WorkerAssignmentHeader.id == shipment.assignment_header_id
+            )
+        )
+
+        header = header_result.scalar_one_or_none()
+
+        if not header:
+            raise HTTPException(400, "Shipment header missing")
+
+        header_id = shipment.assignment_header_id
+
+        # 🔴 Validate OC from client vs header
+        if report_data.oc_no != header.oc_no:
+            raise HTTPException(
+                status_code=400,
+                detail="OC number does not match shipment header"
+            )
+
+        # =====================================================
+        # 🔴 FIX 2: Check Existing Report (Use REAL OC + Location)
+        # =====================================================
+        existing_result = await self.db.execute(
             select(DamageReport)
             .options(selectinload(DamageReport.reasons))
-            .filter(
-                DamageReport.worker_assignment_id == report_data.worker_assignment_id,
-                DamageReport.oc_no == report_data.oc_no,
-                DamageReport.awb_no == report_data.awb_no,
+            .where(
+                DamageReport.assignment_shipment_id
+                == shipment.id,
+
+            # used client values
+                DamageReport.oc_no == header.oc_no,
                 DamageReport.location == report_data.location,
             )
         )
-        existing_report = existing_report_result.scalars().first()
-        
-        # For NEW reports, both reasons and images required
+
+        existing_report = existing_result.scalars().first()
+
+        # =====================================================
+        # 3️⃣ Validate Images + Reasons
+        # =====================================================
         if not existing_report:
-            if not report_data.reason_ids or len(report_data.reason_ids) == 0:
-                raise HTTPException(status_code=400, detail="At least one damage reason is required")
-            if not images or len(images) == 0:
-                raise HTTPException(status_code=400, detail="At least one image is required for new reports")
+            if not report_data.reason_ids:
+                raise HTTPException(400, "At least one damage reason required")
+
+            if not images:
+                raise HTTPException(400, "At least one image required")
         else:
-            # For UPDATES, must have at least 1 reason (can't remove all)
-            if not report_data.reason_ids or len(report_data.reason_ids) == 0:
-                raise HTTPException(status_code=400, detail="At least one damage reason must be selected")
-        
+            if not report_data.reason_ids:
+                raise HTTPException(400, "At least one damage reason required")
+
         if images and len(images) > self.MAX_IMAGES_PER_REPORT:
             raise HTTPException(
-                status_code=400,
-                detail=f"Maximum {self.MAX_IMAGES_PER_REPORT} images allowed per report"
+                400,
+                f"Maximum {self.MAX_IMAGES_PER_REPORT} images allowed"
             )
 
-        # Validate reason IDs
         await self._validate_reason_ids(report_data.reason_ids)
 
         try:
+            # =================================================
+            # UPDATE
+            # =================================================
             if existing_report:
-                # ========== UPDATE EXISTING REPORT ==========
-                
                 changes = []
-                
-                # Update remarks
+
+                # ---- Remarks ----
                 if report_data.remarks != existing_report.remarks:
-                    old_remarks = existing_report.remarks
                     existing_report.remarks = report_data.remarks
-                    if old_remarks and report_data.remarks:
-                        changes.append("remarks updated")
-                    elif report_data.remarks:
-                        changes.append("remarks added")
-                    else:
-                        changes.append("remarks removed")
-                
-                existing_report.updated_at = datetime.utcnow()
-                self.db.add(existing_report)
+                    changes.append("remarks updated")
+
+                existing_report.updated_at = get_utc_now()
+
                 await self.db.flush()
 
-                # ===== SYNC REASONS (Handle Add/Remove) =====
-                existing_reason_ids = {r.reason_id for r in existing_report.reasons}
-                new_reason_ids = set(report_data.reason_ids)
-                
-                # Find added and removed reasons
-                added_reasons = new_reason_ids - existing_reason_ids
-                removed_reasons = existing_reason_ids - new_reason_ids
-                
-                # Remove old reasons that are no longer selected
-                if removed_reasons:
-                    for reason_rel in existing_report.reasons:
-                        if reason_rel.reason_id in removed_reasons:
-                            await self.db.delete(reason_rel)
-                    changes.append(f"{len(removed_reasons)} reason(s) removed")
-                
-                # Add new reasons
-                if added_reasons:
-                    for reason_id in added_reasons:
-                        report_reason = DamageReportReason(
-                            report_id=existing_report.id,
-                            reason_id=reason_id,
-                            emp_id=user_info.get("emp_id", report_data.emp_id),
-                            device_id=user_info.get("device_id"),
-                        )
-                        self.db.add(report_reason)
-                    changes.append(f"{len(added_reasons)} reason(s) added")
+                # ---- Sync Reasons ----
+                old_ids = {r.reason_id for r in existing_report.reasons}
+                new_ids = set(report_data.reason_ids)
 
-                # Add new images if provided
-                if images:
-                    for idx, image in enumerate(images):
-                        image_record = await self._save_image(
-                            existing_report.id,
-                            image,
-                            idx,
-                            emp_id=user_info.get("emp_id", report_data.emp_id),
+                added = new_ids - old_ids
+                removed = old_ids - new_ids
+
+                for rel in existing_report.reasons:
+                    if rel.reason_id in removed:
+                        await self.db.delete(rel)
+
+                for rid in added:
+                    self.db.add(
+                        DamageReportReason(
+                            report_id=existing_report.id,
+                            reason_id=rid,
+                            emp_id=user_info.get("emp_id"),
                             device_id=user_info.get("device_id")
                         )
-                        saved_images.append(image_record)
-                    changes.append(f"{len(images)} new image(s) added")
+                    )
+
+                # ---- Add Images ----
+                if images:
+                    for idx, img in enumerate(images):
+                        rec = await self._save_image(
+                            existing_report.id,
+                            img,
+                            idx,
+                            emp_id=user_info.get("emp_id"),
+                            device_id=user_info.get("device_id")
+                        )
+                        saved_images.append(rec)
+
+                # 🔴 FIX 3: db_report was missing (CRASH BUG)
+                db_report = existing_report
 
                 action = "UPDATE"
                 source_action = "report_updated"
-                description = f"Damage report updated: {', '.join(changes)}" if changes else "No changes detected"
 
+                description = (
+                    "Updated: " + ", ".join(changes)
+                    if changes else "No changes"
+                )
+
+            # =================================================
+            # CREATE
+            # =================================================
             else:
-                # ========== CREATE NEW REPORT ==========
-                
                 db_report = DamageReport(
-                    worker_assignment_id=report_data.worker_assignment_id,
+                    # 🔴 FIX 4: Save REAL assignment chain
+                    assignment_header_id=header_id,
+                    assignment_shipment_id=shipment.id,
+
+                    # 🔴 FIX 5: Save REAL OC + Location (NOT client)
                     oc_no=report_data.oc_no,
+                    location=report_data.location,
+
                     awb_no=report_data.awb_no,
                     hawb=report_data.hawb,
-                    location=report_data.location,
+
                     remarks=report_data.remarks,
                     reported_at=report_data.reported_at,
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow(),
+
+                    created_at=get_utc_now(),
+                    updated_at=get_utc_now(),
                 )
+
                 self.db.add(db_report)
+
+                # 🔴 ADD THIS BLOCK 👇👇👇(SYNC TO WORKER ASSIGNMENT)
+                # =========================
+                current_status = shipment.damage_report_status
+
+                # Only set OPEN if no active tracer case
+                if current_status is None:
+
+                    shipment.damage_report_status = DamageStatusInWorkerAssignmnet.OPEN.value
+                    shipment.damage_resolve_datetime = None
+
+                # ❌ THIS USED WHEN NEED IN FUTURE THAT REOPEN NOT TODAY (FEB...)
+                # elif current_status == DamageStatusInWorkerAssignmnet.RESOLVED.value:
+                #     # New damage after resolved → reopen
+                #     shipment.damage_report_status = DamageStatusInWorkerAssignmnet.OPEN.value
+                #     shipment.damage_resolve_datetime = None
+
+
+                    # If already OPEN or IN_PROGRESS → DO NOTHING
+                    # (Keep existing status)
+                shipment.updated_at = get_utc_now()
+                self.db.add(shipment)
+                # 🔴------ END
+
                 await self.db.flush()
 
-                # Add damage reasons
-                for reason_id in report_data.reason_ids:
-                    report_reason = DamageReportReason(
-                        report_id=db_report.id,
-                        reason_id=reason_id,
-                        emp_id=user_info.get("emp_id", report_data.emp_id),
-                        device_id=user_info.get("device_id", report_data.device_id)
+                # ---- Add Reasons ----
+                for rid in report_data.reason_ids:
+                    self.db.add(
+                        DamageReportReason(
+                            report_id=db_report.id,
+                            reason_id=rid,
+                            emp_id=user_info.get("emp_id"),
+                            device_id=user_info.get("device_id"),
+                        )
                     )
-                    self.db.add(report_reason)
 
-                # Save images
-                for idx, image in enumerate(images):
-                    image_record = await self._save_image(
+                # ---- Save Images ----
+                for idx, img in enumerate(images):
+                    rec = await self._save_image(
                         db_report.id,
-                        image,
+                        img,
                         idx,
-                        emp_id=user_info.get("emp_id", report_data.emp_id),
+                        emp_id=user_info.get("emp_id"),
                         device_id=user_info.get("device_id")
                     )
-                    saved_images.append(image_record)
+                    saved_images.append(rec)
 
-                existing_report = db_report
                 action = "CREATE"
                 source_action = "report_created"
-                description = f"Damage report created: {len(report_data.reason_ids)} reason(s), {len(saved_images)} image(s)"
 
-            # Commit transaction
-            await self.db.commit()
-            await self.db.refresh(existing_report, ["reasons", "images"])
+                description = (
+                    f"Created with {len(report_data.reason_ids)} reasons "
+                    f"and {len(saved_images)} images"
+                )
 
-            # Create audit log
+            # =====================================================
+            # FLUSH BEFORE AUDIT
+            # =====================================================
+            await self.db.flush()
+
+            # =====================================================
+            # AUDIT
+            # =====================================================
             await self._create_audit_log(
-                damage_report_id=existing_report.id,
-                oc_no=report_data.oc_no,
+                damage_report_id=db_report.id,
+
+                # 🔴 FIX 6: Save assignment context
+                assignment_header_id=header_id,
+                assignment_shipment_id=shipment.id,
+
+                oc_no=header.oc_no,
                 location=report_data.location,
+
                 db_action=action,
                 source_action=source_action,
+
                 changed_by=user_info.get("emp_id"),
                 changed_by_role=user_info.get("role"),
+
                 ip_address=user_info.get("ip_address"),
                 device_id=user_info.get("device_id"),
+
                 user_agent=user_info.get("user_agent"),
-                description=description
+
+                description=description,
+
+                changed_at=get_utc_now(),  # 🔴 FIX 7: mandatory
             )
 
-            return existing_report, saved_images
+            # =====================================================
+            # COMMIT (SINGLE COMMIT)
+            # =====================================================
+            await self.db.commit()
+
+            # =====================================================
+            # REFRESH REPORT WITH RELATIONSHIPS
+            # =====================================================
+            result = await self.db.execute(
+                select(DamageReport)
+                .options(
+                    selectinload(DamageReport.reasons),
+                    selectinload(DamageReport.images),
+                )
+                .where(DamageReport.id == db_report.id)
+            )
+
+            db_report = result.scalar_one()
+
+            return db_report, saved_images
 
         except Exception as e:
             await self.db.rollback()
-            for image in saved_images:
-                await self._delete_image_file(image.image_url)
-            raise HTTPException(status_code=500, detail=f"Failed to create/update damage report: {str(e)}")
+            import traceback
+            for img in saved_images:
+                await self._delete_image_file(img.image_url)
 
+            # Print full traceback to console
+            traceback.print_exc()    
+
+            raise HTTPException(
+                500,
+                f"Failed to save report: {str(e)}"
+            )    
+
+
+# -----------------------------------------------------------------
 
     async def _validate_reason_ids(self, reason_ids: List[int]):
         """Validate that all reason IDs exist and are active"""
@@ -312,6 +969,93 @@ class DamageReportService:
         result = await self.db.execute(stmt)
         return result.scalars().all()
 
+    # 😊😊
+    async def get_damage_reports_by_shipment_and_location(
+        self,
+        assignment_shipment_id: int,
+        oc_no: str,
+        location: str
+    ) -> List[DamageReport]:
+
+        # =====================================================
+        # 1️⃣ Fetch Shipment
+        # =====================================================
+        shipment_result = await self.db.execute(
+            select(WorkerAssignmentShipment)
+            .where(
+                WorkerAssignmentShipment.id == assignment_shipment_id
+            )
+        )
+
+        shipment = shipment_result.scalar_one_or_none()
+
+        if not shipment:
+            raise HTTPException(
+                status_code=404,
+                detail="Invalid assignment_shipment_id"
+            )
+
+
+        # =====================================================
+        # 2️⃣ Fetch Header Manually (NO RELATIONSHIP)
+        # =====================================================
+        header_result = await self.db.execute(
+            select(WorkerAssignmentHeader)
+            .where(
+                WorkerAssignmentHeader.id == shipment.assignment_header_id
+            )
+        )
+
+        header = header_result.scalar_one_or_none()
+
+        if not header:
+            raise HTTPException(
+                status_code=404,
+                detail="Shipment header missing"
+            )
+
+
+        # =====================================================
+        # 3️⃣ Validate OC (DO NOT TRUST CLIENT)
+        # =====================================================
+        if oc_no != header.oc_no:
+            raise HTTPException(
+                status_code=400,
+                detail="OC number does not match shipment header"
+            )
+
+
+        # =====================================================
+        # 4️⃣ Fetch Damage Reports (Shipment + Location)
+        # =====================================================
+        stmt = (
+            select(DamageReport)
+
+            .options(
+                selectinload(DamageReport.reasons)
+                    .selectinload(DamageReportReason.reason),
+
+                selectinload(DamageReport.images)
+            )
+
+            .where(
+                DamageReport.assignment_shipment_id == assignment_shipment_id,
+                DamageReport.location == location  # ✅ use DB value
+            )
+
+            .order_by(
+                DamageReport.reported_at.desc()
+            )
+        )
+
+
+        result = await self.db.execute(stmt)
+
+        reports = result.scalars().all()
+
+        return reports
+
+
     async def get_damage_reports_by_employee(
         self,
         emp_id: str,
@@ -388,6 +1132,9 @@ class DamageReportService:
             old_remarks = db_report.remarks
             db_report.remarks = update_data.remarks
             changes.append(("remarks", old_remarks, update_data.remarks))
+        
+        print(update_data,"report_data")
+        print(changes,"changes")
 
         try:
             await self.db.commit()
@@ -469,6 +1216,8 @@ class DamageReportService:
     async def _create_audit_log(
         self,
         damage_report_id: int,
+         assignment_header_id: int,
+    assignment_shipment_id: int,
         oc_no: str,
         location: str,
         db_action: str,
@@ -481,12 +1230,16 @@ class DamageReportService:
         ip_address: Optional[str] = None,
         device_id: Optional[str] = None,
         user_agent: Optional[str] = None,
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        changed_at: Optional[datetime] = None
+
     ):
         """Create audit log entry"""
         audit_log = DamageReportAuditLog(
             damage_report_id=damage_report_id,
             oc_no=oc_no,
+            assignment_header_id=assignment_header_id ,
+            assignment_shipment_id= assignment_shipment_id,
             location=location,
             field_name=field_name,
             old_value=old_value,
@@ -499,12 +1252,13 @@ class DamageReportService:
             device_id=device_id,
             user_agent=user_agent,
             description=description,
-            changed_at=datetime.utcnow()
+            changed_at=changed_at or get_utc_now()
         )
         self.db.add(audit_log)
-        await self.db.commit()
+        # Already commited in create damage report
+        # await self.db.commit()
 
-    # Damage Reason Management Methods
+    # Damage Reason Management Methods-----------------------------------------------------------------------
     async def get_all_damage_reasons(self, active_only: bool = True) -> List[DamageReason]:
         """Get all damage reasons"""
         stmt = select(DamageReason)
@@ -549,7 +1303,16 @@ class DamageReportService:
             description=description
         )
         self.db.add(db_reason)
-        await self.db.commit()
+        try:
+            await self.db.commit()
+
+        except IntegrityError:
+                await self.db.rollback()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Damage reason '{reason_code}' already exists"
+                )
+        
         await self.db.refresh(db_reason)
         
         return db_reason

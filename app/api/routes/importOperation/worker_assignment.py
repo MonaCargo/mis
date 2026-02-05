@@ -557,6 +557,7 @@
 
 # app/api/v1/endpoints/worker_assignment_api.py
 from datetime import date, datetime, time, timedelta
+import math
 import traceback
 from typing import List, Optional
 from zoneinfo import ZoneInfo
@@ -574,7 +575,11 @@ from app.db.models.user import User
 from app.db.session import get_db
 from app.schemas.importOperation.worker_assignment import (
     AssignDropDlvZoneRequest,
+    AssignLoadingInLiftRequest,
+    AssignUnloadingFromLiftRequest,
+    MarkShipmentFinalDeliveryRequest,
     PaginatedWorkerAssignmentResponse,
+    RequestOfImprtTracerAssign,
     RequestOfWorkerAssignment,
     ResponseOfWorkerAssignment,
     WorkerAssignmentExportRequest,
@@ -585,6 +590,8 @@ from app.schemas.importOperation.worker_assignment import (
 from app.schemas.user import UserListResponse, UserRead
 from app.services.importOperation.worker_assignment_service import (
     add_drop_dlv_zone_by_assigned_worker,
+    add_loading_in_lift_by_assigned_worker,
+    add_unloading_from_lift_by_assigned_worker,
     assign_user_to_worker_assignment,
     auto_assign_pom_shipments,
     generate_excel_stream_export_worker_assignment,
@@ -594,14 +601,22 @@ from app.services.importOperation.worker_assignment_service import (
     get_assignment_overall_summary,
     get_assignment_summary_according_to_assigned_person,
     get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no,
+    get_full_damage_report_by_id_for_tracer,
     get_paginated_worker_assignments_data_list,
+    get_paginated_worker_assignments_with_damage_filter,
+    get_particular_user_drop_shipments_details,
     get_shipment_delay_dashboard_counts,
     get_shipment_delay_details,
+    get_shipments_for_final_delivery,
+    get_shipments_for_loading_in_lift,
+    get_shipments_for_unloading_from_lift,
     get_worker_assignment_lists_by_emp_id,
     get_worker_shipment_details_by_empid_which_assigned_not_dropatlift,
+    mark_final_delivery_by_assigned_worker,
     process_worker_assignment,
     search_in_worker_assignments,
 )
+from app.services.user_service import get_active_import_tracer
 from app.utils.common.get_request_ip import get_request_ip
 
 router = APIRouter(prefix="/worker-assignment", tags=[""])
@@ -881,7 +896,7 @@ async def assign_drop_dlv_zone(
     # emp_id: str = None,
     req: AssignDropDlvZoneRequest,
     fastApiRequest: Request,
-    current_user: User = Depends(require_roles(["imp_gp_user"])),
+    current_user: User = Depends(require_roles(["imp_gp_user","imp_tracer"])),
     db: AsyncSession = Depends(get_db),
 ):
     print(req, "req--------------------------------")
@@ -1163,6 +1178,7 @@ async def shipment_delay_details(
         offset=offset,
     )
 
+
 @router.get("/shipments/by-ton-category-value")
 async def get_shipments_by_ton(
     start_date: str,
@@ -1247,6 +1263,592 @@ async def get_shipments_by_ton(
         "count": len(data),
         "data": data,
     }
+
+
+# Get the details of particulart operator/worker that how many data drop(5/3/10 ton) on paerticular date range (for operator daily summary view) 
+@router.get("/particular-user-drop-shipments-details")
+async def get_user_drop_shipments_api(
+    emp_id: str = Query(..., description="Employee ID"),
+    start_date: str = Query(..., example="2026-01-20"),
+    end_date: str = Query(..., example="2026-01-25"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get dropped shipments of a user in date range (IST based)
+    """
+
+    # -------------------------------
+    # Basic validation
+    # -------------------------------
+    if start_date > end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date cannot be greater than end_date",
+        )
+
+    data = await get_particular_user_drop_shipments_details(
+        db=db,
+        emp_id=emp_id,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    return {
+        "status": "success",
+        "emp_id": emp_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "count": data["total_records"],
+        "count_metrics": data["count_metrics"],
+        "data": data["full_data"],
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================ LIFT LOADING AND UNLOADING RELATED SERVICES ==========================================
+
+
+@router.get("/shipments/for-loading-in-lift")
+async def get_for_loading(
+    start_date: str = Query(...,example="2026-01-30"),
+    end_date: str = Query(...,example="2026-01-30"),
+    drop_dlv_zone_term: str = Query(..., example="5 Ton"),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    """
+    Shipments ready to be LOADED in lift
+    """
+    
+    # ============================
+    # ✅ Date Format Validation
+    # ============================
+
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date must be in YYYY-MM-DD format",
+
+        )
+
+    try:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be in YYYY-MM-DD format",
+
+        )
+
+    # ============================
+    # ✅ Date Range Validation
+    # ============================
+
+    if end_dt < start_dt:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be greater than or equal to start_date",
+
+        )
+
+    return await get_shipments_for_loading_in_lift(
+        db=db,
+        drop_dlv_zone_term=drop_dlv_zone_term,
+        user=current_user,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+
+@router.get("/shipments/for-unloading-from-lift")
+async def get_for_unloading(
+    start_date: str = Query(...,example="2026-01-30"),
+    end_date: str = Query(...,example="2026-01-30"),
+    drop_dlv_zone_term: str = Query(..., example="5 Ton"),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    """
+    Shipments ready to be UNLOADED from lift
+    """
+        # ============================
+    # ✅ Date Format Validation
+    # ============================
+
+    print(drop_dlv_zone_term,"drop_dlv_zone_term")
+
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date must be in YYYY-MM-DD format",
+       
+        )
+
+    try:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be in YYYY-MM-DD format",
+
+        )
+
+    # ============================
+    # ✅ Date Range Validation
+    # ============================
+
+    if end_dt < start_dt:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be greater than or equal to start_date",
+
+        )
+    print(drop_dlv_zone_term,"unloading_from_lift_zone")
+
+    return await get_shipments_for_unloading_from_lift(
+        db=db,
+        drop_dlv_zone_term=drop_dlv_zone_term,
+        user=current_user,
+        start_date=start_date,
+        end_date=end_date
+    )
+
+
+
+@router.put("/add-loading-in-lift")
+async def assign_loading_in_lift(
+    req: AssignLoadingInLiftRequest,
+    fastApiRequest: Request,
+    current_user: User = Depends(require_roles(["imp_security","super_admin"])),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        emp_id = current_user.emp_id
+        current_user_role = current_user.role
+
+        print(req,"======================================")
+
+        # Validate
+        if not req.oc_no or not req.loading_in_lift_zone:
+            raise HTTPException(
+                status_code=400,
+                detail="oc_no and loading_in_lift_zone are required",
+            )
+
+        # Metadata
+        ip_address = get_request_ip(fastApiRequest)
+        user_agent = fastApiRequest.headers.get("user-agent")
+
+        # Call service
+        result = await add_loading_in_lift_by_assigned_worker(
+            db=db,
+            header_id=req.header_id,
+            shipment_id=req.shipment_id,
+            oc_no=req.oc_no,
+            emp_id=emp_id,
+            current_user_role=current_user_role,
+            loading_in_lift_zone=req.loading_in_lift_zone,
+            ip_address=ip_address,
+            device_id=req.device_id,
+            user_agent=user_agent,
+        )
+
+        if result["status"] == "success":
+            return {"message": result["message"], "success": True}
+
+        raise HTTPException(400, result["message"])
+
+    except Exception as e:
+        print("🔥 ERROR IN assign_loading_in_lift 🔥")
+        traceback.print_exc()
+        raise
+
+@router.put("/add-unloading-from-lift")
+async def assign_unloading_from_lift(
+    req: AssignUnloadingFromLiftRequest,
+    fastApiRequest: Request,
+    current_user: User = Depends(require_roles(["imp_security","super_admin"])),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        emp_id = current_user.emp_id
+        current_user_role = current_user.role
+
+        # Validate
+        if not req.oc_no or not req.unloading_from_lift_zone:
+            raise HTTPException(
+                status_code=400,
+                detail="oc_no and unloading_from_lift_zone are required",
+            )
+
+        # Metadata
+        ip_address = get_request_ip(fastApiRequest)
+        user_agent = fastApiRequest.headers.get("user-agent")
+
+        # Call service
+        result = await add_unloading_from_lift_by_assigned_worker(
+            db=db,
+            header_id=req.header_id,
+            shipment_id=req.shipment_id,
+            oc_no=req.oc_no,
+            emp_id=emp_id,
+            current_user_role=current_user_role,
+            unloading_from_lift_zone=req.unloading_from_lift_zone,
+            ip_address=ip_address,
+            device_id=req.device_id,
+            user_agent=user_agent,
+        )
+
+        if result["status"] == "success":
+            return {"message": result["message"], "success": True}
+
+        raise HTTPException(400, result["message"])
+
+    except Exception as e:
+        print("🔥 ERROR IN assign_unloading_from_lift 🔥")
+        traceback.print_exc()
+        raise
+
+
+
+
+# @router.get("/shipments/for-final-delivery")
+# async def get_for_final_delivery(
+#     start_date: str = Query(..., example="2026-01-25"),
+#     end_date: str = Query(..., example="2026-01-26"),
+#     drop_dlv_zone_term: str = Query(..., example="5 Ton"),
+#     db: AsyncSession = Depends(get_db),
+#     current_user=Depends(verify_token_and_get_user),
+# ):
+#     """
+#     Shipments ready for FINAL DELIVERY
+#     """
+
+#     # ✅ Date validation (reuse your earlier logic)
+#     from datetime import datetime
+#     from fastapi import HTTPException
+
+#     try:
+#         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+#         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+#     except ValueError:
+#         raise HTTPException(
+#             400, "Date must be YYYY-MM-DD"
+#         )
+
+#     if end_dt < start_dt:
+#         raise HTTPException(
+#             400, "end_date must be >= start_date"
+#         )
+
+#     return await get_shipments_for_final_delivery(
+#         db=db,
+#         drop_dlv_zone_term=drop_dlv_zone_term,
+#         user=current_user,
+#         start_date=start_date,
+#         end_date=end_date,
+#     )
+
+@router.get("/shipments/for-final-delivery")
+async def get_final_delivery_shipments(
+
+    startDate: str = Query(..., example="2026-01-24"),
+    endDate: str = Query(..., example="2026-01-24"),
+
+    status: str = Query("all", example="all"),
+
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=501,),
+
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    """
+    Get shipments for final delivery (paginated)
+    """
+
+    records, total = await get_shipments_for_final_delivery(
+        db=db,
+        start_date=startDate,
+        end_date=endDate,
+        status=status,
+        page=page,
+        page_size=page_size,
+        user=current_user,
+    )
+
+    # Pagination meta
+    total_pages = math.ceil(total / page_size) if total else 1
+
+    pagination = {
+        "current_page": page,
+        "page_size": page_size,
+        "total_records": total,
+        "total_pages": total_pages,
+        "has_previous": page > 1,
+        "has_next": page < total_pages,
+        "previous_page": page - 1 if page > 1 else None,
+        "next_page": page + 1 if page < total_pages else None,
+    }
+
+    return {
+        "success": True,
+        "message": "Final delivery records fetched",
+        "pagination": pagination,
+        "data": records,
+    }
+
+
+
+@router.put("/mark-final-delivery")
+async def mark_final_delivery(
+    req: MarkShipmentFinalDeliveryRequest,
+    fastApiRequest: Request,
+    current_user: User = Depends(require_roles(["imp_security"])),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        emp_id = current_user.emp_id
+        role = current_user.role
+
+        # Metadata
+        ip_address = get_request_ip(fastApiRequest)
+        user_agent = fastApiRequest.headers.get("user-agent")
+
+        result = await mark_final_delivery_by_assigned_worker(
+            db=db,
+            header_id=req.header_id,
+            shipment_id=req.shipment_id,
+            oc_no=req.oc_no,
+
+            emp_id=emp_id,
+            current_user_role=role,
+
+            ip_address=ip_address,
+            device_id=req.device_id,
+            user_agent=user_agent,
+        )
+
+        if result["status"] == "success":
+            return {"success": True, "message": result["message"]}
+
+        raise HTTPException(400, result["message"])
+
+    except Exception:
+        traceback.print_exc()
+        raise
+
+# -----------------------------------------------------------------------------------------------
+# ========================== 😎 Import Tracer related api and routes  ===============================
+
+
+@router.get(
+    "/tracer/get-damage-worker-assignment-list",
+    summary="Get paginated worker assignments having damage reports.",
+    description="Retrieve paginated worker assignments filtered by damage status. It will see to import shift incharge web screen",
+)
+async def get_damage_worker_assignments(
+    assignment_status: str = Query(
+        default="damage_all",
+        description="damage_all | damage_open | damage_resolved"
+    ),
+
+    startDate: Optional[str] = Query(
+        default=None,
+        regex=r"^\d{4}-\d{2}-\d{2}$"
+    ),
+
+    endDate: Optional[str] = Query(
+        default=None,
+        regex=r"^\d{4}-\d{2}-\d{2}$"
+    ),
+
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=500),
+
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    API for paginated damage-related worker assignments.
+    """
+
+    # -----------------------------
+    # VALIDATE STATUS
+    # -----------------------------
+    allowed_status = [
+        "all",
+        "damage_open",
+        "damage_resolved"
+    ]
+
+    if assignment_status not in allowed_status:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status. Allowed: {allowed_status}"
+        )
+
+    # -----------------------------
+    # VALIDATE DATES
+    # -----------------------------
+    def validate_date(val: str, name: str):
+        try:
+            return datetime.strptime(val, "%Y-%m-%d")
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {name}. Format: YYYY-MM-DD"
+            )
+
+    if (startDate and not endDate) or (endDate and not startDate):
+        raise HTTPException(
+            status_code=400,
+            detail="startDate and endDate must be together"
+        )
+
+    if startDate and endDate:
+        s = validate_date(startDate, "startDate")
+        e = validate_date(endDate, "endDate")
+
+        if s > e:
+            raise HTTPException(
+                status_code=400,
+                detail="startDate cannot be after endDate"
+            )
+
+    # -----------------------------
+    # SERVICE CALL
+    # -----------------------------
+    try:
+
+        result = await get_paginated_worker_assignments_with_damage_filter(
+            db=db,
+            status=assignment_status,
+            startDate=startDate,
+            endDate=endDate,
+            page=page,
+            page_size=page_size,
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+
+
+        traceback.print_exc()   # 🔥 full stacktrace
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Damage API Error: {str(e)}"
+        )
+
+@router.get("/{report_id}/full",
+    summary="get all damage report data by damage_report_id  ")
+async def get_damage_report_full_details(
+    report_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+
+    data = await get_full_damage_report_by_id_for_tracer(db, report_id)
+
+    if not data:
+        raise HTTPException(
+            status_code=404,
+            detail="Damage report not found"
+        )
+
+    return {
+        "success": True,
+        "message": "Damage report fetched successfully",
+        "data": data
+    }
+
+
+@router.post("/assign-shipment-to-import-tracer", response_model=ResponseOfWorkerAssignment)
+async def assign_tracer_to_worker_assignment_route(
+    assign_request: RequestOfImprtTracerAssign,   # no emp_id needed
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    try:
+        # ─────────────────────────────────────────────
+        # 1️⃣ Get Active Tracer
+        # ─────────────────────────────────────────────
+        tracer = await get_active_import_tracer(db)
+
+        if not tracer:
+            raise HTTPException(
+                status_code=404,
+                detail="No active import tracer found"
+            )
+
+        tracer_emp_id = tracer.emp_id
+
+        # ─────────────────────────────────────────────
+        # 2️⃣ Assign Using Existing Service
+        # ─────────────────────────────────────────────
+        await assign_user_to_worker_assignment(
+            db=db,
+            header_id=assign_request.header_id,
+            shipment_id=assign_request.shipment_id,
+            oc_no=assign_request.oc_no,
+
+            # 🔥 AUTO EMP ID (Of traacer)
+            emp_id=tracer_emp_id,
+
+            current_user_role=current_user.role,
+            changed_by=current_user.emp_id,
+
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            device_id=assign_request.device_id,
+        )
+
+        return ResponseOfWorkerAssignment(
+            success=True,
+            message="Tracer successfully assigned",
+            oc_num=assign_request.oc_no,
+            emp_id=tracer_emp_id,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to assign tracer"
+        )
+
+
+
+
+
+
+
+
 
 
 # 👌============================ AUTO ASSIGN POM OC SHIPMENT TO PERTICULAR EMPLOYEE =====================
