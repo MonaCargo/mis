@@ -50,6 +50,7 @@
 
 
 
+from sqlalchemy import func, select
 from app.db.models.importOperation.audit_log_worker_assignment import WorkerAssignmentAuditLog
 from app.db.models.importOperation.worker_assignment import WorkerAssignmentHeader, WorkerAssignmentShipment
 from app.utils.common.helperFunction import get_utc_now
@@ -103,3 +104,82 @@ async def log_worker_assignment_audit(
 
     db.add(audit_entry)
 
+
+
+async def search_in_worker_assignments_for_history_timeline(
+    db: AsyncSession,
+    search_type: str,
+    search_value: str
+):
+
+    header_fields = {
+        "oc_no": WorkerAssignmentHeader.oc_no,
+        "awb": WorkerAssignmentHeader.awb_no,
+        "hawb": WorkerAssignmentHeader.hawb,
+        "temp_oc": WorkerAssignmentHeader.temp_irm_oc_no,
+    }
+
+    shipment_fields = {
+        "gp_no": WorkerAssignmentShipment.gate_pass_no,
+    }
+    def model_to_dict(obj):
+        return {
+            column.name: getattr(obj, column.name)
+            for column in obj.__table__.columns
+        }
+
+
+    # ----------------------------------------------------------------
+    # 1️⃣ HEADER SEARCH
+    # ----------------------------------------------------------------
+    if search_type in header_fields:
+        column = header_fields[search_type]
+
+        stmt = (
+            select(WorkerAssignmentShipment, WorkerAssignmentHeader)
+            .join(
+                WorkerAssignmentHeader,
+                WorkerAssignmentShipment.assignment_header_id == WorkerAssignmentHeader.id
+            )
+            .where(column == search_value)
+        )
+
+    # ----------------------------------------------------------------
+    # 2️⃣ SHIPMENT SEARCH
+    # ----------------------------------------------------------------
+    elif search_type in shipment_fields:
+        column = shipment_fields[search_type]
+
+        stmt = (
+            select(WorkerAssignmentShipment, WorkerAssignmentHeader)
+            .join(
+                WorkerAssignmentHeader,
+                WorkerAssignmentShipment.assignment_header_id == WorkerAssignmentHeader.id
+            )
+            .where(func.lower(column).contains(search_value.lower()))
+        )
+
+    else:
+        return []
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    response_list = []
+
+    for shipment, header in rows:
+
+        # Convert shipment model → dictionary (ALL columns)
+        shipment_dict = model_to_dict(shipment)
+
+        # Add header identity fields manually
+        shipment_dict.update({
+            "oc_no": header.oc_no,
+            "awb_no": header.awb_no,
+            "hawb": header.hawb,
+            "temp_irm_oc_no": header.temp_irm_oc_no,
+        })
+
+        response_list.append(shipment_dict)
+
+    return response_list

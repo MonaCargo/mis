@@ -202,6 +202,8 @@ class WorkerAssignmentResponseForWorker(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+    damage_report_status:Optional[str] = None
+
     class Config:
         # extra = "ignore"   # 🔥 very important
           from_attributes = True
@@ -369,5 +371,34 @@ class WorkerAssignmentExportResponse(APIResponseBase):
 
 
 
+# ============= LOADING AND UNLOADING FORM LIFT =================
+class AssignLoadingInLiftRequest(BaseModel):
+    header_id: int
+    shipment_id: int
+    oc_no: str
+    loading_in_lift_zone: str
+    device_id: str | None = None
 
 
+class AssignUnloadingFromLiftRequest(BaseModel):
+    header_id: int
+    shipment_id: int
+    oc_no: str
+    unloading_from_lift_zone: str
+    device_id: str | None = None
+
+
+
+class MarkShipmentFinalDeliveryRequest(BaseModel):
+    header_id: int
+    shipment_id: int
+    oc_no: str
+    device_id: str | None = None
+
+
+
+class RequestOfImprtTracerAssign(BaseModel):
+    header_id: int
+    shipment_id: int
+    oc_no: str
+    device_id: str | None = None

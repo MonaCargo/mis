@@ -1620,13 +1620,15 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 from numpy import ceil
 import pytz
-from sqlalchemy import and_, case, func, or_, select, text, update
+from sqlalchemy import and_, case, cast, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.db.models.importOperation.damage_report import DamageReason, DamageReport, DamageReportReason
 from app.db.models.user import User
 from app.services.importOperation.audit_log_worker_assignment import log_worker_assignment_audit
-from app.utils.common.helperFunction import detect_origin_source, get_utc_now
-from sqlalchemy.orm import aliased
+from app.utils.common.enums import DamageStatusInWorkerAssignmnet, WorkerAssignmentAuditSource
+from app.utils.common.helperFunction import convert_ist_day_to_utc_range_helper, detect_origin_source, get_utc_now
+from sqlalchemy.orm import aliased,selectinload
 
 
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
@@ -2020,16 +2022,30 @@ async def process_worker_assignment(db: AsyncSession, req):
                          insert(WorkerAssignmentShipment).excluded.no_of_pc),
                         else_=WorkerAssignmentShipment.no_of_pc
                     ),
+                        # "location": case(
+                        #          (
+                        #     or_(
+                        #         WorkerAssignmentShipment.location.is_(None),
+                        #         func.trim(WorkerAssignmentShipment.location) == "",
+                        #         func.trim(WorkerAssignmentShipment.location) == "-"
+                        #     ),
+                        #     insert(WorkerAssignmentShipment).excluded.location
+                        # ),
+                        # else_=WorkerAssignmentShipment.location
+
                         "location": case(
-                                 (
-                            or_(
-                                WorkerAssignmentShipment.location.is_(None),
-                                func.trim(WorkerAssignmentShipment.location) == "",
-                                func.trim(WorkerAssignmentShipment.location) == "-"
+                            (
+                                and_(
+                                    insert(WorkerAssignmentShipment).excluded.location.isnot(None),
+                                    func.trim(insert(WorkerAssignmentShipment).excluded.location) != "",
+                                    func.trim(insert(WorkerAssignmentShipment).excluded.location) != "-",
+                                    # WorkerAssignmentShipment.location
+                                    # != insert(WorkerAssignmentShipment).excluded.location
+                                ),
+                                insert(WorkerAssignmentShipment).excluded.location
                             ),
-                            insert(WorkerAssignmentShipment).excluded.location
-                        ),
-                        else_=WorkerAssignmentShipment.location
+                            else_=WorkerAssignmentShipment.location
+
                     ),
                     "updated_at": now
                 }
@@ -2178,6 +2194,19 @@ async def process_worker_assignment(db: AsyncSession, req):
                 # print("🟩 FIRST IRR FOR OC → UPDATE OC EVENT WITH NEW GP")
                 if str(irr.gate_pass_no) == "25277649":
                     print("✅ CASE: First IRR → Updating OC")
+                # 🫷🫷🫷🫷🫷🫷🫷🫷
+                if (
+                    irr.location_pcs
+                    and oc_event
+                    and oc_event.location != irr.location_pcs
+                ):
+                    print(
+                        f"📍 LOCATION OVERRIDE | "
+                        f"AWB={irr.awb} | "
+                        f"OLD={oc_event.location} → NEW={irr.location_pcs}"
+                    )
+                    # 🫷
+
                 await db.execute(
                     update(WorkerAssignmentShipment)
                     .where(WorkerAssignmentShipment.id == oc_event.id)
@@ -2205,17 +2234,31 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None), irr.chg_wt),
                             else_=WorkerAssignmentShipment.chg_wgt_in_kg
                         ),
-                       location = case(
+                    #    location = case(
+                    #         (
+                    #             or_(
+                    #                 WorkerAssignmentShipment.location.is_(None),
+                    #                 func.trim(WorkerAssignmentShipment.location) == "",
+                    #                 func.trim(WorkerAssignmentShipment.location) == "-"
+                    #             ),
+                    #             irr.location_pcs
+                    #         ),
+                    #         else_=WorkerAssignmentShipment.location
+                    #     ),
+                    location = case(
                             (
-                                or_(
-                                    WorkerAssignmentShipment.location.is_(None),
-                                    func.trim(WorkerAssignmentShipment.location) == "",
-                                    func.trim(WorkerAssignmentShipment.location) == "-"
+                                and_(
+                                    # irr.location_pcs.isnot(None),
+                                      irr.location_pcs != None,
+                                    func.trim(irr.location_pcs) != "",
+                                    func.trim(irr.location_pcs) != "-",
+                                    # WorkerAssignmentShipment.location != irr.location_pcs
                                 ),
                                 irr.location_pcs
                             ),
                             else_=WorkerAssignmentShipment.location
                         ),
+
                         agent_name=case(
                             (WorkerAssignmentShipment.agent_name.is_(None), irr.agent),
                             else_=WorkerAssignmentShipment.agent_name
@@ -2240,6 +2283,19 @@ async def process_worker_assignment(db: AsyncSession, req):
                 # print("🟩 SAME GP FOR OC → UPDATE OC EVENT")
                 if str(irr.gate_pass_no) == "25277649":
                     print("✅ CASE: Same GP → Updating OC")
+                 # 🫷🫷🫷🫷🫷🫷🫷🫷
+                if (
+                    irr.location_pcs
+                    and oc_event
+                    and oc_event.location != irr.location_pcs
+                ):
+                    print(
+                        f"📍 LOCATION OVERRIDE | "
+                        f"AWB={irr.awb} | "
+                        f"OLD={oc_event.location} → NEW={irr.location_pcs}"
+                    )
+                    # 🫷
+
                 await db.execute(
                     update(WorkerAssignmentShipment)
                     .where(WorkerAssignmentShipment.id == oc_event.id)
@@ -2267,10 +2323,23 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None), irr.chg_wt),
                             else_=WorkerAssignmentShipment.chg_wgt_in_kg
                         ),
-                        location=case(
-                            (WorkerAssignmentShipment.location.is_(None), irr.location_pcs),
-                            else_=WorkerAssignmentShipment.location
-                        ),
+                        # location=case(
+                        #     (WorkerAssignmentShipment.location.is_(None), irr.location_pcs),
+                        #     else_=WorkerAssignmentShipment.location
+                        # ),
+                        location = case(
+                                    (
+                                        and_(
+                                             irr.location_pcs != None,
+                                            func.trim(irr.location_pcs) != "",
+                                            func.trim(irr.location_pcs) != "-",
+                                            # WorkerAssignmentShipment.location != irr.location_pcs
+                                        ),
+                                        irr.location_pcs
+                                    ),
+                                    else_=WorkerAssignmentShipment.location
+                                ),
+
                         agent_name=case(
                             (WorkerAssignmentShipment.agent_name.is_(None), irr.agent),
                             else_=WorkerAssignmentShipment.agent_name
@@ -2332,6 +2401,19 @@ async def process_worker_assignment(db: AsyncSession, req):
         # Case B1: Same GP exists → UPDATE
         if existing_irr_event:
             # print("🟩 SAME IRR GP → UPDATE IRR EVENT")
+            # 🫷
+            # 🔍 LOCATION DEBUG (IRR→IRR UPDATE)
+            if (
+                irr.location_pcs
+                and existing_irr_event.location
+                and existing_irr_event.location != irr.location_pcs
+            ):
+                print(
+                    f"📍 [IRR→IRR] LOCATION CHANGED | "
+                    f"AWB={irr.awb} | "
+                    f"OLD={existing_irr_event.location} → NEW={irr.location_pcs}"
+                )
+# 🫷
             await db.execute(
                 update(WorkerAssignmentShipment)
                 .where(WorkerAssignmentShipment.id == existing_irr_event.id)
@@ -2342,7 +2424,20 @@ async def process_worker_assignment(db: AsyncSession, req):
                     no_of_pc_recd=irr.pcs,
                     weight_in_kgs=irr.grg_wt,
                     chg_wgt_in_kg=irr.chg_wt,
-                    location=irr.location_pcs,
+                    # location=irr.location_pcs,
+                    location = case(
+                        (
+                            and_(
+                                 irr.location_pcs != None,
+                                func.trim(irr.location_pcs) != "",
+                                func.trim(irr.location_pcs) != "-",
+                                # WorkerAssignmentShipment.location != irr.location_pcs
+                            ),
+                            irr.location_pcs
+                        ),
+                        else_=WorkerAssignmentShipment.location
+                    ),
+
                     agent_name=irr.agent,
                     customer_name=irr.consignee,
                     release_zone=irr.dlv_zone,
@@ -2409,7 +2504,7 @@ async def process_worker_assignment(db: AsyncSession, req):
 
 
 async def get_all_allowed_users_as_worker(db: AsyncSession) -> list[User]:
-    allowed_roles_for_become_worker = ['imp_gp_user']  # Define the allowed role
+    allowed_roles_for_become_worker = ['imp_gp_user','imp_tracer']  # Define the allowed role
     
     query = select(User).filter(User.role.in_(allowed_roles_for_become_worker), User.is_active == True)
     
@@ -2437,7 +2532,8 @@ async def get_worker_assignment_lists_by_emp_id(
     if not user:
         raise HTTPException(404, "User not found")
 
-    if user.role != "imp_gp_user":
+    allowed_roles = {"imp_gp_user", "imp_tracer"} # ✅ add all allowed roles here if user.role not in
+    if user.role not in allowed_roles:
         raise HTTPException(403, "User is not authorized")
 
     # ----------------------------------------------------
@@ -2499,6 +2595,8 @@ async def get_worker_assignment_lists_by_emp_id(
         "weight_in_kgs": shipment.weight_in_kgs,
         "chg_wgt_in_kg": shipment.chg_wgt_in_kg,
 
+        "damage_report_status":shipment.damage_report_status,
+
         "flight_no": shipment.flight_no,
         "flight_date": shipment.flight_date,
 
@@ -2511,6 +2609,142 @@ async def get_worker_assignment_lists_by_emp_id(
 
 
 # # ==========Assign a user to the worker assignment table row data =============================
+# async def assign_user_to_worker_assignment(
+#     *,
+#     db: AsyncSession,
+#     header_id: int,
+#     shipment_id: int,
+#     oc_no: str,
+#     emp_id: str | None,          # None = unassign
+#     current_user_role: str,
+#     changed_by: str,
+#     ip_address: str | None,
+#     user_agent: str | None,
+#     device_id: str | None,
+# ):
+#     try:
+#         # ─────────────────────────────────────────────
+#         # 1️⃣ FETCH HEADER
+#         # ─────────────────────────────────────────────
+#         header = (
+#             await db.execute(
+#                 select(WorkerAssignmentHeader)
+#                 .where(WorkerAssignmentHeader.id == header_id)
+#             )
+#         ).scalars().first()
+
+#         if not header:
+#             raise HTTPException(404, "Invalid header_id")
+
+#         if header.oc_no != oc_no:
+#             raise HTTPException(400, "OC number mismatch with header")
+
+#         # ─────────────────────────────────────────────
+#         # 2️⃣ FETCH SHIPMENT
+#         # ─────────────────────────────────────────────
+#         shipment = (
+#             await db.execute(
+#                 select(WorkerAssignmentShipment)
+#                 .where(
+#                     WorkerAssignmentShipment.id == shipment_id,
+#                     WorkerAssignmentShipment.assignment_header_id == header.id,
+#                 )
+#             )
+#         ).scalars().first()
+
+#         if not shipment:
+#             raise HTTPException(404, "Shipment does not belong to this OC")
+
+#         old_value = shipment.assigned_person
+#         now = get_utc_now()
+
+#         # ─────────────────────────────────────────────
+#         # 3️⃣ NO CHANGE → EXIT
+#         # ─────────────────────────────────────────────
+#         if emp_id == old_value:
+#             return True
+
+#         # ─────────────────────────────────────────────
+#         # 4️⃣ UNASSIGN
+#         # ─────────────────────────────────────────────
+#         if emp_id is None:
+#             shipment.assigned_person = None
+#             shipment.assigned_person_datetime = None
+#             shipment.updated_at = now
+
+#             await log_worker_assignment_audit(
+#                 db=db,
+#                 header=header,
+#                 shipment=shipment,
+#                 field_name="assigned_person",
+#                 old_value=old_value,
+#                 new_value=None,
+#                 changed_by=changed_by,
+#                 changed_by_role=current_user_role,
+#                 ip_address=ip_address,
+#                 device_id=device_id,
+#                 user_agent=user_agent,
+#                 db_action="UPDATE",
+#                 source_action="unassign_user",
+#             )
+
+#             await db.commit()
+#             return True
+
+#         # ─────────────────────────────────────────────
+#         # 5️⃣ VALIDATE WORKER
+#         # ─────────────────────────────────────────────
+#         user = (
+#             await db.execute(
+#                 select(User).where(
+#                     User.emp_id == emp_id,
+#                     User.role == "imp_gp_user",
+#                     User.is_active.is_(True),
+#                 )
+#             )
+#         ).scalars().first()
+
+#         if not user:
+#             raise HTTPException(
+#                 400, f"Worker {emp_id} not found or inactive"
+#             )
+
+#         # ─────────────────────────────────────────────
+#         # 6️⃣ ASSIGN WORKER
+#         # ─────────────────────────────────────────────
+#         shipment.assigned_person = emp_id
+#         shipment.assigned_person_datetime = now
+#         shipment.updated_at = now
+
+#         await log_worker_assignment_audit(
+#             db=db,
+#             header=header,
+#             shipment=shipment,
+#             field_name="assigned_person",
+#             old_value=old_value,
+#             new_value=emp_id,
+#             changed_by=changed_by,
+#             changed_by_role=current_user_role,
+#             ip_address=ip_address,
+#             device_id=device_id,
+#             user_agent=user_agent,
+#             db_action="UPDATE",
+#             source_action="assign_user",
+#         )
+
+#         await db.commit()
+#         return True
+
+#     except HTTPException:
+#         await db.rollback()
+#         raise
+
+#     except Exception:
+#         await db.rollback()
+#         raise HTTPException(
+#             status_code=500,
+#             detail="Failed to assign worker"
+#         )
 async def assign_user_to_worker_assignment(
     *,
     db: AsyncSession,
@@ -2524,6 +2758,7 @@ async def assign_user_to_worker_assignment(
     user_agent: str | None,
     device_id: str | None,
 ):
+    ENFORCE_TRACER_ALWAYS_ASSIGNED = True # It means in case of tracer flow tracer unser never unassign (not go assign a user to none in person)
     try:
         # ─────────────────────────────────────────────
         # 1️⃣ FETCH HEADER
@@ -2570,6 +2805,30 @@ async def assign_user_to_worker_assignment(
         # 4️⃣ UNASSIGN
         # ─────────────────────────────────────────────
         if emp_id is None:
+
+            # Prevent unassigning active tracer (future policy)
+            if (
+                ENFORCE_TRACER_ALWAYS_ASSIGNED
+                and shipment.damage_report_status in [
+                    DamageStatusInWorkerAssignmnet.OPEN.value,
+                    DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+                ]
+            ):
+                raise HTTPException(
+                    400,
+                    "Tracer case must have an assigned user"
+                )
+
+
+            # Clear tracer status (optional)
+            if shipment.damage_report_status in [
+                DamageStatusInWorkerAssignmnet.OPEN.value,
+                DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+            ]:
+                shipment.damage_report_status = None
+                shipment.damage_resolve_datetime = None
+
+
             shipment.assigned_person = None
             shipment.assigned_person_datetime = None
             shipment.updated_at = now
@@ -2594,13 +2853,14 @@ async def assign_user_to_worker_assignment(
             return True
 
         # ─────────────────────────────────────────────
-        # 5️⃣ VALIDATE WORKER
+        # 5️⃣ VALIDATE WORKER (OPS OR TRACER)
         # ─────────────────────────────────────────────
+
         user = (
             await db.execute(
                 select(User).where(
                     User.emp_id == emp_id,
-                    User.role == "imp_gp_user",
+                    User.role.in_(["imp_gp_user", "imp_tracer"]),
                     User.is_active.is_(True),
                 )
             )
@@ -2608,31 +2868,66 @@ async def assign_user_to_worker_assignment(
 
         if not user:
             raise HTTPException(
-                400, f"Worker {emp_id} not found or inactive"
+                400, f"Worker {emp_id} not found, inactive, or invalid role"
             )
 
+
+        is_tracer = user.role == "imp_tracer"
+
+        # Prevent ops overriding active tracer
+        if (
+            shipment.damage_report_status in [
+                DamageStatusInWorkerAssignmnet.OPEN.value,
+                DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+            ]
+            and not is_tracer
+        ):
+            raise HTTPException(
+                400,
+                "Shipment is under tracer investigation"
+            )
+
+
         # ─────────────────────────────────────────────
-        # 6️⃣ ASSIGN WORKER
+        # 6️⃣ ASSIGN USER
         # ─────────────────────────────────────────────
+
         shipment.assigned_person = emp_id
         shipment.assigned_person_datetime = now
         shipment.updated_at = now
+
+
+        # Mark shipment under tracer (optional)
+        if is_tracer:
+            shipment.damage_report_status = DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+
 
         await log_worker_assignment_audit(
             db=db,
             header=header,
             shipment=shipment,
+
             field_name="assigned_person",
+
             old_value=old_value,
             new_value=emp_id,
+
             changed_by=changed_by,
             changed_by_role=current_user_role,
+
             ip_address=ip_address,
             device_id=device_id,
             user_agent=user_agent,
+
             db_action="UPDATE",
-            source_action="assign_user",
+
+            source_action=(
+                WorkerAssignmentAuditSource.TRACER_ASSIGN.value
+                if is_tracer
+                else WorkerAssignmentAuditSource.USER_ASSIGN.value
+            ),
         )
+
 
         await db.commit()
         return True
@@ -2716,7 +3011,7 @@ async def add_drop_dlv_zone_by_assigned_worker(
         if shipment.assigned_person != emp_id:
             raise HTTPException(
                 status_code=403,
-                detail="Shipment is assigned to another worker"
+                detail="Shipment is assigned to another person"
             )
         # if irm shipment then only allow to add gaain drop dlv
         if shipment.drop_dlv_zone and not is_irm_shipment:
@@ -2725,6 +3020,22 @@ async def add_drop_dlv_zone_by_assigned_worker(
                 detail="Drop delivery zone already added"
             )
         origin_source = detect_origin_source(header,shipment)
+
+        # # ─────────────────────────────────────────────
+        # # 4️⃣ Update SHIPMENT
+        # # ─────────────────────────────────────────────
+        # old_value = shipment.drop_dlv_zone
+        # now = get_utc_now()
+
+        # await db.execute(
+        #     update(WorkerAssignmentShipment)
+        #     .where(WorkerAssignmentShipment.id == shipment.id)
+        #     .values(
+        #         drop_dlv_zone=drop_dlv_zone,
+        #         drop_dlv_zone_datetime=now,
+        #         updated_at=now,
+        #     )
+        # )
 
         # ─────────────────────────────────────────────
         # 4️⃣ Update SHIPMENT
@@ -2741,6 +3052,55 @@ async def add_drop_dlv_zone_by_assigned_worker(
                 updated_at=now,
             )
         )
+
+
+        # ─────────────────────────────────────────────
+        # Get fresh damage status
+        # ─────────────────────────────────────────────
+        current_damage_status = (
+            await db.execute(
+                select(WorkerAssignmentShipment.damage_report_status)
+                .where(WorkerAssignmentShipment.id == shipment.id)
+            )
+        ).scalar_one()
+
+
+        # ─────────────────────────────────────────────
+        # 4.1️⃣ AUTO RESOLVE DAMAGE (TRACER ONLY)
+        # ─────────────────────────────────────────────
+
+        if (
+            current_user_role == "imp_tracer"
+            and current_damage_status in [
+                DamageStatusInWorkerAssignmnet.OPEN.value,
+                DamageStatusInWorkerAssignmnet.IN_PROGRESS.value,
+            ]
+        ):
+
+            await db.execute(
+                update(WorkerAssignmentShipment)
+                .where(WorkerAssignmentShipment.id == shipment.id)
+                .values(
+                    damage_report_status=DamageStatusInWorkerAssignmnet.RESOLVED.value,
+                    damage_resolve_datetime=now,
+                    updated_at=now,
+                )
+            )
+
+            await db.execute(
+                update(DamageReport)
+                .where(
+                    DamageReport.assignment_shipment_id == shipment.id,
+                    DamageReport.status != "resolved",
+                )
+                .values(
+                    status="resolved",
+                    resolved_date_time=now,
+                    updated_at=now,
+                )
+            )
+
+
 
         # ─────────────────────────────────────────────
         # 5️⃣ Audit log (NO COMMIT here)
@@ -2961,8 +3321,17 @@ async def get_paginated_worker_assignments_data_list(
             "chg_wgt_in_kg" :safe_convert(shipment.chg_wgt_in_kg,float),
             "integrate_date_time":shipment.integrate_date_time,
             "from_irr_table": safe_convert(shipment.from_irr_table, bool),
+
             "created_at": shipment.created_at,
             "updated_at": shipment.updated_at,
+
+            "damage_report_status":shipment.damage_report_status,
+            "damage_resolve_datetime":shipment.damage_resolve_datetime,
+            "is_final_delivered":shipment.is_final_delivered,
+            "loading_in_lift_zone":shipment.loading_in_lift_zone,
+            "unloading_from_lift_zone":shipment.unloading_from_lift_zone
+
+
         })
     # -----------------------------------------------------
     # STEP 4 – MATRIX COUNTS
@@ -4755,6 +5124,1724 @@ async def get_worker_shipment_details_by_empid_which_assigned_not_dropatlift(
     }
 
 
+# 
+async def get_particular_user_drop_shipments_details(
+    db: AsyncSession,
+    emp_id: str,
+    start_date: str,   # "YYYY-MM-DD"
+    end_date: str,     # "YYYY-MM-DD"
+):
+    """
+    Fetch dropped shipments of user + dynamic zone metrics (date range)
+    """
+
+    # ----------------------------------
+    # 1️⃣ Convert IST → UTC Range
+    # ----------------------------------
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+    # ----------------------------------
+    # 2️⃣ Main Data Query
+    # ----------------------------------
+    data_stmt = (
+        select(
+            WorkerAssignmentShipment,
+            WorkerAssignmentHeader
+        )
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentShipment.assignment_header_id
+            == WorkerAssignmentHeader.id
+        )
+        .where(
+
+            # ✅ User filter
+            WorkerAssignmentShipment.assigned_person == emp_id,
+
+            # ✅ Only dropped shipments
+            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+
+            # ✅ Date Range (IST handled)
+            WorkerAssignmentShipment.drop_dlv_zone_datetime.between(
+                start_utc,
+                end_utc
+            ),
+        )
+        .order_by(
+            WorkerAssignmentShipment.drop_dlv_zone_datetime.desc()
+        )
+    )
+
+    data_result = await db.execute(data_stmt)
+    rows = data_result.all()
+
+    # ----------------------------------
+    # 3️⃣ Metrics Query (GROUP BY)
+    # ----------------------------------
+    metrics_stmt = (
+        select(
+            WorkerAssignmentShipment.drop_dlv_zone,
+            func.count().label("total")
+        )
+        .where(
+
+            WorkerAssignmentShipment.assigned_person == emp_id,
+
+            WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+
+            WorkerAssignmentShipment.drop_dlv_zone_datetime.between(
+                start_utc,
+                end_utc
+            ),
+        )
+        .group_by(
+            WorkerAssignmentShipment.drop_dlv_zone
+        )
+    )
+
+    metrics_result = await db.execute(metrics_stmt)
+
+    # Build metrics dict
+    count_metrics = {
+        row.drop_dlv_zone: row.total
+        for row in metrics_result
+    }
+
+    # ----------------------------------
+    # 4️⃣ Build Full Data
+    # ----------------------------------
+    full_data = []
+
+    for shipment, header in rows:
+
+        item = {
+                "header_id": header.id,
+                "oc_no": header.oc_no,
+                "awb_no": header.awb_no,
+                "hawb": header.hawb,
+                "igp_no": header.igp_no,
+                "shipment_id": shipment.id,
+                "no_of_pc": shipment.no_of_pc,
+                "weight_in_kgs": shipment.weight_in_kgs,
+                "flight_no": shipment.flight_no,
+                "location": shipment.location,
+
+
+                "assigned_person": shipment.assigned_person,
+                "assigned_person_datetime":shipment.assigned_person_datetime,
+                "drop_dlv_zone": shipment.drop_dlv_zone,
+                "drop_dlv_zone_datetime": shipment.drop_dlv_zone_datetime,
+
+                "gate_pass_no": shipment.gate_pass_no,
+                "gate_pass_issued_date_time_combo":shipment.gate_pass_issued_date_time_combo,
+                "integrate_date_time": shipment.integrate_date_time,
+
+                "created_at": shipment.created_at,
+        }
+
+        full_data.append(item)
+
+    # ----------------------------------
+    # 5️⃣ Final Response
+    # ----------------------------------
+    return {
+        "count_metrics": count_metrics,
+        "total_records": len(full_data),
+        "full_data": full_data,
+    }
+
+
+
+
+
+# ============================ LIFT LOADING AND UNLOADING RELATED SERVICES ==========================================
+
+# async def get_shipments_for_loading_in_lift(
+#     db: AsyncSession,
+#     drop_dlv_zone_term: str,
+#     user,
+#     start_date:str,
+#     end_date:str,
+# ):
+#     """
+#     Shipments ready for lift loading
+#     """
+#     start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+#     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+#     stmt = (
+#         select(WorkerAssignmentShipment)
+#         .where(
+
+#             # Assigned
+#             WorkerAssignmentShipment.assigned_person.isnot(None),
+
+#             # Drop zone exists
+#             WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+
+#             # Vehicle type
+#             WorkerAssignmentShipment.drop_dlv_zone == drop_dlv_zone_term,
+
+#             # Not loaded, not unloaded
+#             WorkerAssignmentShipment.loading_in_lift_zone.is_(None),
+#             WorkerAssignmentShipment.unloading_from_lift_zone.is_(None),
+#             # ✅ Date filter (RANGE)
+#             or_(
+#                 WorkerAssignmentShipment.integrate_date_time.between(
+#                     start_utc, end_utc
+#                 ),
+#                 WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+#                     start_utc, end_utc
+#                 ),
+#             ),
+#         )
+#         # .order_by(WorkerAssignmentShipment.created_at.asc())
+#         .order_by(
+#     WorkerAssignmentShipment.gate_pass_issued_date_time_combo.asc().nulls_last(),
+#     WorkerAssignmentShipment.drop_dlv_zone_datetime.asc().nulls_last(),
+# )
+
+
+#     )
+
+#     result = await db.execute(stmt)
+
+#     return result.scalars().all()
+
+async def get_shipments_for_loading_in_lift(
+    db: AsyncSession,
+    drop_dlv_zone_term: str,
+    user,
+    start_date: str,
+    end_date: str,
+):
+    """
+    Shipments ready for lift loading (with header info + count)
+    """
+
+    # Convert IST → UTC
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+    # Base filters (reusable)
+    base_filters = [
+
+        WorkerAssignmentShipment.assigned_person.isnot(None),
+        WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+
+        # Vehicle
+        WorkerAssignmentShipment.drop_dlv_zone == drop_dlv_zone_term,
+
+        # Status
+        WorkerAssignmentShipment.loading_in_lift_zone.is_(None),
+        WorkerAssignmentShipment.unloading_from_lift_zone.is_(None),
+
+        # Date Range
+        or_(
+            WorkerAssignmentShipment.integrate_date_time.between(
+                start_utc, end_utc
+            ),
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                start_utc, end_utc
+            ),
+        ),
+    ]
+
+    # ============================
+    # 1️⃣ Main Data Query (JOIN)
+    # ============================
+
+    data_stmt = (
+        select(
+            WorkerAssignmentShipment.id.label("shipment_id"),
+            WorkerAssignmentShipment.assignment_header_id.label("header_id"),
+
+            # Header fields
+            WorkerAssignmentHeader.oc_no,
+            WorkerAssignmentHeader.awb_no,
+            WorkerAssignmentHeader.hawb,
+
+            # Shipment fields
+            WorkerAssignmentShipment.gate_pass_no,
+            WorkerAssignmentShipment.integrate_date_time,
+            WorkerAssignmentShipment.drop_dlv_zone,
+            WorkerAssignmentShipment.drop_dlv_zone_datetime,
+            WorkerAssignmentShipment.assigned_person,
+            WorkerAssignmentShipment.loading_in_lift_zone,
+            WorkerAssignmentShipment.loading_in_lift_zone_datetime,
+            WorkerAssignmentShipment.unloading_from_lift_zone_datetime,
+            WorkerAssignmentShipment.unloading_from_lift_zone,
+        )
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentShipment.assignment_header_id
+            == WorkerAssignmentHeader.id
+        )
+        .where(*base_filters)
+        .order_by(
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+            .asc()
+            .nulls_last(),
+
+            WorkerAssignmentShipment.drop_dlv_zone_datetime
+            .asc()
+            .nulls_last(),
+        )
+    )
+
+    result = await db.execute(data_stmt)
+    rows = result.mappings().all()   # ← gives dict-like rows
+
+    # ============================
+    # 2️⃣ Count Query
+    # ============================
+
+    count_stmt = (
+        select(func.count())
+        .select_from(WorkerAssignmentShipment)
+        .where(*base_filters)
+    )
+
+    count_result = await db.execute(count_stmt)
+    total_count = count_result.scalar() or 0
+
+    # ============================
+    # 3️⃣ Format Response
+    # ============================
+
+    data = []
+
+    for row in rows:
+        data.append({
+            "shipment_id": row["shipment_id"],
+            "header_id": row["header_id"],
+
+            "oc_no": row["oc_no"],
+            "awb_no": row["awb_no"],
+            "hawb": row["hawb"],
+
+            "gate_pass_no": row["gate_pass_no"],
+            "integrate_date_time": row["integrate_date_time"],
+            "drop_dlv_zone": row["drop_dlv_zone"],
+            "drop_dlv_zone_datetime": row["drop_dlv_zone_datetime"],
+
+            "assigned_person": row["assigned_person"],
+
+            "loading_in_lift_zone_datetime": row["loading_in_lift_zone_datetime"],
+            "loading_in_lift_zone":row['loading_in_lift_zone'],
+            "unloading_from_lift_zone":row["unloading_from_lift_zone"],
+            "unloading_from_lift_zone_datetime":row["unloading_from_lift_zone_datetime"],
+
+            "loading_status": (
+                "PENDING" if not row["loading_in_lift_zone"] else "DONE"
+            ),
+            "unloading_status": (
+                "PENDING" if not row["unloading_from_lift_zone"] else "DONE"
+            ),
+        })
+
+    # ============================
+    # 4️⃣ Final API Response
+    # ============================
+
+    return {
+        "total_count": total_count,
+        "start_date": start_date,
+        "end_date": end_date,
+        "records": data,
+    }
+
+async def get_shipments_for_unloading_from_lift(
+    db: AsyncSession,
+    drop_dlv_zone_term: str,
+    user,
+    start_date: str,
+    end_date: str,
+):
+    """
+    Shipments ready for lift unloading (with header info + count)
+    """
+
+    # Convert IST → UTC
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+    # Common filters
+    base_filters = [
+
+        # Assigned
+        WorkerAssignmentShipment.assigned_person.isnot(None),
+
+        # Drop zone exists
+        WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+
+        # Vehicle type
+        WorkerAssignmentShipment.loading_in_lift_zone == drop_dlv_zone_term,
+
+        # Loaded but NOT unloaded
+        WorkerAssignmentShipment.loading_in_lift_zone.isnot(None),
+        WorkerAssignmentShipment.unloading_from_lift_zone.is_(None),
+
+        # Date range
+        or_(
+            WorkerAssignmentShipment.integrate_date_time.between(
+                start_utc, end_utc
+            ),
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                start_utc, end_utc
+            ),
+        ),
+    ]
+
+    # ============================
+    # 1️⃣ Data Query (JOIN)
+    # ============================
+
+    data_stmt = (
+        select(
+            WorkerAssignmentShipment.id.label("shipment_id"),
+            WorkerAssignmentShipment.assignment_header_id.label("header_id"),
+
+            # Header info
+            WorkerAssignmentHeader.oc_no,
+            WorkerAssignmentHeader.awb_no,
+            WorkerAssignmentHeader.hawb,
+
+            # Shipment info
+            WorkerAssignmentShipment.gate_pass_no,
+            WorkerAssignmentShipment.integrate_date_time,
+
+            WorkerAssignmentShipment.drop_dlv_zone,
+            WorkerAssignmentShipment.drop_dlv_zone_datetime,
+
+            WorkerAssignmentShipment.assigned_person,
+
+            WorkerAssignmentShipment.loading_in_lift_zone,
+            WorkerAssignmentShipment.loading_in_lift_zone_datetime,
+
+            WorkerAssignmentShipment.unloading_from_lift_zone,
+            WorkerAssignmentShipment.unloading_from_lift_zone_datetime,
+        )
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentShipment.assignment_header_id
+            == WorkerAssignmentHeader.id
+        )
+        .where(*base_filters)
+        .order_by(
+            # FIFO: unload in order of loading
+            WorkerAssignmentShipment.loading_in_lift_zone_datetime
+            .asc()
+            .nulls_last()
+        )
+    )
+
+    result = await db.execute(data_stmt)
+    rows = result.mappings().all()
+
+    # ============================
+    # 2️⃣ Count Query
+    # ============================
+
+    count_stmt = (
+        select(func.count())
+        .select_from(WorkerAssignmentShipment)
+        .where(*base_filters)
+    )
+
+    count_result = await db.execute(count_stmt)
+    total_count = count_result.scalar() or 0
+
+    # ============================
+    # 3️⃣ Format Response
+    # ============================
+
+    data = []
+
+    for row in rows:
+        data.append({
+
+            "shipment_id": row["shipment_id"],
+            "header_id": row["header_id"],
+
+            "oc_no": row["oc_no"],
+            "awb_no": row["awb_no"],
+            "hawb": row["hawb"],
+
+            "gate_pass_no": row["gate_pass_no"],
+            "integrate_date_time": row["integrate_date_time"],
+
+            "drop_dlv_zone": row["drop_dlv_zone"],
+            "drop_dlv_zone_datetime": row["drop_dlv_zone_datetime"],
+
+            "assigned_person": row["assigned_person"],
+
+            "loading_in_lift_zone_datetime": row["loading_in_lift_zone_datetime"],
+            "loading_in_lift_zone":row['loading_in_lift_zone'],
+            "unloading_from_lift_zone":row["unloading_from_lift_zone"],
+            "unloading_from_lift_zone_datetime":row["unloading_from_lift_zone_datetime"]
+
+        })
+
+    # ============================
+    # 4️⃣ Final Response
+    # ============================
+
+    return {
+        "total_count": total_count,
+        "start_date": start_date,
+        "end_date": end_date,
+        "records": data,
+    }
+
+
+
+async def add_loading_in_lift_by_assigned_worker(
+    db: AsyncSession,
+    *,
+    header_id: int,
+    shipment_id: int,
+    oc_no: str,
+    emp_id: str,
+    current_user_role: str,
+    loading_in_lift_zone: str,
+    ip_address: str | None = None,
+    device_id: str | None = None,
+    user_agent: str | None = None,
+) -> dict:
+
+    try:
+        # ─────────────────────────────
+        # 1️⃣ Fetch HEADER
+        # ─────────────────────────────
+        header = (
+            await db.execute(
+                select(WorkerAssignmentHeader)
+                .where(WorkerAssignmentHeader.id == header_id)
+            )
+        ).scalars().first()
+
+        if not header:
+            raise HTTPException(404, "Invalid header_id")
+
+        if header.oc_no != oc_no:
+            raise HTTPException(
+                400,
+                "OC number does not match header"
+            )
+
+        # ─────────────────────────────
+        # 2️⃣ Fetch SHIPMENT
+        # ─────────────────────────────
+        shipment = (
+            await db.execute(
+                select(WorkerAssignmentShipment)
+                .where(
+                    WorkerAssignmentShipment.id == shipment_id,
+                    WorkerAssignmentShipment.assignment_header_id == header.id,
+                )
+            )
+        ).scalars().first()
+
+        if not shipment:
+            raise HTTPException(404, "Shipment does not belong to this OC")
+
+        # ─────────────────────────────
+        # 3️⃣ Validations
+        # ─────────────────────────────
+        if not shipment.assigned_person:
+            raise HTTPException(400, "Shipment not assigned")
+
+        # if shipment.assigned_person != emp_id:
+        #     raise HTTPException(403, "Assigned to another worker")
+
+        # ❌ Prevent double loading
+        if shipment.loading_in_lift_zone:
+            raise HTTPException(400, "Shipment already loaded in lift")
+
+        # ❌ Must have drop zone first
+        if not shipment.drop_dlv_zone:
+            raise HTTPException(
+                400,
+                "Drop delivery zone not assigned yet"
+            )
+
+        origin_source = detect_origin_source(header, shipment)
+
+        # ─────────────────────────────
+        # 4️⃣ Update
+        # ─────────────────────────────
+        old_value = shipment.loading_in_lift_zone
+        now = get_utc_now()
+
+        await db.execute(
+            update(WorkerAssignmentShipment)
+            .where(WorkerAssignmentShipment.id == shipment.id)
+            .values(
+                loading_in_lift_zone=loading_in_lift_zone,
+                loading_in_lift_person=emp_id,
+                loading_in_lift_zone_datetime=now,
+                updated_at=now,
+            )
+        )
+
+        # ─────────────────────────────
+        # 5️⃣ Audit Log
+        # ─────────────────────────────
+        await log_worker_assignment_audit(
+            db=db,
+            header=header,
+            shipment=shipment,
+            field_name="loading_in_lift_zone",
+            old_value=old_value,
+            new_value=loading_in_lift_zone,
+            changed_by=emp_id,
+            changed_by_role=current_user_role,
+            ip_address=ip_address,
+            device_id=device_id,
+            user_agent=user_agent,
+            db_action="UPDATE",
+            source_action="lift_loading_update",
+            origin_source_type=origin_source.value,
+        )
+
+        # ─────────────────────────────
+        # 6️⃣ Commit
+        # ─────────────────────────────
+        await db.commit()
+
+        return {
+            "status": "success",
+            "message": "Loading in lift added successfully"
+        }
+
+    except HTTPException:
+        await db.rollback()
+        raise
+
+    except Exception:
+        await db.rollback()
+        raise HTTPException(
+            500,
+            "Failed to update loading in lift"
+        )
+
+async def add_unloading_from_lift_by_assigned_worker(
+    db: AsyncSession,
+    *,
+    header_id: int,
+    shipment_id: int,
+    oc_no: str,
+    emp_id: str,
+    current_user_role: str,
+    unloading_from_lift_zone: str,
+    ip_address: str | None = None,
+    device_id: str | None = None,
+    user_agent: str | None = None,
+) -> dict:
+
+    try:
+        # ─────────────────────────────
+        # 1️⃣ Fetch HEADER
+        # ─────────────────────────────
+        header = (
+            await db.execute(
+                select(WorkerAssignmentHeader)
+                .where(WorkerAssignmentHeader.id == header_id)
+            )
+        ).scalars().first()
+
+        if not header:
+            raise HTTPException(404, "Invalid header_id")
+
+        if header.oc_no != oc_no:
+            raise HTTPException(
+                400,
+                "OC number does not match header"
+            )
+
+        # ─────────────────────────────
+        # 2️⃣ Fetch SHIPMENT
+        # ─────────────────────────────
+        shipment = (
+            await db.execute(
+                select(WorkerAssignmentShipment)
+                .where(
+                    WorkerAssignmentShipment.id == shipment_id,
+                    WorkerAssignmentShipment.assignment_header_id == header.id,
+                )
+            )
+        ).scalars().first()
+
+        if not shipment:
+            raise HTTPException(404, "Shipment does not belong to this OC")
+
+        # ─────────────────────────────
+        # 3️⃣ Validations
+        # ─────────────────────────────
+        if not shipment.assigned_person:
+            raise HTTPException(400, "Shipment not assigned")
+
+        # if shipment.assigned_person != emp_id:
+        #     raise HTTPException(403, "Assigned to another worker")
+
+        # ❌ Must be loaded first
+        if not shipment.loading_in_lift_zone:
+            raise HTTPException(
+                400,
+                "Shipment not loaded in lift yet"
+            )
+
+        # ❌ Prevent double unload
+        if shipment.unloading_from_lift_zone:
+            raise HTTPException(400, "shipment Already unloaded from lift")
+
+        origin_source = detect_origin_source(header, shipment)
+
+        # ─────────────────────────────
+        # 4️⃣ Update
+        # ─────────────────────────────
+        old_value = shipment.unloading_from_lift_zone
+        now = get_utc_now()
+        print(unloading_from_lift_zone,"unloading_from_lift_zone")
+        await db.execute(
+            update(WorkerAssignmentShipment)
+            .where(WorkerAssignmentShipment.id == shipment.id)
+            .values(
+                unloading_from_lift_zone=unloading_from_lift_zone,
+                unloading_from_lift_person=emp_id,
+                unloading_from_lift_zone_datetime=now,
+                updated_at=now,
+            )
+        )
+
+        # ─────────────────────────────
+        # 5️⃣ Audit Log
+        # ─────────────────────────────
+        await log_worker_assignment_audit(
+            db=db,
+            header=header,
+            shipment=shipment,
+            field_name="unloading_from_lift_zone",
+            old_value=old_value,
+            new_value=unloading_from_lift_zone,
+            changed_by=emp_id,
+            changed_by_role=current_user_role,
+            ip_address=ip_address,
+            device_id=device_id,
+            user_agent=user_agent,
+            db_action="UPDATE",
+            source_action="lift_unloading_update",
+            origin_source_type=origin_source.value,
+        )
+
+        # ─────────────────────────────
+        # 6️⃣ Commit
+        # ─────────────────────────────
+        await db.commit()
+
+        return {
+            "status": "success",
+            "message": "Unloading from lift added successfully"
+        }
+
+    except HTTPException:
+        await db.rollback()
+        raise
+
+    except Exception:
+        await db.rollback()
+        raise HTTPException(
+            500,
+            "Failed to update unloading from lift"
+        )
+
+
+# async def get_shipments_for_final_delivery(
+#     db: AsyncSession,
+#     drop_dlv_zone_term: str,
+#     user,
+#     start_date: str,
+#     end_date: str,
+# ):
+#     """
+#     Get shipments ready for final delivery
+#     """
+
+#     # Convert IST → UTC
+#     start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+#     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+#     # Common filters
+#     base_filters = [
+
+#         # Assigned
+#         WorkerAssignmentShipment.assigned_person.isnot(None),
+
+#         # Drop zone
+#         WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+
+#         # Vehicle
+#         WorkerAssignmentShipment.drop_dlv_zone == drop_dlv_zone_term,
+
+#         # Must be unloaded
+#         WorkerAssignmentShipment.unloading_from_lift_zone.isnot(None),
+
+
+
+#         # Not yet delivered
+#         WorkerAssignmentShipment.is_final_delivered.is_(False),
+
+#         # Date filter
+#         or_(
+#             and_(
+#                 WorkerAssignmentShipment.integrate_date_time >= start_utc,
+#                 WorkerAssignmentShipment.integrate_date_time < end_utc,
+#             ),
+#             and_(
+#                 WorkerAssignmentShipment.gate_pass_issued_date_time_combo >= start_utc,
+#                 WorkerAssignmentShipment.gate_pass_issued_date_time_combo < end_utc,
+#             ),
+#         ),
+#     ]
+
+#     # ============================
+#     # 1️⃣ Data Query
+#     # ============================
+
+#     data_stmt = (
+#         select(
+#             # IDs
+#             WorkerAssignmentShipment.id.label("shipment_id"),
+#             WorkerAssignmentShipment.assignment_header_id.label("header_id"),
+
+#             # Header
+#             WorkerAssignmentHeader.oc_no,
+#             WorkerAssignmentHeader.awb_no,
+#             WorkerAssignmentHeader.hawb,
+
+#             # Shipment
+#             WorkerAssignmentShipment.gate_pass_no,
+#             WorkerAssignmentShipment.integrate_date_time,
+
+#             WorkerAssignmentShipment.drop_dlv_zone,
+#             WorkerAssignmentShipment.drop_dlv_zone_datetime,
+
+#             WorkerAssignmentShipment.loading_in_lift_zone,
+#             WorkerAssignmentShipment.loading_in_lift_zone_datetime,
+
+#             WorkerAssignmentShipment.unloading_from_lift_zone,
+#             WorkerAssignmentShipment.unloading_from_lift_zone_datetime,
+
+#             WorkerAssignmentShipment.assigned_person,
+
+#             # Final delivery fields
+#             WorkerAssignmentShipment.final_delivery_by_person,
+#             WorkerAssignmentShipment.final_delivery_datetime,
+#             WorkerAssignmentShipment.is_final_delivered,
+#         )
+#         .join(
+#             WorkerAssignmentHeader,
+#             WorkerAssignmentShipment.assignment_header_id
+#             == WorkerAssignmentHeader.id
+#         )
+#         .where(*base_filters)
+#         .order_by(
+#             # FIFO: unload first → deliver first
+#             WorkerAssignmentShipment.unloading_from_lift_zone_datetime
+#             .asc()
+#             .nulls_last()
+#         )
+#     )
+
+#     result = await db.execute(data_stmt)
+#     rows = result.mappings().all()
+
+#     # ============================
+#     # 2️⃣ Count
+#     # ============================
+
+#     count_stmt = (
+#         select(func.count())
+#         .select_from(WorkerAssignmentShipment)
+#         .where(*base_filters)
+#     )
+
+#     count_result = await db.execute(count_stmt)
+#     total_count = count_result.scalar() or 0
+
+#     # ============================
+#     # 3️⃣ Format
+#     # ============================
+
+#     data = []
+
+#     for row in rows:
+#         data.append({
+
+#             "shipment_id": row["shipment_id"],
+#             "header_id": row["header_id"],
+
+#             "oc_no": row["oc_no"],
+#             "awb_no": row["awb_no"],
+#             "hawb": row["hawb"],
+
+#             "gate_pass_no": row["gate_pass_no"],
+#             "integrate_date_time": row["integrate_date_time"],
+
+#             "drop_dlv_zone": row["drop_dlv_zone"],
+#             "drop_dlv_zone_datetime": row["drop_dlv_zone_datetime"],
+
+#             "unloading_from_lift_zone": row["unloading_from_lift_zone"],
+#             "unloading_from_lift_zone_datetime": row["unloading_from_lift_zone_datetime"],
+#             "loading_in_lift_zone": row["loading_in_lift_zone"],
+#             "loading_in_lift_zone_datetime": row["loading_in_lift_zone_datetime"],
+
+#             "assigned_person": row["assigned_person"],
+
+#             "final_delivery_by_person": row["final_delivery_by_person"],
+#             "final_delivery_datetime": row["final_delivery_datetime"],
+#             "is_final_delivered": row["is_final_delivered"],
+#         })
+
+#     # ============================
+#     # 4️⃣ Response
+#     # ============================
+
+#     return {
+#         "total_count": total_count,
+#         "start_date": start_date,
+#         "end_date": end_date,
+#         "records": data,
+#     }
+
+async def get_shipments_for_final_delivery(
+    db: AsyncSession,
+    *,
+    start_date: str,
+    end_date: str,
+    status: str,
+    page: int,
+    page_size: int,
+    user,
+) -> tuple[list[dict], int]:
+    """
+    Fetch final delivery shipments with pagination
+    """
+
+    # IST → UTC
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+
+    # ============================
+    # Build Filters
+    # ============================
+
+    conditions = [
+
+        # Assigned
+        WorkerAssignmentShipment.assigned_person.isnot(None),
+
+        # Has drop zone
+        WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+
+        # Must be unloaded
+        WorkerAssignmentShipment.unloading_from_lift_zone.isnot(None),
+
+        # Date range
+        or_(
+            and_(
+                WorkerAssignmentShipment.integrate_date_time >= start_utc,
+                WorkerAssignmentShipment.integrate_date_time < end_utc,
+            ),
+            and_(
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo >= start_utc,
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo < end_utc,
+            ),
+        ),
+    ]
+
+
+    # ============================
+    # Status Filter
+    # ============================
+
+    if status != "all":
+
+        if status == "final_delivered":
+            conditions.append(
+                WorkerAssignmentShipment.is_final_delivered.is_(True)
+            )
+
+        elif status == "final_not_delivered":
+            conditions.append(
+                WorkerAssignmentShipment.is_final_delivered.is_(False)
+            )
+        # Zone Status (3 Ton / 5 Ton / 10 Ton)
+        elif status in {"3 Ton", "5 Ton", "10 Ton"}:
+
+            conditions.append(
+                WorkerAssignmentShipment.unloading_from_lift_zone == status
+            )
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status: {status}"
+            )
+
+
+    # ============================
+    # Base Queries
+    # ============================
+
+    base_query = (
+        select(
+            WorkerAssignmentShipment.id.label("shipment_id"),
+            WorkerAssignmentShipment.assignment_header_id.label("header_id"),
+
+            WorkerAssignmentHeader.oc_no,
+            WorkerAssignmentHeader.awb_no,
+            WorkerAssignmentHeader.hawb,
+
+            WorkerAssignmentShipment.gate_pass_no,
+            WorkerAssignmentShipment.no_of_pc,
+            WorkerAssignmentShipment.chg_wgt_in_kg,
+            WorkerAssignmentShipment.weight_in_kgs,
+            WorkerAssignmentShipment.integrate_date_time,
+
+
+            WorkerAssignmentShipment.drop_dlv_zone,
+            WorkerAssignmentShipment.drop_dlv_zone_datetime,
+
+            WorkerAssignmentShipment.loading_in_lift_zone,
+            WorkerAssignmentShipment.loading_in_lift_person,
+            WorkerAssignmentShipment.loading_in_lift_zone_datetime,
+            WorkerAssignmentShipment.unloading_from_lift_zone,
+            WorkerAssignmentShipment.unloading_from_lift_person,
+            WorkerAssignmentShipment.unloading_from_lift_zone_datetime,
+
+            WorkerAssignmentShipment.assigned_person,
+
+            WorkerAssignmentShipment.final_delivery_by_person,
+            WorkerAssignmentShipment.final_delivery_datetime,
+            WorkerAssignmentShipment.is_final_delivered,
+        )
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentShipment.assignment_header_id
+            == WorkerAssignmentHeader.id
+        )
+        .where(and_(*conditions))
+    )
+
+
+    # ============================
+    # Count Query
+    # ============================
+
+    count_stmt = (
+        select(func.count())
+        .select_from(WorkerAssignmentShipment)
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentShipment.assignment_header_id
+            == WorkerAssignmentHeader.id
+        )
+        .where(and_(*conditions))
+    )
+
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
+
+
+    # ============================
+    # Pagination
+    # ============================
+
+    offset = (page - 1) * page_size
+
+
+    data_stmt = (
+        base_query
+        .order_by(
+            WorkerAssignmentShipment.unloading_from_lift_zone_datetime
+            .asc()
+            .nulls_last()
+        )
+        .offset(offset)
+        .limit(page_size)
+    )
+
+
+    # ============================
+    # Execute
+    # ============================
+
+    result = await db.execute(data_stmt)
+
+    rows = result.mappings().all()
+
+
+    # ============================
+    # Format Response
+    # ============================
+
+    records = []
+
+    for row in rows:
+
+        records.append({
+
+            "shipment_id": row["shipment_id"],
+            "header_id": row["header_id"],
+
+            "oc_no": row["oc_no"],
+            "awb_no": row["awb_no"],
+            "hawb": row["hawb"],
+
+            "gate_pass_no": row["gate_pass_no"],
+            "integrate_date_time": row["integrate_date_time"],
+            "no_of_pc": row["no_of_pc"],
+            "weight_in_kgs": row["weight_in_kgs"],
+            "chg_wgt_in_kg": row["chg_wgt_in_kg"],
+
+            "drop_dlv_zone": row["drop_dlv_zone"],
+            "drop_dlv_zone_datetime": row["drop_dlv_zone_datetime"],
+
+            "loading_in_lift_zone": row["loading_in_lift_zone"],
+            "loading_in_lift_person": row["loading_in_lift_person"],
+            "loading_in_lift_zone_datetime": row["loading_in_lift_zone_datetime"],
+            "unloading_from_lift_zone": row["unloading_from_lift_zone"],
+            "unloading_from_lift_person": row["unloading_from_lift_person"],
+            "unloading_from_lift_zone_datetime": row["unloading_from_lift_zone_datetime"],
+
+            "assigned_person": row["assigned_person"],
+
+            "final_delivery_by_person": row["final_delivery_by_person"],
+            "final_delivery_datetime": row["final_delivery_datetime"],
+            "is_final_delivered": row["is_final_delivered"],
+        })
+
+
+    return records, total
+
+
+
+
+
+
+
+
+
+async def mark_final_delivery_by_assigned_worker(
+    db: AsyncSession,
+    *,
+    header_id: int,
+    shipment_id: int,
+    oc_no: str,
+    emp_id: str,
+    current_user_role: str,
+
+    ip_address: str | None = None,
+    device_id: str | None = None,
+    user_agent: str | None = None,
+) -> dict:
+
+    try:
+        # ─────────────────────────────
+        # 1️⃣ Fetch HEADER
+        # ─────────────────────────────
+        header = (
+            await db.execute(
+                select(WorkerAssignmentHeader)
+                .where(WorkerAssignmentHeader.id == header_id)
+            )
+        ).scalars().first()
+
+        if not header:
+            raise HTTPException(404, "Invalid header_id")
+
+        if header.oc_no != oc_no:
+            raise HTTPException(400, "OC number does not match header")
+
+        # ─────────────────────────────
+        # 2️⃣ Fetch SHIPMENT
+        # ─────────────────────────────
+        shipment = (
+            await db.execute(
+                select(WorkerAssignmentShipment)
+                .where(
+                    WorkerAssignmentShipment.id == shipment_id,
+                    WorkerAssignmentShipment.assignment_header_id == header.id,
+                )
+            )
+        ).scalars().first()
+
+        if not shipment:
+            raise HTTPException(404, "Shipment does not belong to this OC")
+
+        # ─────────────────────────────
+        # 3️⃣ Validations
+        # ─────────────────────────────
+
+        if not shipment.assigned_person:
+            raise HTTPException(400, "Shipment not assigned")
+
+        if not shipment.loading_in_lift_zone:
+            raise HTTPException(
+                400,
+                "Shipment not loaded  in lift yet"
+            )
+        
+        # Must be unloaded first
+        if not shipment.unloading_from_lift_zone:
+            raise HTTPException(
+                400,
+                "Shipment not unloaded from lift yet"
+            )
+
+        # Prevent double delivery
+        if shipment.is_final_delivered:
+            raise HTTPException(
+                400,
+                "Shipment already final delivered"
+            )
+
+        origin_source = detect_origin_source(header, shipment)
+
+        # ─────────────────────────────
+        # 4️⃣ Update
+        # ─────────────────────────────
+        old_value = shipment.is_final_delivered
+        now = get_utc_now()
+
+        await db.execute(
+            update(WorkerAssignmentShipment)
+            .where(WorkerAssignmentShipment.id == shipment.id)
+            .values(
+                final_delivery_by_person=emp_id,
+                final_delivery_datetime=now,
+                is_final_delivered=True,
+                updated_at=now,
+            )
+        )
+
+        # ─────────────────────────────
+        # 5️⃣ Audit Log
+        # ─────────────────────────────
+        await log_worker_assignment_audit(
+            db=db,
+            header=header,
+            shipment=shipment,
+
+            field_name="is_final_delivered",
+
+            old_value=str(old_value),
+            new_value="True",
+
+            changed_by=emp_id,
+            changed_by_role=current_user_role,
+
+            ip_address=ip_address,
+            device_id=device_id,
+            user_agent=user_agent,
+
+            db_action="UPDATE",
+            source_action="final_delivery_update",
+
+            origin_source_type=origin_source.value,
+        )
+
+        # ─────────────────────────────
+        # 6️⃣ Commit
+        # ─────────────────────────────
+        await db.commit()
+
+        return {
+            "status": "success",
+            "message": "Final delivery marked successfully"
+        }
+
+    except HTTPException:
+        await db.rollback()
+        raise
+
+    except Exception:
+        await db.rollback()
+        raise HTTPException(
+            500,
+            "Failed to mark final delivery"
+        )
+# ---------------------------------------------------------------------------------
+
+
+# ================================ 😎 IMPORT TRACER RELATED SERVICES  ====================================
+
+async def get_paginated_worker_assignments_with_damage_filter(
+    db: AsyncSession,
+    status: str,
+    startDate: Optional[str],
+    endDate: Optional[str],
+    page: int,
+    page_size: int,
+) -> Dict[str, Any]:
+
+    shipment_model = WorkerAssignmentShipment
+    header_model = WorkerAssignmentHeader
+    damage_model = DamageReport
+
+
+
+    # =====================================================
+    # STEP 1 — BASE QUERY
+    # =====================================================
+
+
+    user_model = User   # alias
+
+
+    query = (
+        select(
+            shipment_model,
+            header_model,
+            damage_model,
+            user_model
+        )
+        .join(
+            header_model,
+            shipment_model.assignment_header_id == header_model.id
+        )
+        .join(
+            damage_model,
+            damage_model.assignment_shipment_id == shipment_model.id,
+            isouter=True
+        )
+        .join(
+            user_model,
+            user_model.emp_id == shipment_model.assigned_person,
+            isouter=True   # LEFT JOIN (important)
+        )
+    )
+
+
+
+    # =====================================================
+    # STEP 2 — DATE FILTER (IST → UTC SAFE)
+    # =====================================================
+
+    if startDate and endDate:
+
+        start_dt, end_dt = convert_ist_day_to_utc_range_helper(startDate)
+        _, end_dt2 = convert_ist_day_to_utc_range_helper(endDate)
+
+        # Use start of startDate and end of endDate
+        if start_dt and end_dt2:
+
+            query = query.where(
+                damage_model.reported_at.isnot(None),
+                damage_model.reported_at.between(start_dt, end_dt2)
+            )
+
+
+    # =====================================================
+    # STEP 3 — DAMAGE STATUS FILTER
+    # =====================================================
+
+    if status == "damage_open":
+
+        query = query.where(
+            shipment_model.damage_report_status == "open"
+        )
+
+    elif status == "damage_resolved":
+
+        query = query.where(
+            shipment_model.damage_report_status == "resolved"
+        )
+
+    elif status == "all":
+
+        query = query.where(
+            shipment_model.damage_report_status.isnot(None)
+        )
+
+
+    # =====================================================
+    # STEP 4 — TOTAL COUNT
+    # =====================================================
+
+    total_records = (
+        await db.execute(
+            select(func.count())
+            .select_from(query.subquery())
+        )
+    ).scalar() or 0
+
+
+    total_pages = ceil(total_records / page_size) if page_size else 0
+
+
+    if page > total_pages and total_pages > 0:
+        page = total_pages
+
+    offset = (page - 1) * page_size
+
+
+    # =====================================================
+    # STEP 5 — PAGINATION + ORDER
+    # =====================================================
+
+    paginated_query = (
+        query
+        .order_by(
+            damage_model.reported_at.desc().nullslast(),
+            shipment_model.id.desc()
+        )
+        .offset(offset)
+        .limit(page_size)
+    )
+
+
+    result = await db.execute(paginated_query)
+
+    rows = result.all()
+
+
+    # =====================================================
+    # STEP 6 — SERIALIZATION
+    # =====================================================
+
+    def safe(val, tp):
+        if val is None:
+            return None
+        return tp(val)
+
+
+    records = []
+
+
+    for shipment_row, header_row, damage_row, user_row  in rows:
+
+
+        records.append({
+
+            # ---------------- HEADER ----------------
+            "header_id": header_row.id,
+            "oc_no": header_row.oc_no,
+            "awb_no": header_row.awb_no,
+            "hawb": header_row.hawb,
+            "temp_irm_oc_no":header_row.temp_irm_oc_no,
+
+
+            # ---------------- SHIPMENT ----------------
+            "shipment_id": shipment_row.id,
+                        # Flags
+            "from_irr_table": shipment_row.from_irr_table,
+
+            # Package Info
+            "no_of_pc": shipment_row.no_of_pc,
+            "no_of_pc_recd": shipment_row.no_of_pc_recd,
+
+            "weight_in_kgs": shipment_row.weight_in_kgs,
+            "chg_wgt_in_kg": shipment_row.chg_wgt_in_kg,
+
+            # Flight
+            "flight_no": shipment_row.flight_no,
+            "flight_date": shipment_row.flight_date,
+
+            # Location
+            "location": shipment_row.location,
+            "shc": shipment_row.shc,
+
+            # IRR
+            "irr_codes": shipment_row.irr_codes,
+            "irregularity_remarks": shipment_row.irregularity_remarks,
+
+            # Parties
+            "agent_name": shipment_row.agent_name,
+            "customer_name": shipment_row.customer_name,
+
+            # Zones
+            "release_zone": shipment_row.release_zone,
+            "drop_dlv_zone": shipment_row.drop_dlv_zone,
+            "drop_dlv_zone_datetime": shipment_row.drop_dlv_zone_datetime,
+
+            # Integration
+            "integrate_date_time": shipment_row.integrate_date_time,
+
+            # Gate Pass
+            "gate_pass_no": shipment_row.gate_pass_no,
+            "gate_pass_issued_date_time_combo": shipment_row.gate_pass_issued_date_time_combo,
+            "gate_pass_end_datetime": shipment_row.gate_pass_end_datetime,
+
+            # Assignment
+             "assigned_person": (
+                user_row.name if user_row else None
+            ),
+
+            "assigned_person_emp_id": (
+                user_row.emp_id if user_row else None
+            ),
+
+            "assigned_person_datetime": shipment_row.assigned_person_datetime,
+
+            "verified_by": shipment_row.verified_by,
+            "pd_in_time": shipment_row.pd_in_time,
+
+            # Lift Loading
+            "loading_in_lift_zone": shipment_row.loading_in_lift_zone,
+            "loading_in_lift_person": shipment_row.loading_in_lift_person,
+            "loading_in_lift_zone_datetime": shipment_row.loading_in_lift_zone_datetime,
+
+            # Lift Unloading
+            "unloading_from_lift_zone": shipment_row.unloading_from_lift_zone,
+            "unloading_from_lift_person": shipment_row.unloading_from_lift_person,
+            "unloading_from_lift_zone_datetime": shipment_row.unloading_from_lift_zone_datetime,
+
+            # Final Delivery
+            "final_delivery_by_person": shipment_row.final_delivery_by_person,
+            "final_delivery_datetime": shipment_row.final_delivery_datetime,
+            "is_final_delivered": shipment_row.is_final_delivered,
+
+            # Damage Info
+            "damage_report_status": shipment_row.damage_report_status,
+            "damage_resolve_datetime": shipment_row.damage_resolve_datetime,
+
+            # Audit
+            "created_at": shipment_row.created_at,
+            "updated_at": shipment_row.updated_at,
+
+
+            # ---------------- DAMAGE ----------------
+            "damage_report_id": damage_row.id if damage_row else None,
+
+            "damage_remarks": damage_row.remarks if damage_row else None,
+
+            "damage_reported_at": damage_row.reported_at if damage_row else None,
+            "damage_location": damage_row.location if damage_row else None,
+
+            # "damage_resolved_at": damage_row.resolved_date_time if damage_row else None,
+        })
+
+
+    # =====================================================
+    # STEP 7 — DAMAGE COUNTS (MATRIX)
+    # =====================================================
+
+    open_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(shipment_model)
+            .where(shipment_model.damage_report_status == "open")
+        )
+    ).scalar() or 0
+
+
+    resolved_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(shipment_model)
+            .where(shipment_model.damage_report_status == "resolved")
+        )
+    ).scalar() or 0
+
+
+    total_damage = (
+        await db.execute(
+            select(func.count())
+            .select_from(WorkerAssignmentShipment)
+            .where(shipment_model.damage_report_status.isnot(None))
+        )
+    ).scalar() or 0
+
+
+    # =====================================================
+    # STEP 8 — FINAL RESPONSE
+    # =====================================================
+
+    return {
+
+        "success": True,
+
+        "message": "Damage worker assignments fetched successfully",
+
+        "data": records,
+
+
+        # ---------------- PAGINATION ----------------
+        "pagination": {
+
+            "current_page": int(page),
+
+            "page_size": int(page_size),
+
+            "total_records": int(total_records),
+
+            "total_pages": int(total_pages),
+
+            "has_previous": bool(page > 1),
+
+            "has_next": bool(page < total_pages),
+
+            "previous_page": page - 1 if page > 1 else None,
+
+            "next_page": page + 1 if page < total_pages else None,
+        },
+
+
+        # ---------------- COUNTS ----------------
+        "damage_summary": {
+
+            "open": int(open_count),
+
+            "resolved": int(resolved_count),
+
+            "total": int(total_damage),
+        },
+
+
+        # ---------------- FILTERS ----------------
+        "filters_applied": {
+
+            "status": status,
+
+            "start_date": startDate,
+
+            "end_date": endDate,
+        }
+    }
+
+
+
+
+async def get_full_damage_report_by_id_for_tracer(
+    db: AsyncSession,
+    report_id: int
+) -> Dict[str, Any] | None:
+
+    # -----------------------------------
+    # MAIN QUERY (WITH RELATIONS)
+    # -----------------------------------
+
+    query = (
+        select(DamageReport)
+        .options(
+
+            # Load reasons + master reason
+            selectinload(DamageReport.reasons)
+            .selectinload(DamageReportReason.reason),
+
+            # Load images
+            selectinload(DamageReport.images),
+        )
+        .where(DamageReport.id == report_id)
+    )
+
+    result = await db.execute(query)
+
+    report = result.scalar_one_or_none()
+
+    if not report:
+        return None
+
+
+    # -----------------------------------
+    # SERIALIZE REASONS
+    # -----------------------------------
+
+    reasons = []
+
+    for rr in report.reasons:
+
+        reason_master: DamageReason = rr.reason
+
+        reasons.append({
+
+            "id": rr.id,
+
+            "reason_id": reason_master.id,
+            "reason_code": reason_master.reason_code,
+            "reason_name": reason_master.reason_name,
+            "description": reason_master.description,
+
+            "emp_id": rr.emp_id,
+            "device_id": rr.device_id,
+
+            "created_at": rr.created_at,
+        })
+
+
+    # -----------------------------------
+    # SERIALIZE IMAGES
+    # -----------------------------------
+
+    images = []
+
+    for img in report.images:
+
+        images.append({
+
+            "id": img.id,
+
+            "image_url": img.image_url,
+            "image_name": img.image_name,
+
+            "file_size": img.file_size,
+            "mime_type": img.mime_type,
+
+            "emp_id": img.emp_id,
+            "device_id": img.device_id,
+
+            "uploaded_at": img.uploaded_at,
+        })
+
+
+    # -----------------------------------
+    # FINAL RESPONSE
+    # -----------------------------------
+
+    return {
+
+        # ================= MAIN REPORT =================
+
+        "id": report.id,
+
+        "status": report.status,
+        "resolved_date_time": report.resolved_date_time,
+
+        "assignment_header_id": report.assignment_header_id,
+        "assignment_shipment_id": report.assignment_shipment_id,
+
+        "oc_no": report.oc_no,
+        "awb_no": report.awb_no,
+        "hawb": report.hawb,
+        "location": report.location,
+
+        "remarks": report.remarks,
+
+        "reported_at": report.reported_at,
+
+        "created_at": report.created_at,
+        "updated_at": report.updated_at,
+
+
+        # ================= RELATIONS =================
+
+        "reasons": reasons,
+
+        "images": images,
+    }
+
+
+
+
+
+
+# ---------------------------------------------------------------------------------------------------------------
+
 # 👌⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️========================= AUTO ASSIGN POM OC SHIPMENT TO PERTICULAR EMPLOYEE =====================
 
 AUTO_ASSIGN_EMP_ID_POM = "523560"
@@ -4833,3 +6920,5 @@ async def auto_assign_pom_shipments(
         "total_found": len(shipments),
         "assigned": len(shipments),
     }
+
+

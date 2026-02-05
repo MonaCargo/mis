@@ -101,92 +101,14 @@ async def get_damage_reason(
 
 # ==================== DAMAGE REPORT ENDPOINTS ====================
 
-# @router.post("/create", response_model=DamageReportCreateResponse)
-# async def create_damage_report(
-#     request: Request,
-#     worker_assignment_id:int = Form(...),
-#     oc_no: str = Form(...),
-#     location: str = Form(...),
-#     emp_id: str = Form(...),
-#     device_id: str = Form(...),
-#     awb_no: str = Form(...),
-#     hawb: Optional[str] = Form(None),
-#     reason_ids: str = Form(...),  # JSON string of integer IDs
-#     reported_at: str = Form(...),  # ISO format
-#     remarks: Optional[str] = Form(None),
-#     images: List[UploadFile] = File(...),
-#     db: AsyncSession = Depends(get_db),
-#     current_user: UserRead = Depends(verify_token_and_get_user)
-# ):
-#     """
-#     Create a new damage report with images.
-    
-#     **Required Fields:**
-#     - oc_no: Order confirmation number
-#     - location: Location code where damage occurred
-#     - emp_id: Employee ID reporting the damage
-#     - reason_ids: JSON array of damage reason IDs (e.g., "[1, 2, 3]")
-#     - reported_at: ISO 8601 timestamp
-#     - images: 1-5 image files (JPEG/PNG, max 5MB each)
-    
-#     **Optional Fields:**
-#     - remarks: Additional comments (max 500 chars)
-#     """
-#     try:
-#         # Parse reason_ids from JSON string
-#         reason_ids_list = json.loads(reason_ids)
-        
-#         # Validate it's a list of integers
-#         if not isinstance(reason_ids_list, list) or not all(isinstance(i, int) for i in reason_ids_list):
-#             raise ValueError("reason_ids must be a JSON array of integers")
-        
-#         # Parse reported_at timestamp
-#         reported_datetime = datetime.fromisoformat(reported_at.replace('Z', '+00:00'))
-        
-#         # Create report data
-#         report_data = DamageReportCreate(
-#             worker_assignment_id=worker_assignment_id,
-#             oc_no=oc_no,
-#             awb_no=awb_no,
-#             hawb=hawb,
-#             location=location,
-#             emp_id=emp_id,
-#             device_id = device_id,
-#             reason_ids=reason_ids_list,
-#             remarks=remarks,
-#             reported_at=reported_datetime
-#         )
-        
-#         # Get user info for audit
-#         user_info = get_user_info(request, current_user)
-        
-#         # Create damage report
-#         service = DamageReportService(db)
-#         db_report, saved_images = await service.create_damage_report(
-#             report_data=report_data,
-#             images=images,
-#             user_info=user_info
-#         )
-        
-#         return DamageReportCreateResponse(
-#             success=True,
-#             message="Damage report submitted successfully",
-#             report_id=db_report.id,
-#             image_count=len(saved_images)
-#         )
-        
-#     except json.JSONDecodeError:
-#         raise HTTPException(status_code=400, detail="Invalid reason_ids JSON format")
-#     except ValueError as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-
-@router.post("/create", response_model=DamageReportCreateResponse)
+@router.post("/create", response_model=DamageReportCreateResponse,
+             description="New damage report → status = 'open' automatically ✅ it is default value in model/schema "
+             )
 async def create_damage_report(
     request: Request,
-    worker_assignment_id: int = Form(...),
+    # worker_assignment_id: int = Form(...),
+     assignment_shipment_id: int = Form(...), # ✅ NEW
     oc_no: str = Form(...),
     location: str = Form(...),
     emp_id: str = Form(...),
@@ -228,6 +150,7 @@ async def create_damage_report(
     - remarks: Additional comments (max 500 chars)
     - images: 0-5 image files for updates, 1-5 for new reports (JPEG/PNG, max 5MB each)
     """
+
     try:
         # Parse reason_ids from JSON string
         reason_ids_list = json.loads(reason_ids)
@@ -245,7 +168,7 @@ async def create_damage_report(
         
         # Create report data
         report_data = DamageReportCreate(
-            worker_assignment_id=worker_assignment_id,
+              assignment_shipment_id=assignment_shipment_id,
             oc_no=oc_no,
             awb_no=awb_no,
             hawb=hawb,
@@ -285,7 +208,7 @@ async def create_damage_report(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@router.get("/oc/{oc_no}", response_model=DamageReportListResponse)
+@router.get("/oc/{oc_no}/shipmentId/{shipment_id}", response_model=DamageReportListResponse)
 async def get_damage_reports_by_oc(
     oc_no: str,
     location: Optional[str] = None,
@@ -306,6 +229,31 @@ async def get_damage_reports_by_oc(
         reports=reports
     )
 
+
+
+# 😊😊
+@router.get("/by-shipment/location", response_model=DamageReportListResponse)
+async def get_damage_reports_by_shipment(
+    assignment_shipment_id: int,
+    oc_no: str,
+    location: str,
+
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user)
+):
+
+    service = DamageReportService(db)
+
+    reports = await service.get_damage_reports_by_shipment_and_location(
+        assignment_shipment_id=assignment_shipment_id,
+        oc_no=oc_no,
+        location=location
+    )
+
+    return DamageReportListResponse(
+        total=len(reports),
+        reports=reports
+    )
 
 @router.get("/employee/{emp_id}", response_model=DamageReportListResponse)
 async def get_damage_reports_by_employee(

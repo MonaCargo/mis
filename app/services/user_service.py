@@ -337,3 +337,17 @@ async def bulk_create_users(
     await db.commit()
 
     return created_users
+
+
+
+
+async def get_active_import_tracer(db: AsyncSession) -> User | None:
+
+    result = await db.execute(
+        select(User).where(
+            User.role == "imp_tracer",
+            User.is_active.is_(True),
+        )
+    )
+
+    return result.scalars().first()

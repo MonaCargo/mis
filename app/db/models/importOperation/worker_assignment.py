@@ -193,8 +193,45 @@ class WorkerAssignmentShipment(Base):
     assigned_person = Column(String(100), index=True)
     assigned_person_datetime = Column(DateTime(timezone=True))
 
-    drop_dlv_zone = Column(String(100))
+    drop_dlv_zone = Column(String(100),index=True)
     drop_dlv_zone_datetime = Column(DateTime(timezone=True))
+
+    # ===============================
+    # LIFT ZONE OPERATIONS
+    # ===============================
+
+    loading_in_lift_zone = Column(String(100))
+    loading_in_lift_person = Column(String(100))
+    loading_in_lift_zone_datetime = Column(DateTime(timezone=True), index=True)
+
+    unloading_from_lift_zone = Column(String(100))
+    unloading_from_lift_person = Column(String(100))
+    unloading_from_lift_zone_datetime = Column(DateTime(timezone=True), index=True)
+
+    # ===============================
+    # FINAL DELIVERY COLUMNS (this is lat step of shipment operation of import )
+    # ===============================
+
+    final_delivery_by_person=Column(String(30))
+    final_delivery_datetime=Column(DateTime(timezone=True))
+    is_final_delivered = Column(Boolean,default=False,nullable=False)
+
+
+    # =========================================================================
+    # It represent Damage Reeports status at WorkerAssignmentShipment level
+
+    damage_report_status = Column(
+        String(30),
+        nullable=True,
+        index=True
+    )
+    # values: open / resolved
+
+    damage_resolve_datetime = Column(
+        DateTime(timezone=True),
+        nullable=True
+    )
+
 
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
@@ -218,6 +255,26 @@ class WorkerAssignmentShipment(Base):
             "idx_worker_assignment_header_shipment_header_id",
             "assignment_header_id"
         ),
+
+    # ===============================
+    # 🚀 LIFT LOADING PERFORMANCE
+    # ===============================
+
+    Index(
+        "idx_lift_loading_zone_time",
+        "loading_in_lift_zone",
+        "loading_in_lift_zone_datetime",
+    ),
+
+    # ===============================
+    # 🚀 LIFT UNLOADING PERFORMANCE
+    # ===============================
+
+    Index(
+        "idx_lift_unloading_zone_time",
+        "unloading_from_lift_zone",
+        "unloading_from_lift_zone_datetime",
+    ),
     )
 
 
