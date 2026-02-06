@@ -63,7 +63,7 @@ class DamageReportReasonResponse(BaseModel):
 class DamageReportCreate(BaseModel):
     """Schema for creating a new damage report"""
     oc_no: str = Field(..., min_length=1, max_length=50)
-    worker_assignment_id:int = Field(...,description="ID of the worker assignment")
+    assignment_shipment_id:int = Field(...,description="shipment ID of the worker assignment")
     awb_no: str = Field(None, min_length=1, max_length=50)
     hawb: Optional[str] = Field(None, min_length=1, max_length=50)
     location: str = Field(..., min_length=1, max_length=50)
@@ -89,6 +89,7 @@ class DamageReportCreate(BaseModel):
         json_schema_extra = {
             "example": {
                 "oc_no": "OC-2024-001",
+                "assignment_shipment_id":4545,
                 "awb_no": "AWB-123456", 
                 "hawb": "HAWB-7890",
                 "location": "IGF_38_C/1",
@@ -109,7 +110,8 @@ class DamageReportUpdate(BaseModel):
 class DamageReportResponse(BaseModel):
     """Response schema for damage report"""
     id: int
-    worker_assignment_id:int
+    assignment_header_id: int  # ✅ Change from worker_assignment_id
+    assignment_shipment_id: int
     oc_no: str
     awb_no:str
     hawb:Optional[str]

@@ -48,8 +48,37 @@ class DamageReport(Base):
     # 🔑 Primary Key
     id = Column(Integer, primary_key=True, autoincrement=True)
 
+
+
     # 🔗 Relations & Identifiers
-    worker_assignment_id = Column(Integer, nullable=False,index=True)
+    # worker_assignment_id = Column(Integer, nullable=False,index=True)
+    # ===============================
+    # 🔗 2-Level Worker Assignment
+    # ===============================
+
+    assignment_header_id = Column(
+        Integer,
+        ForeignKey("import_worker_assignment_header.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True
+    )
+
+    assignment_shipment_id = Column(
+        Integer,
+        ForeignKey("import_worker_assignment_shipment.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True
+    )
+
+    # status and resolved at represent the this repoert stage only. this info also saved in worker assignment table also
+    status = Column(
+    String(30),
+    default="open",
+    index=True
+    )
+
+    resolved_date_time = Column(DateTime(timezone=True), nullable=True)
+
     oc_no = Column(String(50), nullable=False, index=True)
     awb_no = Column(String(50), nullable=False, index=True)
     hawb = Column(String(50), nullable=True, index=True)
@@ -79,10 +108,22 @@ class DamageReport(Base):
         lazy="selectin"
     )
 
+    assignment_header = relationship("WorkerAssignmentHeader")
+
+    assignment_shipment = relationship("WorkerAssignmentShipment")
+
+
     # 📊 Composite indexes for common queries
     __table_args__ = (
         Index("idx_damage_reports_oc_location", "oc_no", "location"),
         Index("idx_damage_reports_created", "created_at"),
+
+
+         Index(
+        "idx_damage_reports_assignment_chain",
+        "assignment_header_id",
+        "assignment_shipment_id"
+    ),
     )
 
     def __repr__(self):
@@ -188,9 +229,13 @@ class DamageReportAuditLog(Base):
     # 🔗 Relation to damage report
     damage_report_id = Column(Integer, index=True, nullable=False)
 
+    # ✅ NEW
+    assignment_header_id = Column(Integer, index=True, nullable=False)
+    assignment_shipment_id = Column(Integer, index=True, nullable=False)
+
     # 🔍 Searchable identifiers
     oc_no = Column(String(50), index=True, nullable=False)
-    location = Column(String(50), index=True, nullable=False)
+    location = Column(String(1000), index=True, nullable=False)
 
     # 🧾 What changed
     field_name = Column(String(100), nullable=True)

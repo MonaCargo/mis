@@ -31,6 +31,11 @@
 
 
 
+
+
+
+
+
 # from fastapi import APIRouter, Depends, HTTPException
 # from sqlalchemy.ext.asyncio import AsyncSession
 # from sqlalchemy.future import select
@@ -65,6 +70,7 @@
 
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependency import require_roles, verify_token_and_get_user
 from app.db.models.user import User
@@ -72,6 +78,7 @@ from app.db.session import get_db
 from app.schemas.user import UserCreate, UserCreateResponse, UserPasswordChange, UserPasswordChangeResponse,UserReadResponse, UserListResponse, UserRead, UserStatusUpdate, UserStatusUpdateResponse
 from app.services.user_service import (
     bulk_create_users,
+    get_active_import_tracer,
     get_all_users_paginated,
     get_all_users_paginated_filter_apply,
     get_user_by_emp_id,
@@ -83,6 +90,10 @@ from app.utils.common.clean_bulck_user_excel import parse_user_excel
 from app.utils.common.get_request_ip import get_request_ip
 
 router = APIRouter(prefix="", tags=["Users"])
+
+
+
+
 
 # Create a new user
 @router.post("/", response_model=UserCreateResponse)
@@ -271,3 +282,20 @@ async def bulk_upload_users(
         "success": True,
         "message": f"{len(created_users)} users created successfully",
     }
+
+
+
+# Get a user by emp_id
+@router.get("/{emp_id}", response_model=UserReadResponse)
+async def read_user(emp_id: str, db: AsyncSession = Depends(get_db)):
+    user = await get_user_by_emp_id(emp_id, db)
+    print (user)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return UserReadResponse(
+        success=True,
+        message="User fetched successfully",
+        user=UserRead.model_validate(user)
+    )    
+
