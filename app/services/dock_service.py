@@ -66,6 +66,17 @@ class DockService:
             if scan_data.current_dock_number:
                 export_slot.current_dock_number = scan_data.current_dock_number
 
+            # ===== Changes for the dock availiabity issue =======================
+                dock = (await db.execute(
+                        select(DockAvailability).where(
+                            DockAvailability.dock_no == scan_data.current_dock_number
+                        )
+                )).scalar_one_or_none()
+                    
+                if dock:
+                    dock.is_dock_occupied = True  # ← IS THIS LINE PRESENT?
+                    dock.dock_in_time = now
+                    dock.updated_at = now
 
             # Commit changes
             await db.commit()

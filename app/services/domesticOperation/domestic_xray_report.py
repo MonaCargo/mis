@@ -539,6 +539,7 @@ class DomesticXrayService:
                         .values(
                             is_email_sent=False,
                             retry_count=attempt,
+                            email_sent_date_time = None,
                             email_error_message=error_msg,
                             updated_at=get_utc_now(),
                             email_sent_by=None
@@ -557,6 +558,7 @@ class DomesticXrayService:
                     .values(
                         is_email_sent=False,
                         retry_count=attempt,
+                         email_sent_date_time = None,
                         email_error_message=str(e),
                         updated_at=get_utc_now()
                     )

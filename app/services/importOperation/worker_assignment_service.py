@@ -1614,13 +1614,14 @@
 
 from datetime import datetime, time,date , timedelta
 import io
+import json
 import xlsxwriter
 from typing import Any, Dict, Generator, List, Optional, AsyncGenerator
 from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 from numpy import ceil
 import pytz
-from sqlalchemy import and_, case, cast, func, or_, select, text, update
+from sqlalchemy import JSON, and_, case, cast, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models.importOperation.damage_report import DamageReason, DamageReport, DamageReportReason
@@ -1629,6 +1630,7 @@ from app.services.importOperation.audit_log_worker_assignment import log_worker_
 from app.utils.common.enums import DamageStatusInWorkerAssignmnet, WorkerAssignmentAuditSource
 from app.utils.common.helperFunction import convert_ist_day_to_utc_range_helper, detect_origin_source, get_utc_now
 from sqlalchemy.orm import aliased,selectinload
+from sqlalchemy.dialects.postgresql import JSONB
 
 
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
@@ -2517,7 +2519,96 @@ async def get_all_allowed_users_as_worker(db: AsyncSession) -> list[User]:
     return users
 
 
-# Get all list of shipment based on assignd to particular worker ==============================
+# 🫷🫷🫷Get all list of shipment based on assignd to particular worker ==============================
+# async def get_worker_assignment_lists_by_emp_id(
+#     db: AsyncSession,
+#     emp_id: str
+# ) -> list[dict]:
+#     # ----------------------------------------------------
+#     # 1️⃣ Validate user
+#     # ----------------------------------------------------
+#     user = await db.scalar(
+#         select(User).where(User.emp_id == emp_id)
+#     )
+
+#     if not user:
+#         raise HTTPException(404, "User not found")
+
+#     allowed_roles = {"imp_gp_user", "imp_tracer"} # ✅ add all allowed roles here if user.role not in
+#     if user.role not in allowed_roles:
+#         raise HTTPException(403, "User is not authorized")
+
+#     # ----------------------------------------------------
+#     # 2️⃣ Query shipment + header
+#     # ----------------------------------------------------
+#     shipment = WorkerAssignmentShipment
+#     header = WorkerAssignmentHeader
+
+#     stmt = (
+#         select(shipment, header)
+#         .join(header, shipment.assignment_header_id == header.id)
+#         .where(shipment.assigned_person == emp_id)
+#         .where(
+#             or_(
+#                 shipment.drop_dlv_zone.is_(None),
+#                 func.trim(shipment.drop_dlv_zone) == "",
+#                 func.trim(shipment.drop_dlv_zone) == "-"
+#             )
+#         )
+#         .order_by(shipment.integrate_date_time.desc())
+#     )
+
+#     rows = (await db.execute(stmt)).all()
+
+#     # ----------------------------------------------------
+#     # 3️⃣ Shape response (flat JSON)
+#     # ----------------------------------------------------
+#     results = []
+#     for shipment, header in rows:
+#         results.append({
+#                    # REQUIRED IDS
+#         "header_id": header.id,
+#         "shipment_id": shipment.id,
+
+#         # HEADER FIELDS
+#         "oc_no": header.oc_no,
+#         "awb_no": header.awb_no,
+#         "hawb": header.hawb,
+#         "temp_irm_oc_no": header.temp_irm_oc_no,
+#         "is_temp_irm_oc": header.is_temp_irm_oc,
+
+#         # SHIPMENT FIELDS
+#         "gate_pass_no": shipment.gate_pass_no,
+#         "gate_pass_issued_date_time_combo": shipment.gate_pass_issued_date_time_combo,
+#         "gate_pass_end_datetime": shipment.gate_pass_end_datetime,
+
+#         "assigned_person": shipment.assigned_person,
+#         "assigned_person_datetime": shipment.assigned_person_datetime,
+
+#         "drop_dlv_zone": shipment.drop_dlv_zone,
+#         "drop_dlv_zone_datetime": shipment.drop_dlv_zone_datetime,
+
+#         "integrate_date_time": shipment.integrate_date_time,
+#         "from_irr_table": shipment.from_irr_table,
+
+#         # OPERATIONAL DATA
+#         "location": shipment.location,
+#         "no_of_pc": shipment.no_of_pc,
+#         "weight_in_kgs": shipment.weight_in_kgs,
+#         "chg_wgt_in_kg": shipment.chg_wgt_in_kg,
+
+#         "damage_report_status":shipment.damage_report_status,
+
+#         "flight_no": shipment.flight_no,
+#         "flight_date": shipment.flight_date,
+
+#         # TIMESTAMPS
+#         "created_at": shipment.created_at,
+#         "updated_at": shipment.updated_at,
+#         })
+
+#     return results
+
 async def get_worker_assignment_lists_by_emp_id(
     db: AsyncSession,
     emp_id: str
@@ -2542,27 +2633,72 @@ async def get_worker_assignment_lists_by_emp_id(
     shipment = WorkerAssignmentShipment
     header = WorkerAssignmentHeader
 
+    # stmt = (
+    #     select(shipment, header)
+    #     .join(header, shipment.assignment_header_id == header.id)
+    #     .where(shipment.assigned_person == emp_id)
+    #     .where(
+    #         or_(
+    #             shipment.drop_dlv_zone.is_(None),
+    #             func.trim(shipment.drop_dlv_zone) == "",
+    #             func.trim(shipment.drop_dlv_zone) == "-"
+    #         )
+    #     )
+    #     .order_by(shipment.integrate_date_time.desc())
+    # )
+    
+    damage = DamageReport
     stmt = (
-        select(shipment, header)
-        .join(header, shipment.assignment_header_id == header.id)
-        .where(shipment.assigned_person == emp_id)
-        .where(
-            or_(
-                shipment.drop_dlv_zone.is_(None),
-                func.trim(shipment.drop_dlv_zone) == "",
-                func.trim(shipment.drop_dlv_zone) == "-"
-            )
-        )
-        .order_by(shipment.integrate_date_time.desc())
+    select(
+        shipment,
+        header,
+
+        # ✅ Fixed: Use json type instead of JSONB
+        func.coalesce(
+            func.json_agg(
+                func.json_build_object(
+                    "id", damage.id,
+                    "location", damage.location,
+                    "status", func.coalesce(damage.status, "")  # ✅ Default to "open" or ""
+                )
+            ).filter(damage.id.isnot(None)),
+            func.cast("[]", JSON)   # ✅ Changed from JSONB to JSON
+        ).label("damages")
+
     )
 
+    .join(header, shipment.assignment_header_id == header.id)
+
+    # ✅ LEFT JOIN Damage
+    .outerjoin(
+        damage,
+        damage.assignment_shipment_id == shipment.id
+    )
+
+    .where(shipment.assigned_person == emp_id)
+
+    .where(
+        or_(
+            shipment.drop_dlv_zone.is_(None),
+            func.trim(shipment.drop_dlv_zone) == "",
+            func.trim(shipment.drop_dlv_zone) == "-"
+        )
+    )
+
+    # ✅ REQUIRED for aggregation
+    .group_by(shipment.id, header.id)
+
+    .order_by(shipment.integrate_date_time.desc())
+)
+    
     rows = (await db.execute(stmt)).all()
 
     # ----------------------------------------------------
     # 3️⃣ Shape response (flat JSON)
     # ----------------------------------------------------
     results = []
-    for shipment, header in rows:
+    for shipment, header, damages in rows:
+        damages_list = json.loads(damages) if isinstance(damages, str) else damages
         results.append({
                    # REQUIRED IDS
         "header_id": header.id,
@@ -2603,11 +2739,15 @@ async def get_worker_assignment_lists_by_emp_id(
         # TIMESTAMPS
         "created_at": shipment.created_at,
         "updated_at": shipment.updated_at,
+
+        "damages": damages_list,
+
         })
 
     return results
 
 
+# ----------------------------------------🫷🫷🫷🫷
 # # ==========Assign a user to the worker assignment table row data =============================
 # async def assign_user_to_worker_assignment(
 #     *,
@@ -3014,11 +3154,13 @@ async def add_drop_dlv_zone_by_assigned_worker(
                 detail="Shipment is assigned to another person"
             )
         # if irm shipment then only allow to add gaain drop dlv
+
         if shipment.drop_dlv_zone and not is_irm_shipment:
             raise HTTPException(
                 status_code=400,
                 detail="Drop delivery zone already added"
             )
+
         origin_source = detect_origin_source(header,shipment)
 
         # # ─────────────────────────────────────────────
@@ -5320,9 +5462,24 @@ async def get_shipments_for_loading_in_lift(
     Shipments ready for lift loading (with header info + count)
     """
 
+    # # Convert IST → UTC
+    # start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    # _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+
+
+    #==== Temporary solution (for handling strt flow of data) ---------------------------------------
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+
+    # Format current date as YYYY-MM-DD
+    current_date_str = now_ist.strftime("%Y-%m-%d")
+
+    # Get next day
+    next_day_ist = now_ist + timedelta(days=1)
+    next_date_str = next_day_ist.strftime("%Y-%m-%d")
+     #========================================================================
     # Convert IST → UTC
-    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
-    _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-02-06")
+    _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(next_date_str)
 
     # Base filters (reusable)
     base_filters = [
@@ -5361,6 +5518,10 @@ async def get_shipments_for_loading_in_lift(
             WorkerAssignmentHeader.oc_no,
             WorkerAssignmentHeader.awb_no,
             WorkerAssignmentHeader.hawb,
+
+            WorkerAssignmentShipment.no_of_pc,
+            WorkerAssignmentShipment.weight_in_kgs,
+            WorkerAssignmentShipment.chg_wgt_in_kg,
 
             # Shipment fields
             WorkerAssignmentShipment.gate_pass_no,
@@ -5420,6 +5581,10 @@ async def get_shipments_for_loading_in_lift(
             "oc_no": row["oc_no"],
             "awb_no": row["awb_no"],
             "hawb": row["hawb"],
+
+            "no_of_pc": row['no_of_pc'],
+            "weight_in_kgs": row['weight_in_kgs'],
+            "chg_wgt_in_kg": row['chg_wgt_in_kg'],
 
             "gate_pass_no": row["gate_pass_no"],
             "integrate_date_time": row["integrate_date_time"],
@@ -5512,6 +5677,10 @@ async def get_shipments_for_unloading_from_lift(
             WorkerAssignmentShipment.gate_pass_no,
             WorkerAssignmentShipment.integrate_date_time,
 
+            WorkerAssignmentShipment.no_of_pc,
+            WorkerAssignmentShipment.weight_in_kgs,
+            WorkerAssignmentShipment.chg_wgt_in_kg,
+
             WorkerAssignmentShipment.drop_dlv_zone,
             WorkerAssignmentShipment.drop_dlv_zone_datetime,
 
@@ -5571,6 +5740,10 @@ async def get_shipments_for_unloading_from_lift(
 
             "gate_pass_no": row["gate_pass_no"],
             "integrate_date_time": row["integrate_date_time"],
+
+            "no_of_pc": row['no_of_pc'],
+            "weight_in_kgs": row['weight_in_kgs'],
+            "chg_wgt_in_kg": row['chg_wgt_in_kg'],
 
             "drop_dlv_zone": row["drop_dlv_zone"],
             "drop_dlv_zone_datetime": row["drop_dlv_zone_datetime"],
@@ -6461,6 +6634,11 @@ async def get_paginated_worker_assignments_with_damage_filter(
         query = query.where(
             shipment_model.damage_report_status == "resolved"
         )
+    elif status == "damage_in_progress":
+
+        query = query.where(
+            shipment_model.damage_report_status == "in_progress"
+        )
 
     elif status == "all":
 
@@ -6836,7 +7014,161 @@ async def get_full_damage_report_by_id_for_tracer(
     }
 
 
+from typing import List, Dict, Any
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from typing import Dict, Any
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+async def get_full__all_damage_grouped_by_shipment_for_tracer(
+    db: AsyncSession,
+
+    header_id: int,
+    shipment_id: int,
+    oc_no: str
+
+) -> Dict[str, Any] | None:
+
+    # -----------------------------------
+    # MAIN QUERY
+    # -----------------------------------
+
+    query = (
+        select(DamageReport)
+        .options(
+
+            selectinload(DamageReport.reasons)
+            .selectinload(DamageReportReason.reason),
+
+            selectinload(DamageReport.images),
+
+        )
+        .where(
+            DamageReport.assignment_header_id == header_id,
+            DamageReport.assignment_shipment_id == shipment_id,
+            DamageReport.oc_no == oc_no
+        )
+        .order_by(DamageReport.created_at.asc())
+    )
+
+    result = await db.execute(query)
+
+    reports = result.scalars().all()
+
+    if not reports:
+        return None
+
+
+    # -----------------------------------
+    # BUILD DAMAGES ARRAY
+    # -----------------------------------
+
+    damages = []
+
+
+    for report in reports:
+
+        # ---------- REASONS ----------
+
+        reasons = []
+
+        for rr in report.reasons:
+
+            master = rr.reason
+
+            reasons.append({
+
+                "id": rr.id,
+
+                "reason_id": master.id,
+                "reason_code": master.reason_code,
+                "reason_name": master.reason_name,
+                "description": master.description,
+
+                "emp_id": rr.emp_id,
+                "device_id": rr.device_id,
+
+                "created_at": rr.created_at,
+            })
+
+
+        # ---------- IMAGES ----------
+
+        images = []
+
+        for img in report.images:
+
+            images.append({
+
+                "id": img.id,
+
+                "image_url": f"/{img.image_url.replace('\\', '/')}",
+                "image_name": img.image_name,
+
+                "file_size": img.file_size,
+                "mime_type": img.mime_type,
+
+                "emp_id": img.emp_id,
+                "device_id": img.device_id,
+
+                "uploaded_at": img.uploaded_at,
+            })
+
+
+        # ---------- DAMAGE OBJECT ----------
+
+        damages.append({
+
+            "id": report.id,
+
+            "location": report.location,
+
+            "status": report.status,
+            "resolved_date_time": report.resolved_date_time,
+
+            "remarks": report.remarks,
+
+            "reported_at": report.reported_at,
+
+            "created_at": report.created_at,
+            "updated_at": report.updated_at,
+
+            "reasons": reasons,
+
+            "images": images,
+        })
+
+
+    # -----------------------------------
+    # SHIPMENT LEVEL OBJECT
+    # -----------------------------------
+
+    first = reports[0]
+
+
+    return {
+
+        # ===== Shipment Info =====
+
+        "assignment_header_id": first.assignment_header_id,
+        "assignment_shipment_id": first.assignment_shipment_id,
+
+        "oc_no": first.oc_no,
+        "awb_no": first.awb_no,
+        "hawb": first.hawb,
+
+        "created_at": first.created_at,
+        "updated_at": first.updated_at,
+
+        # ===== Damages =====
+
+        "damages": damages
+    }
 
 
 
@@ -6922,3 +7254,182 @@ async def auto_assign_pom_shipments(
     }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =======================================================================
+
+
+async def update_drop_dlv_zone(
+    db: AsyncSession,
+    *,
+    header_id: int,
+    shipment_id: int,
+    oc_no: str,
+    emp_id: str,
+    current_user_role: str,
+    drop_dlv_zone: str | None,
+    ip_address: str | None = None,
+    device_id: str | None = None,
+    user_agent: str | None = None,
+) -> dict:
+
+    try:
+
+        # -------------------------------
+        # 1. Fetch Header
+        # -------------------------------
+        header = (
+            await db.execute(
+                select(WorkerAssignmentHeader)
+                .where(WorkerAssignmentHeader.id == header_id)
+            )
+        ).scalars().first()
+
+        if not header:
+            raise HTTPException(404, "Invalid header_id")
+
+        if header.oc_no != oc_no:
+            raise HTTPException(400, "OC mismatch")
+
+        is_irm = bool(header.temp_irm_oc_no)
+
+        # -------------------------------
+        # 2. Fetch Shipment
+        # -------------------------------
+        shipment = (
+            await db.execute(
+                select(WorkerAssignmentShipment)
+                .where(
+                    WorkerAssignmentShipment.id == shipment_id,
+                    WorkerAssignmentShipment.assignment_header_id == header.id
+                )
+            )
+        ).scalars().first()
+
+        if not shipment:
+            raise HTTPException(404, "Shipment not found")
+
+        # -------------------------------
+        # 3. Validations
+        # -------------------------------
+        if not shipment.assigned_person:
+            raise HTTPException(400, "Not assigned")
+
+        # if shipment.assigned_person != emp_id:
+        #     raise HTTPException(403, "Not your shipment")
+
+        # If not IRM → prevent overwrite (optional)
+        # if shipment.drop_dlv_zone and not is_irm:
+        #     raise HTTPException(400, "Already set")
+
+        # -------------------------------
+        # 4. Update
+        # -------------------------------
+        old_value = shipment.drop_dlv_zone
+        now = get_utc_now()
+
+        await db.execute(
+            update(WorkerAssignmentShipment)
+            .where(WorkerAssignmentShipment.id == shipment.id)
+            .values(
+                drop_dlv_zone=drop_dlv_zone,
+                drop_dlv_zone_datetime=now,
+                updated_at=now,
+            )
+        )
+
+        # -------------------------------
+        # 5. Auto resolve damage (Tracer)
+        # -------------------------------
+        status = (
+            await db.execute(
+                select(WorkerAssignmentShipment.damage_report_status)
+                .where(WorkerAssignmentShipment.id == shipment.id)
+            )
+        ).scalar_one()
+
+        if (
+            current_user_role == "imp_tracer"
+            and status in ["open", "in_progress"]
+        ):
+
+            await db.execute(
+                update(WorkerAssignmentShipment)
+                .where(WorkerAssignmentShipment.id == shipment.id)
+                .values(
+                    damage_report_status="resolved",
+                    damage_resolve_datetime=now,
+                    updated_at=now,
+                )
+            )
+
+            await db.execute(
+                update(DamageReport)
+                .where(
+                    DamageReport.assignment_shipment_id == shipment.id,
+                    DamageReport.status != "resolved",
+                )
+                .values(
+                    status="resolved",
+                    resolved_date_time=now,
+                    updated_at=now,
+                )
+            )
+
+        # -------------------------------
+        # 6. Audit
+        # -------------------------------
+        await log_worker_assignment_audit(
+            db=db,
+            header=header,
+            shipment=shipment,
+            field_name="drop_dlv_zone",
+            old_value=old_value,
+            new_value=drop_dlv_zone,
+            changed_by=emp_id,
+            changed_by_role=current_user_role,
+            ip_address=ip_address,
+            device_id=device_id,
+            user_agent=user_agent,
+            db_action="UPDATE",
+            source_action="dlv_zone_update_manual",
+        )
+
+        # -------------------------------
+        # 7. Commit
+        # -------------------------------
+        await db.commit()
+
+        return {
+            "status": "success",
+            "message": "Drop zone updated"
+        }
+
+    except HTTPException:
+        await db.rollback()
+        raise
+
+    except Exception as e:
+
+        await db.rollback()
+
+        raise HTTPException(
+            500,
+            "Failed to update drop zone"
+        )

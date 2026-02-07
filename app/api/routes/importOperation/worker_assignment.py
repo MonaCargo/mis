@@ -561,7 +561,7 @@ import math
 import traceback
 from typing import List, Optional
 from zoneinfo import ZoneInfo
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 import pytz
 from fastapi import Request
@@ -577,6 +577,7 @@ from app.schemas.importOperation.worker_assignment import (
     AssignDropDlvZoneRequest,
     AssignLoadingInLiftRequest,
     AssignUnloadingFromLiftRequest,
+    DropZoneUpdateRequest,
     MarkShipmentFinalDeliveryRequest,
     PaginatedWorkerAssignmentResponse,
     RequestOfImprtTracerAssign,
@@ -602,6 +603,7 @@ from app.services.importOperation.worker_assignment_service import (
     get_assignment_summary_according_to_assigned_person,
     get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no,
     get_full_damage_report_by_id_for_tracer,
+    get_full__all_damage_grouped_by_shipment_for_tracer,
     get_paginated_worker_assignments_data_list,
     get_paginated_worker_assignments_with_damage_filter,
     get_particular_user_drop_shipments_details,
@@ -615,6 +617,7 @@ from app.services.importOperation.worker_assignment_service import (
     mark_final_delivery_by_assigned_worker,
     process_worker_assignment,
     search_in_worker_assignments,
+    update_drop_dlv_zone,
 )
 from app.services.user_service import get_active_import_tracer
 from app.utils.common.get_request_ip import get_request_ip
@@ -1622,7 +1625,7 @@ async def get_final_delivery_shipments(
 async def mark_final_delivery(
     req: MarkShipmentFinalDeliveryRequest,
     fastApiRequest: Request,
-    current_user: User = Depends(require_roles(["imp_security"])),
+    current_user: User = Depends(require_roles(["imp_sec_fd"])),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -1668,7 +1671,7 @@ async def mark_final_delivery(
 async def get_damage_worker_assignments(
     assignment_status: str = Query(
         default="damage_all",
-        description="damage_all | damage_open | damage_resolved"
+        description="all | damage_in_progress |damage_open | damage_resolved"
     ),
 
     startDate: Optional[str] = Query(
@@ -1696,6 +1699,7 @@ async def get_damage_worker_assignments(
     allowed_status = [
         "all",
         "damage_open",
+        "damage_in_progress",
         "damage_resolved"
     ]
 
@@ -1784,6 +1788,24 @@ async def get_damage_report_full_details(
         "data": data
     }
 
+@router.get("/by-shipment/full-damage-report")
+async def get_damage_reports_by_shipment(
+
+    header_id: int,
+    shipment_id: int,
+    oc_no: str,
+
+    db: AsyncSession = Depends(get_db)
+):
+
+    return await get_full__all_damage_grouped_by_shipment_for_tracer(
+        db,
+        header_id,
+        shipment_id,
+        oc_no
+    )
+
+
 
 @router.post("/assign-shipment-to-import-tracer", response_model=ResponseOfWorkerAssignment)
 async def assign_tracer_to_worker_assignment_route(
@@ -1870,3 +1892,46 @@ async def auto_assign_pom_api(
         "date": str(date),
         "stats": result,
     }
+
+
+
+
+
+
+
+# ================================================================================
+
+@router.put("/drop-zone-update")
+async def update_drop_zone_api(
+    request: Request,
+      payload: DropZoneUpdateRequest = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+):
+    allowed_ids = ["521546", "518399", "523250", "518339"]
+
+    if current_user.emp_id not in allowed_ids:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not authorized to access this resource"
+        )
+    
+    # Convert empty string to None here
+    drop_zone_val = payload.drop_dlv_zone if payload.drop_dlv_zone and payload.drop_dlv_zone.strip() != "" else None
+
+    return await update_drop_dlv_zone(
+
+        db=db,
+
+        header_id=payload.header_id,
+        shipment_id=payload.shipment_id,
+        oc_no=payload.oc_no,
+
+        emp_id=current_user.emp_id,
+        current_user_role=current_user.role,
+
+        drop_dlv_zone=drop_zone_val,
+
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
