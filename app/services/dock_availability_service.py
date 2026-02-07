@@ -10,6 +10,32 @@ from app.db.models.user import User
 
 async def get_all_docks(db: AsyncSession):
     try:
+        # 🔥 AUTO-SYNC: Free docks without active trucks
+        occupied_docks = (await db.execute(
+            select(DockAvailability).where(DockAvailability.is_dock_occupied == True)
+        )).scalars().all()
+
+        for dock in occupied_docks:
+            # Check if there's actually an active truck
+            active_truck = (await db.execute(
+                select(ExportSlotFileRecord).where(
+                    ExportSlotFileRecord.current_dock_number == dock.dock_no,
+                    ExportSlotFileRecord.current_is_dock_in == True,
+                    ExportSlotFileRecord.current_is_dock_out == False,
+                    ExportSlotFileRecord.is_truck_out == False
+                )
+            )).scalar_one_or_none()
+
+            # No active truck? Free it!
+            if not active_truck:
+                dock.is_dock_occupied = False
+                dock.dock_in_time = None
+                dock.updated_at = func.now()
+
+        await db.commit()
+
+        # Now return all docks
+
         result = await db.execute(
             select(DockAvailability).order_by(DockAvailability.dock_no)
         )
@@ -201,7 +227,9 @@ async def get_dock_details(db: AsyncSession, dock_no: str):
             .join(User, ExportSlotFileRecord.current_dock_in_by == User.emp_id, isouter=True)
             .where(
                 ExportSlotFileRecord.current_dock_number == dock_no,
-                ExportSlotFileRecord.current_is_dock_in.is_(True)
+                ExportSlotFileRecord.current_is_dock_in.is_(True),
+                ExportSlotFileRecord.current_is_dock_out.is_(False),  # 🔥 ADD THIS
+                ExportSlotFileRecord.is_truck_out.is_(False)  # 🔥 ADD THIS
             )
             .order_by(desc(ExportSlotFileRecord.current_dock_in_date_time))
             .limit(1)

@@ -163,6 +163,14 @@ from app.schemas.base import APIResponseBase
 
 
 # ======================According to new structure ================================================
+class DamageInfo(BaseModel):
+    id: int
+    location: str
+    status: str
+
+    class Config:
+        from_attributes = True
+
 
 class WorkerAssignmentResponseForWorker(BaseModel):
     # REQUIRED IDS (🔥 critical for frontend actions)
@@ -201,8 +209,12 @@ class WorkerAssignmentResponseForWorker(BaseModel):
 
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-
+    # source of truth of damages ststaus if all damges of shipment resolved then it become resolved(it represent all damages group status)
     damage_report_status:Optional[str] = None
+
+     # ✅ NEW FIELD (It contain all damges on different location in shipment)
+    damages: List[DamageInfo] = []
+
 
     class Config:
         # extra = "ignore"   # 🔥 very important
@@ -402,3 +414,23 @@ class RequestOfImprtTracerAssign(BaseModel):
     shipment_id: int
     oc_no: str
     device_id: str | None = None
+
+
+
+
+
+
+
+
+
+
+
+
+# =============================================================================
+class DropZoneUpdateRequest(BaseModel):
+
+    header_id: int
+    shipment_id: int
+    oc_no: str
+
+    drop_dlv_zone: Optional[str] = None
