@@ -118,6 +118,7 @@ async def create_damage_report(
     reason_ids: str = Form(...),  # JSON string of integer IDs
     reported_at: str = Form(...),  # ISO format
     remarks: Optional[str] = Form(None),
+    tracer_remarks: Optional[str] = Form(None),  # ✅ NEW
     images: Optional[List[UploadFile]] = File(None),  # ✅ CHANGE: Make images optional
     db: AsyncSession = Depends(get_db),
     current_user: UserRead = Depends(verify_token_and_get_user)
@@ -177,6 +178,7 @@ async def create_damage_report(
             device_id=device_id,
             reason_ids=reason_ids_list,
             remarks=remarks,
+            tracer_remarks=tracer_remarks,
             reported_at=reported_datetime
         )
         
