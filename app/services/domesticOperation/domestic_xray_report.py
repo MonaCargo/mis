@@ -1,7 +1,9 @@
 # services/domestic_xray_service.py
 import asyncio
 import io
+import aiofiles
 from fastapi import BackgroundTasks
+import httpx
 import pytz
 import os, base64, msal, requests
 import re
@@ -413,7 +415,6 @@ class DomesticXrayService:
             return {"success": False, "message": f"PDF generation failed: {str(e)}"}
 
 
-    
     @staticmethod
     async def background_send_email(db: AsyncSession, awb_no: str, doc_no: str, pdf_path: str,email_sent_by:str):
         """
@@ -446,11 +447,11 @@ class DomesticXrayService:
                 # Recipient logic
                 if awb_no_clean.startswith("098"):
                     # recipient_email = RECIPIENT_098
-                    recipient_email = RECIPIENT_098
+                    recipient_email = DEVELOPER_EMAIL
                     receipient_name = "Air India Cargo"
 
                 elif awb_no_clean.startswith("775"):
-                    recipient_email = RECIPIENT_775
+                    recipient_email = DEVELOPER_EMAIL
                     receipient_name = "SpiceJet Cargo"
 
                 # else:
@@ -479,7 +480,7 @@ class DomesticXrayService:
                             )
                         },
                         "toRecipients": [{"emailAddress": {"address": recipient_email}}],
-                        "ccRecipients": [{"emailAddress": {"address": SECURITY_EMAIL}}],
+                        "ccRecipients": [{"emailAddress": {"address": DEVELOPER_EMAIL}}],
                         #"bccRecipients": [{"emailAddress": {"address": DEVELOPER_EMAIL}}],
                         "attachments": [{
                             "@odata.type": "#microsoft.graph.fileAttachment",
@@ -571,6 +572,8 @@ class DomesticXrayService:
                 await asyncio.sleep(base_delay * attempt)  # exponential backoff
             else:
                 print(f"❌ Email permanently failed for AWB {awb_no} after {max_retries} attempts")
+
+
 
     @staticmethod    
     async def search_domestic_xray(

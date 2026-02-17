@@ -79,6 +79,7 @@ from app.schemas.user import UserCreate, UserCreateResponse, UserPasswordChange,
 from app.services.user_service import (
     bulk_create_users,
     get_active_import_tracer,
+    get_all_active_import_tracers_users,
     get_all_users_paginated,
     get_all_users_paginated_filter_apply,
     get_user_by_emp_id,
@@ -93,6 +94,30 @@ router = APIRouter(prefix="", tags=["Users"])
 
 
 
+
+@router.get("/get-all-active-import-tracers")
+async def fetch_active_import_tracers(
+    db: AsyncSession = Depends(get_db),
+):
+    tracers = await get_all_active_import_tracers_users(db)
+
+    if not tracers:
+        return {
+            "success": True,
+            "data": []
+        }
+
+    return {
+        "success": True,
+        "message": "Tracers retrieved successfully",
+        "data": [
+            {
+                "emp_id": u.emp_id,
+                "name": u.name,
+            }
+            for u in tracers
+        ]
+    }
 
 
 # Create a new user
@@ -297,5 +322,6 @@ async def read_user(emp_id: str, db: AsyncSession = Depends(get_db)):
         success=True,
         message="User fetched successfully",
         user=UserRead.model_validate(user)
-    )    
+    ) 
+
 

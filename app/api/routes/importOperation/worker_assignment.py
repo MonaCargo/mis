@@ -578,6 +578,7 @@ from app.schemas.importOperation.worker_assignment import (
     AssignLoadingInLiftRequest,
     AssignUnloadingFromLiftRequest,
     DropZoneUpdateRequest,
+    MarkNeedTracerRequest,
     MarkShipmentFinalDeliveryRequest,
     PaginatedWorkerAssignmentResponse,
     RequestOfImprtTracerAssign,
@@ -595,12 +596,15 @@ from app.services.importOperation.worker_assignment_service import (
     add_unloading_from_lift_by_assigned_worker,
     assign_user_to_worker_assignment,
     auto_assign_pom_shipments,
+    generate_ageing_report_for_worker_assignment,
     generate_excel_stream_export_worker_assignment,
     get_all_allowed_users_as_worker,
+    get_all_open_damage_shipments,
     get_all_shipments_by_ton_category_value_particular_date_range,
     get_assignment_category_summary,
     get_assignment_overall_summary,
     get_assignment_summary_according_to_assigned_person,
+    get_damage_shipment_summary_stats,
     get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no,
     get_full_damage_report_by_id_for_tracer,
     get_full__all_damage_grouped_by_shipment_for_tracer,
@@ -612,9 +616,11 @@ from app.services.importOperation.worker_assignment_service import (
     get_shipments_for_final_delivery,
     get_shipments_for_loading_in_lift,
     get_shipments_for_unloading_from_lift,
+    get_top_performers,
     get_worker_assignment_lists_by_emp_id,
     get_worker_shipment_details_by_empid_which_assigned_not_dropatlift,
     mark_final_delivery_by_assigned_worker,
+    mark_shipment_need_tracer,
     process_worker_assignment,
     search_in_worker_assignments,
     update_drop_dlv_zone,
@@ -954,13 +960,49 @@ async def assign_drop_dlv_zone(
 
 
 #👌 =========== Export route for user assignment data =============================
+# @router.post(
+#     "/export-filtered-data",
+#     description="Export worker assignments (shipment-based) to Excel (streaming)"
+# )
+# async def export_worker_assignments_stream(
+#     request: WorkerAssignmentExportRequest,
+#     db = Depends(get_db)
+# ):
+#     try:
+#         start = datetime.strptime(request.startDate, "%Y-%m-%d")
+#         end = datetime.strptime(request.endDate, "%Y-%m-%d")
+
+#         if start > end:
+#             raise HTTPException(400, "Start date cannot be greater than end date")
+
+#         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+#         filename = f"worker_assignments_{timestamp}.xlsx"
+
+#         return StreamingResponse(
+#             generate_excel_stream_export_worker_assignment(
+#                 db=db,
+#                 assignment_status=request.assignment_status,
+#                 start_date=request.startDate,
+#                 end_date=request.endDate,
+#                 chunk_size=1000
+#             ),
+#             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+#             headers={
+#                 "Content-Disposition": f"attachment; filename={filename}",
+#                 "Cache-Control": "no-cache"
+#             }
+#         )
+
+#     except ValueError as e:
+#         raise HTTPException(400, f"Invalid date format: {e}")
+
 @router.post(
     "/export-filtered-data",
-    description="Export worker assignments (shipment-based) to Excel (streaming)"
+    description="Export worker assignments (streaming excel)"
 )
 async def export_worker_assignments_stream(
     request: WorkerAssignmentExportRequest,
-    db = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     try:
         start = datetime.strptime(request.startDate, "%Y-%m-%d")
@@ -969,17 +1011,38 @@ async def export_worker_assignments_stream(
         if start > end:
             raise HTTPException(400, "Start date cannot be greater than end date")
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"worker_assignments_{timestamp}.xlsx"
+        report_type = request.report_type.upper()
 
-        return StreamingResponse(
-            generate_excel_stream_export_worker_assignment(
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        filename = f"operator_{report_type.lower()}_{timestamp}.xlsx"
+
+
+        # ✅ REPORT SWITCH
+        if report_type == "DEFAULT":
+
+            generator = generate_excel_stream_export_worker_assignment(
                 db=db,
                 assignment_status=request.assignment_status,
                 start_date=request.startDate,
                 end_date=request.endDate,
-                chunk_size=1000
-            ),
+            )
+
+        elif report_type == "AGEING":
+
+            generator = generate_ageing_report_for_worker_assignment(
+                db=db,
+                assignment_status=request.assignment_status,
+                start_date=request.startDate,
+                end_date=request.endDate,
+            )
+
+        else:
+            raise HTTPException(400, "Invalid report type")
+
+
+        return StreamingResponse(
+            generator,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
                 "Content-Disposition": f"attachment; filename={filename}",
@@ -989,7 +1052,6 @@ async def export_worker_assignments_stream(
 
     except ValueError as e:
         raise HTTPException(400, f"Invalid date format: {e}")
-
 
 
 
@@ -1080,11 +1142,19 @@ async def assignment_category_summary(
         end_utc=end_utc
     )
 
+    damage_summary = await get_damage_shipment_summary_stats(
+    db=db,
+    start_utc=start_utc,
+    end_utc=end_utc,
+)
+    
+
     return {
         "start_date": start_date,
         "end_date": end_date,
         "overall": overall_summary,
-        "by_category": category_summary
+        "by_category": category_summary,
+        "damage_shipment_stats":damage_summary
     }
 
 
@@ -1440,7 +1510,7 @@ async def get_for_unloading(
 async def assign_loading_in_lift(
     req: AssignLoadingInLiftRequest,
     fastApiRequest: Request,
-    current_user: User = Depends(require_roles(["imp_security","super_admin"])),
+    current_user: User = Depends(require_roles(["imp_sec_ll","super_admin"])),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -1488,7 +1558,7 @@ async def assign_loading_in_lift(
 async def assign_unloading_from_lift(
     req: AssignUnloadingFromLiftRequest,
     fastApiRequest: Request,
-    current_user: User = Depends(require_roles(["imp_security","super_admin"])),
+    current_user: User = Depends(require_roles(["imp_sec_ul","super_admin"])),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -1805,6 +1875,19 @@ async def get_damage_reports_by_shipment(
         oc_no
     )
 
+# This is used in tracer assignmnet data
+@router.get("/get-all-not-resolved-damages")
+async def fetch_all_open_damages(
+    db: AsyncSession = Depends(get_db),
+):
+    data = await get_all_open_damage_shipments(db)
+
+    return {
+        "success": True,
+        "message": "Open damage shipments fetched",
+        "data": data
+    }
+
 
 
 @router.post("/assign-shipment-to-import-tracer", response_model=ResponseOfWorkerAssignment)
@@ -1865,9 +1948,30 @@ async def assign_tracer_to_worker_assignment_route(
         )
 
 
+# IT will mark the shipment which have damage report and not resolved yet to need tracer and then only those shipment will come in tracer dashboard for assignmnet (IT ONLY CHANGE THE DAMAGE AND SHIPMENT LEVEL STATUS TO NEED-TRACER)
+@router.post("/mark-need-tracer")
+async def mark_need_tracer(
+    request: MarkNeedTracerRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user)
+):
 
+    shipment = await mark_shipment_need_tracer(
+        db=db,
+        header_id=request.header_id,
+        shipment_id=request.shipment_id,
+        oc_no=request.oc_no,
+        device_id=request.device_id,
+        changed_by=current_user.emp_id,
+        role=current_user.role,
+    )
 
-
+    return {
+        "success": True,
+        "message": "Shipment marked as NEED_TRACER successfully",
+        "shipment_id": shipment.id,
+        "damage_report_status": shipment.damage_report_status
+    }
 
 
 
@@ -1908,7 +2012,7 @@ async def update_drop_zone_api(
     db: AsyncSession = Depends(get_db),
     current_user = Depends(verify_token_and_get_user),
 ):
-    allowed_ids = ["521546", "518399", "523250", "518339"]
+    allowed_ids = ["521546", "518399", "523250", "518339","523556"]
 
     if current_user.emp_id not in allowed_ids:
         raise HTTPException(
@@ -1935,3 +2039,76 @@ async def update_drop_zone_api(
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
     )
+
+
+# =================================== SUMMARY DASHBOARD WORKER ASSIGNMENT ===================================
+@router.get(
+    "/top-performer/in-date-range",
+    description="start_date and end_date must be in format: YYYY-MM-DD"
+)
+async def get_top_performer_worker(
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+
+    limit: int = Query(10, ge=1, le=150),
+
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    """
+    Get top performing operators in date range
+    """
+
+    # ================================
+    # 1️⃣ VALIDATE FORMAT
+    # ================================
+
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date format. Use YYYY-MM-DD"
+        )
+
+    # ================================
+    # 2️⃣ VALIDATE ORDER
+    # ================================
+
+    # String compare is safe for YYYY-MM-DD
+    if start_date > end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date cannot be after end_date"
+        )
+
+    # ================================
+    # 3️⃣ VALIDATE RANGE (<= 32 days)
+    # ================================
+
+    date_diff = (end_dt - start_dt).days
+
+    if date_diff > 32:
+        raise HTTPException(
+            status_code=400,
+            detail="Date range cannot exceed 32 days"
+        )
+
+    # ================================
+    # 4️⃣ CALL SERVICE (PASS STRING)
+    # ================================
+
+    data = await get_top_performers(
+        db=db,
+        start_date=start_date,   # ✅ still string
+        end_date=end_date,       # ✅ still string
+        limit=limit
+    )
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "count": len(data),
+        "data": data
+    }
