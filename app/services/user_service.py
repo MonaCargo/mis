@@ -14,6 +14,26 @@ async def get_user_by_emp_id(emp_id: str, db: AsyncSession):
 
 
 
+
+
+
+# This is used in tracer assignment for damages report
+async def get_all_active_import_tracers_users(db: AsyncSession):
+    try:
+        result = await db.execute(
+            select(User).where(
+                User.role == "imp_tracer",
+                User.is_active.is_(True),
+            )
+            .order_by(User.name)
+        )
+        print(result,"shjdgjshdg")
+        return result.scalars().all()
+    except Exception as err:
+
+        print("Tracer fetch error:", err)
+        return []
+
 # # ✅ Add pagination support here (get users with pagination)
 # async def get_all_users_paginated(db: AsyncSession, page: int, page_size: int):
 #     offset = (page - 1) * page_size
@@ -351,3 +371,4 @@ async def get_active_import_tracer(db: AsyncSession) -> User | None:
     )
 
     return result.scalars().first()
+

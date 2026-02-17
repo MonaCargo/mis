@@ -1633,6 +1633,9 @@ from sqlalchemy.orm import aliased,selectinload
 from sqlalchemy.dialects.postgresql import JSONB
 
 
+import re
+from sqlalchemy.exc import IntegrityError
+
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
 from app.db.models.importOperation.import_release_report import IrrReport
 from app.db.models.importOperation.worker_assignment import WorkerAssignmentHeader, WorkerAssignmentShipment
@@ -1871,26 +1874,671 @@ def combine_gate_pass_date_with_time_and_return_utc_datetime(
 
 # ========================== 4:58 8 jan ====
 #👌 ======================== WORKER ASSIGNMENT PROCESS FUNCTION =========================
+# ------------------- OLD -----------------
+
+# async def process_worker_assignment(db: AsyncSession, req):
+#     """
+#     ======================================================
+#     WORKER ASSIGNMENT PROCESS (HYBRID CLEAN + DEBUG LOGGING)
+#     ======================================================
+#     """
+
+#     print("\n\n================= 🟦 START PROCESS ASSIGNMENT (DEBUG MODE ON) =================")
+
+#     utc_start, utc_end = ist_day_to_utc_range(req.date)
+#     now = get_utc_now()
+
+#     # print(f"\n📌 DATE RANGE (IST converted → UTC):")
+#     # print("  → Start:", utc_start)
+#     # print("  → End:  ", utc_end)
+
+#     headers_inserted = 0
+#     headers_updated = 0
+#     events_inserted = 0
+#     errors = []
+#     # =====================================================
+#     # 1️⃣ FETCH SOURCE DATA (OC + IRR)
+#     # =====================================================
+#     merge_rows = (await db.execute(
+#         select(OcMergeGatePass).where(
+#             and_(
+#                 OcMergeGatePass.integrate_date_time >= utc_start,
+#                 OcMergeGatePass.integrate_date_time < utc_end
+#             )
+#         )
+#     )).scalars().all()
+
+#     irr_rows = (await db.execute(
+#         select(IrrReport).where(
+#             IrrReport.gate_pass_issued_date.between(utc_start, utc_end)
+#         )
+#     )).scalars().all()
+
+#     # print("\n================= 🟩 MERGE ROWS FOUND =================")
+#     # for oc in merge_rows:
+#     #     print({
+#     #         "awb_no": oc.awb_no,
+#     #         "hawb": oc.hawb,
+#     #         "oc_no": oc.oc_no,
+#     #         "integration": oc.integrate_date_time
+#     #     })
+
+#     # print("\n================= 🟥 IRR ROWS FOUND =================")
+#     # for irr in irr_rows:
+#     #     print({
+#     #         "awb_no": irr.awb,
+#     #         "hawb": irr.hwb,
+#     #         "gp_no": irr.gate_pass_no,
+#     #         "gp_date": irr.gate_pass_issued_date,
+#     #     })
+
+#     # =====================================================
+#     # 2️⃣ PROCESS OC-MERGE DATA
+#     # =====================================================
+#     for oc in merge_rows:
+
+#         # print("\n\n---------------------- 🟦 PROCESSING MERGE ROW ----------------------")
+
+#         norm_hawb = (oc.hawb or "").strip()
+
+#         # ---- HEADER UPSERT (same as your original, correct)
+#         header_stmt = (
+#             insert(WorkerAssignmentHeader)
+#             .values(
+#                 awb_no=oc.awb_no,
+#                 hawb=norm_hawb,
+#                 oc_no=oc.oc_no,
+#                 temp_irm_oc_no=oc.temp_irm_oc_no,
+#                 is_temp_irm_oc=oc.is_temp_irm_oc,
+#                 igp_no=oc.igp_no,
+#                 igp_print_date_time=oc.igp_print_date_time,
+#                 created_at=now,
+#                 updated_at=now
+#             )
+#             .on_conflict_do_update(
+#                 index_elements=[WorkerAssignmentHeader.awb_no, text("COALESCE(hawb, '')")],
+#                 set_={
+#                     "oc_no": insert(WorkerAssignmentHeader).excluded.oc_no,
+#                     "temp_irm_oc_no": case(
+#                         (WorkerAssignmentHeader.temp_irm_oc_no.is_(None),
+#                          insert(WorkerAssignmentHeader).excluded.temp_irm_oc_no),
+#                         else_=WorkerAssignmentHeader.temp_irm_oc_no
+#                     ),
+#                     "igp_no": insert(WorkerAssignmentHeader).excluded.igp_no,
+#                     "updated_at": now
+#                 }
+#             )
+#             .returning(WorkerAssignmentHeader.id, text("CASE WHEN xmax = 0 THEN 1 ELSE 0 END"))
+#         )
+
+#         row = (await db.execute(header_stmt)).first()
+#         header_id, is_insert = row
+
+#         if is_insert:
+#             headers_inserted += 1
+#         else:
+#             headers_updated += 1
+        
+#          # 🔒 IF IRR shipment already exists for this header → SKIP OC shipment
+#         irr_exists = (await db.execute(
+#             select(WorkerAssignmentShipment.id).where(
+#                 WorkerAssignmentShipment.assignment_header_id == header_id,
+#                 WorkerAssignmentShipment.from_irr_table == True
+#             )
+#         )).first()
+
+#         if irr_exists:
+#             # OC merge shipment is obsolete once IRR exists
+#             continue
+
+#         # ---- OC EVENT UPSERT
+#         event_stmt = (
+#             insert(WorkerAssignmentShipment)
+#             .values(
+#                 assignment_header_id=header_id,
+#                 flight_no=oc.flight_no,
+#                 flight_date=oc.flight_date,
+#                 no_of_pc=oc.no_of_pc,
+#                 weight_in_kgs=oc.weight_in_kgs,
+#                 chg_wgt_in_kg=oc.chg_wgt_in_kg,
+#                 location=oc.location,
+#                 shc=oc.shc,
+#                 irr_codes=oc.irr_codes,
+#                 irregularity_remarks=oc.irregularity_remarks,
+#                 integrate_date_time=oc.integrate_date_time,
+#                 from_irr_table=False,
+#                 created_at=now,
+#                 updated_at=now
+#             )
+#             .on_conflict_do_update(
+#                 index_elements=[WorkerAssignmentShipment.assignment_header_id,
+#                                 WorkerAssignmentShipment.integrate_date_time],
+#                 set_={
+#                     "weight_in_kgs": case(
+#                         (WorkerAssignmentShipment.weight_in_kgs.is_(None),
+#                          insert(WorkerAssignmentShipment).excluded.weight_in_kgs),
+#                         else_=WorkerAssignmentShipment.weight_in_kgs
+#                     ),
+#                     "chg_wgt_in_kg": case(
+#                         (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None),
+#                          insert(WorkerAssignmentShipment).excluded.chg_wgt_in_kg),
+#                         else_=WorkerAssignmentShipment.chg_wgt_in_kg
+#                     ),
+#                     "no_of_pc": case(
+#                         (WorkerAssignmentShipment.no_of_pc.is_(None),
+#                          insert(WorkerAssignmentShipment).excluded.no_of_pc),
+#                         else_=WorkerAssignmentShipment.no_of_pc
+#                     ),
+#                         # "location": case(
+#                         #          (
+#                         #     or_(
+#                         #         WorkerAssignmentShipment.location.is_(None),
+#                         #         func.trim(WorkerAssignmentShipment.location) == "",
+#                         #         func.trim(WorkerAssignmentShipment.location) == "-"
+#                         #     ),
+#                         #     insert(WorkerAssignmentShipment).excluded.location
+#                         # ),
+#                         # else_=WorkerAssignmentShipment.location
+
+#                         "location": case(
+#                             (
+#                                 and_(
+#                                     insert(WorkerAssignmentShipment).excluded.location.isnot(None),
+#                                     func.trim(insert(WorkerAssignmentShipment).excluded.location) != "",
+#                                     func.trim(insert(WorkerAssignmentShipment).excluded.location) != "-",
+#                                     # WorkerAssignmentShipment.location
+#                                     # != insert(WorkerAssignmentShipment).excluded.location
+#                                 ),
+#                                 insert(WorkerAssignmentShipment).excluded.location
+#                             ),
+#                             else_=WorkerAssignmentShipment.location
+
+#                     ),
+#                     "updated_at": now
+#                 }
+#             )
+#         )
+
+#         await db.execute(event_stmt)
+#         events_inserted += 1
+
+#     # =====================================================
+#     # 3️⃣ PROCESS IRR DATA   (THE MOST IMPORTANT PART)
+#     # =====================================================
+#     for irr in irr_rows:
+#          # 🎯 DEBUG ONLY THIS GATE PASS
+#         if str(irr.gate_pass_no) == "25277649":
+#             print("\n================ 🎯 DEBUG GP 25277649 ================")
+#             print("AWB:", irr.awb)
+#             print("HAWB:", irr.hwb)
+#             print("GP:", irr.gate_pass_no)
+#             print("END_TIME:", irr.gate_pass_end_date_time)
+#             print("PCS:", irr.pcs)
+#             print("WEIGHT:", irr.grg_wt)
+
+#         # print("\n\n---------------------- 🟥 PROCESSING IRR ROW ----------------------")
+
+#         norm_hawb = (irr.hwb or "").strip()
+#         gp_combo = combine_gate_pass_date_with_time_and_return_utc_datetime(
+#             irr.gate_pass_issued_date, irr.gate_pass_issued_time
+#         )
+
+#         # ---- HEADER UPSERT (Same as your logic)
+#         header_stmt = (
+#             insert(WorkerAssignmentHeader)
+#             .values(
+#                 awb_no=irr.awb,
+#                 hawb=norm_hawb,
+#                 oc_no=irr.oc_num,
+#                 is_temp_irm_oc=False,
+#                 created_at=now,
+#                 updated_at=now
+#             )
+#             .on_conflict_do_update(
+#                 index_elements=[WorkerAssignmentHeader.awb_no, text("COALESCE(hawb, '')")],
+#                 set_={
+#                     "oc_no": insert(WorkerAssignmentHeader).excluded.oc_no,
+#                     "is_temp_irm_oc": False,
+#                     "updated_at": now
+#                 }
+#             )
+#             .returning(WorkerAssignmentHeader.id)
+#         )
+
+#         header_id = (await db.execute(header_stmt)).scalar_one()
+
+#         # ============================================================
+#         # ========== IRR EVENT PROCESSING (FINAL BUSINESS RULES) ======
+#         # ============================================================
+
+#         # STEP 1 — Check OC event
+#         oc_event = (await db.execute(
+#             select(WorkerAssignmentShipment).where(
+#                 WorkerAssignmentShipment.assignment_header_id == header_id,
+#                 WorkerAssignmentShipment.from_irr_table == False
+#             )
+#         )).scalars().first()
+
+
+#                 # ============================================================
+#         # 🛡️ START — IRR EXISTENCE GUARD (DO NOT MOVE THIS)
+#         # ============================================================
+#         existing_irr_event = (await db.execute(
+#             select(WorkerAssignmentShipment).where(
+#                 WorkerAssignmentShipment.assignment_header_id == header_id,
+#                 WorkerAssignmentShipment.gate_pass_no == irr.gate_pass_no,
+#                 WorkerAssignmentShipment.from_irr_table == True
+#             )
+#         )).scalars().first()
+
+#         if existing_irr_event:
+#             # print(
+#             #     f"🟨 IRR already exists → IGNORE OC update | "
+#             #     f"awb={irr.awb}, hawb={irr.hwb}, gp={irr.gate_pass_no}"
+#             # )
+#             if existing_irr_event.gate_pass_end_datetime is None and irr.gate_pass_end_date_time:
+
+#                 await db.execute(
+#                     update(WorkerAssignmentShipment)
+#                     .where(WorkerAssignmentShipment.id == existing_irr_event.id)
+#                     .values(
+#                         gate_pass_end_datetime=irr.gate_pass_end_date_time,
+#                         gate_pass_issued_date_time_combo=gp_combo,
+#                         updated_at=now
+#                     )
+#                 )
+
+#                 if str(irr.gate_pass_no) == "25276836":
+#                     print("✅ FIX: Updated end time on existing IRR")
+#             continue
+#         # ============================================================
+#         # 🛡️ END — IRR EXISTENCE GUARD
+#         # ============================================================
+
+# #------------ ---- CASE A: OC EVENT EXISTS
+#         if oc_event:
+#             # print("🟦 OC EVENT FOUND → APPLY OC-FIRST LOGIC")
+#               # 🛡️ GLOBAL GP DUPLICATE GUARD (MUST BE HERE)
+#             if oc_event and str(irr.gate_pass_no) == "25277649":
+#                 print("✅ OC EVENT FOUND")
+#                 print("OC ID:", oc_event.id)
+#                 print("OC GP:", oc_event.gate_pass_no)
+
+#             existing_gp_event = (
+#                 await db.execute(
+#                     select(WorkerAssignmentShipment).where(
+#                         WorkerAssignmentShipment.assignment_header_id == header_id,
+#                         WorkerAssignmentShipment.gate_pass_no == irr.gate_pass_no,
+#                         WorkerAssignmentShipment.id != oc_event.id
+#                     )
+#                 )
+#             ).scalars().first()
+
+#             if existing_gp_event:
+#                 if str(irr.gate_pass_no) == "25277649":
+#                     print("❌ CASE: Global GP Duplicate Blocked")
+#                     print("Existing Event ID:", existing_gp_event.id)
+
+#                 print(
+#                     f"⚠️ DUPLICATE GP BLOCKED → "
+#                     f"header={header_id}, gp={irr.gate_pass_no}, "
+#                     f"existing_event_id={existing_gp_event.id}"
+#                 )
+
+#                 errors.append({
+#                     "type": "DUPLICATE_GP_CONFLICT",
+#                     "awb": irr.awb,
+#                     "hawb": irr.hwb,
+#                     "gate_pass_no": irr.gate_pass_no,
+#                     "existing_event_id": existing_gp_event.id,
+#                     "action": "oc_update_skipped"
+#                 })
+
+#                 continue  # 🔴 DO NOT UPDATE OC EVENT
+            
+#             # CASE A1: OC has no gate pass yet → FIRST IRR ARRIVAL
+#             if oc_event.gate_pass_no is None:
+#                 # print("🟩 FIRST IRR FOR OC → UPDATE OC EVENT WITH NEW GP")
+#                 if str(irr.gate_pass_no) == "25277649":
+#                     print("✅ CASE: First IRR → Updating OC")
+#                 # 🫷🫷🫷🫷🫷🫷🫷🫷
+#                 if (
+#                     irr.location_pcs
+#                     and oc_event
+#                     and oc_event.location != irr.location_pcs
+#                 ):
+#                     print(
+#                         f"📍 LOCATION OVERRIDE | "
+#                         f"AWB={irr.awb} | "
+#                         f"OLD={oc_event.location} → NEW={irr.location_pcs}"
+#                     )
+#                     # 🫷
+
+#                 await db.execute(
+#                     update(WorkerAssignmentShipment)
+#                     .where(WorkerAssignmentShipment.id == oc_event.id)
+#                     .values(
+
+#                         # 🔵 Always update gate pass timestamps (correct)
+#                         gate_pass_no=irr.gate_pass_no,
+#                         gate_pass_issued_date_time_combo=gp_combo,
+#                         gate_pass_end_datetime=irr.gate_pass_end_date_time,
+
+#                         # 🔵 IRR updates ONLY IF OC has NULL values
+#                         no_of_pc=case(
+#                             (WorkerAssignmentShipment.no_of_pc.is_(None), irr.pcs),
+#                             else_=WorkerAssignmentShipment.no_of_pc
+#                         ),
+#                         no_of_pc_recd=case(
+#                             (WorkerAssignmentShipment.no_of_pc_recd.is_(None), irr.pcs),
+#                             else_=WorkerAssignmentShipment.no_of_pc_recd
+#                         ),
+#                         weight_in_kgs=case(
+#                             (WorkerAssignmentShipment.weight_in_kgs.is_(None), irr.grg_wt),
+#                             else_=WorkerAssignmentShipment.weight_in_kgs
+#                         ),
+#                         chg_wgt_in_kg=case(
+#                             (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None), irr.chg_wt),
+#                             else_=WorkerAssignmentShipment.chg_wgt_in_kg
+#                         ),
+#                     #    location = case(
+#                     #         (
+#                     #             or_(
+#                     #                 WorkerAssignmentShipment.location.is_(None),
+#                     #                 func.trim(WorkerAssignmentShipment.location) == "",
+#                     #                 func.trim(WorkerAssignmentShipment.location) == "-"
+#                     #             ),
+#                     #             irr.location_pcs
+#                     #         ),
+#                     #         else_=WorkerAssignmentShipment.location
+#                     #     ),
+#                     location = case(
+#                             (
+#                                 and_(
+#                                     # irr.location_pcs.isnot(None),
+#                                       irr.location_pcs != None,
+#                                     func.trim(irr.location_pcs) != "",
+#                                     func.trim(irr.location_pcs) != "-",
+#                                     # WorkerAssignmentShipment.location != irr.location_pcs
+#                                 ),
+#                                 irr.location_pcs
+#                             ),
+#                             else_=WorkerAssignmentShipment.location
+#                         ),
+
+#                         agent_name=case(
+#                             (WorkerAssignmentShipment.agent_name.is_(None), irr.agent),
+#                             else_=WorkerAssignmentShipment.agent_name
+#                         ),
+#                         customer_name=case(
+#                             (WorkerAssignmentShipment.customer_name.is_(None), irr.consignee),
+#                             else_=WorkerAssignmentShipment.customer_name
+#                         ),
+#                         release_zone=case(
+#                             (WorkerAssignmentShipment.release_zone.is_(None), irr.dlv_zone),
+#                             else_=WorkerAssignmentShipment.release_zone
+#                         ),
+
+#                         updated_at=now
+#                     )
+#                 )
+
+#                 continue
+
+#             # CASE A2: Same GP number (multiple IRR updates)
+#             if oc_event.gate_pass_no == irr.gate_pass_no:
+#                 # print("🟩 SAME GP FOR OC → UPDATE OC EVENT")
+#                 if str(irr.gate_pass_no) == "25277649":
+#                     print("✅ CASE: Same GP → Updating OC")
+#                  # 🫷🫷🫷🫷🫷🫷🫷🫷
+#                 if (
+#                     irr.location_pcs
+#                     and oc_event
+#                     and oc_event.location != irr.location_pcs
+#                 ):
+#                     print(
+#                         f"📍 LOCATION OVERRIDE | "
+#                         f"AWB={irr.awb} | "
+#                         f"OLD={oc_event.location} → NEW={irr.location_pcs}"
+#                     )
+#                     # 🫷
+
+#                 await db.execute(
+#                     update(WorkerAssignmentShipment)
+#                     .where(WorkerAssignmentShipment.id == oc_event.id)
+#                     .values(
+
+#                         # 🔵 Always update gate pass timestamps (correct)
+#                         gate_pass_no=irr.gate_pass_no,
+#                         gate_pass_issued_date_time_combo=gp_combo,
+#                         gate_pass_end_datetime=irr.gate_pass_end_date_time,
+
+#                         # 🔵 IRR updates ONLY IF OC has NULL values
+#                         no_of_pc=case(
+#                             (WorkerAssignmentShipment.no_of_pc.is_(None), irr.pcs),
+#                             else_=WorkerAssignmentShipment.no_of_pc
+#                         ),
+#                         no_of_pc_recd=case(
+#                             (WorkerAssignmentShipment.no_of_pc_recd.is_(None), irr.pcs),
+#                             else_=WorkerAssignmentShipment.no_of_pc_recd
+#                         ),
+#                         weight_in_kgs=case(
+#                             (WorkerAssignmentShipment.weight_in_kgs.is_(None), irr.grg_wt),
+#                             else_=WorkerAssignmentShipment.weight_in_kgs
+#                         ),
+#                         chg_wgt_in_kg=case(
+#                             (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None), irr.chg_wt),
+#                             else_=WorkerAssignmentShipment.chg_wgt_in_kg
+#                         ),
+#                         # location=case(
+#                         #     (WorkerAssignmentShipment.location.is_(None), irr.location_pcs),
+#                         #     else_=WorkerAssignmentShipment.location
+#                         # ),
+#                         location = case(
+#                                     (
+#                                         and_(
+#                                              irr.location_pcs != None,
+#                                             func.trim(irr.location_pcs) != "",
+#                                             func.trim(irr.location_pcs) != "-",
+#                                             # WorkerAssignmentShipment.location != irr.location_pcs
+#                                         ),
+#                                         irr.location_pcs
+#                                     ),
+#                                     else_=WorkerAssignmentShipment.location
+#                                 ),
+
+#                         agent_name=case(
+#                             (WorkerAssignmentShipment.agent_name.is_(None), irr.agent),
+#                             else_=WorkerAssignmentShipment.agent_name
+#                         ),
+#                         customer_name=case(
+#                             (WorkerAssignmentShipment.customer_name.is_(None), irr.consignee),
+#                             else_=WorkerAssignmentShipment.customer_name
+#                         ),
+#                         release_zone=case(
+#                             (WorkerAssignmentShipment.release_zone.is_(None), irr.dlv_zone),
+#                             else_=WorkerAssignmentShipment.release_zone
+#                         ),
+
+#                         updated_at=now
+#                     )
+#                 )
+
+#                 continue
+
+#             # CASE A3: OC already has GP001, IRR brings GP002 → INVALID
+#             # print("🟥 ERROR: OC EVENT HAS AN EXISTING GATE PASS BUT IRR BRINGS A DIFFERENT ONE!")
+#             # raise Exception(
+#             #     f"Invalid IRR: Different gate_pass_no '{irr.gate_pass_no}' "
+#             #     f"received for OC shipment with existing gate_pass_no '{oc_event.gate_pass_no}'"
+#             # )
+#             if str(irr.gate_pass_no) == "25277649":
+#                 print("❌ CASE: GP MISMATCH")
+#                 print("OC GP:", oc_event.gate_pass_no)
+#                 print("IRR GP:", irr.gate_pass_no)
+#             print("⚠️OC EVENT HAS AN EXISTING GATE PASS BUT IRR BRINGS A DIFFERENT ONE! (INFO ONLY — PROCESS CONTINUES)")
+#             print( f"Info : received for OC shipment with existing gate_pass_no '{oc_event.gate_pass_no}' get different gate paas no '{irr.gate_pass_no}' on awb '{irr.awb} and hawb '{irr.hwb}''")
+
+#             # Collect debug / audit info
+#             errors.append({
+#                 "type": "GP_MISMATCH",
+#                 "awb": irr.awb,
+#                 "hawb": irr.hwb,
+#                 "existing_gate_pass": oc_event.gate_pass_no,
+#                 "incoming_gate_pass": irr.gate_pass_no,
+#                 "action": "ignored_irr_update",
+#                 "message": "data already created from OC merge and then different data come from IRR with different gatepaas no.| It is may be case of partshipment"
+#             })
+
+#             # Skip this IRR row and continue batch
+#             continue
+
+
+#         # STEP 2 — No OC event exists → IRR-only shipment
+#         # print("🟧 NO OC EVENT FOUND → IRR-ONLY SHIPMENT LOGIC")
+
+#         # Try to find existing IRR event with same gate_pass_no
+#         existing_irr_event = (await db.execute(
+#             select(WorkerAssignmentShipment).where(
+#                 WorkerAssignmentShipment.assignment_header_id == header_id,
+#                 WorkerAssignmentShipment.gate_pass_no == irr.gate_pass_no
+#             )
+#         )).scalars().first()
+
+#         # Case B1: Same GP exists → UPDATE
+#         if existing_irr_event:
+#             # print("🟩 SAME IRR GP → UPDATE IRR EVENT")
+#             # 🫷
+#             # 🔍 LOCATION DEBUG (IRR→IRR UPDATE)
+#             if (
+#                 irr.location_pcs
+#                 and existing_irr_event.location
+#                 and existing_irr_event.location != irr.location_pcs
+#             ):
+#                 print(
+#                     f"📍 [IRR→IRR] LOCATION CHANGED | "
+#                     f"AWB={irr.awb} | "
+#                     f"OLD={existing_irr_event.location} → NEW={irr.location_pcs}"
+#                 )
+# # 🫷
+#             await db.execute(
+#                 update(WorkerAssignmentShipment)
+#                 .where(WorkerAssignmentShipment.id == existing_irr_event.id)
+#                 .values(
+#                     gate_pass_issued_date_time_combo=gp_combo,
+#                     gate_pass_end_datetime=irr.gate_pass_end_date_time,
+#                     no_of_pc=irr.pcs,
+#                     no_of_pc_recd=irr.pcs,
+#                     weight_in_kgs=irr.grg_wt,
+#                     chg_wgt_in_kg=irr.chg_wt,
+#                     # location=irr.location_pcs,
+#                     location = case(
+#                         (
+#                             and_(
+#                                  irr.location_pcs != None,
+#                                 func.trim(irr.location_pcs) != "",
+#                                 func.trim(irr.location_pcs) != "-",
+#                                 # WorkerAssignmentShipment.location != irr.location_pcs
+#                             ),
+#                             irr.location_pcs
+#                         ),
+#                         else_=WorkerAssignmentShipment.location
+#                     ),
+
+#                     agent_name=irr.agent,
+#                     customer_name=irr.consignee,
+#                     release_zone=irr.dlv_zone,
+#                     updated_at=now
+#                 )
+#             )
+#             continue
+
+#         # Case B2: No matching IRR GP → Insert new event (PART SHIPMENT)
+#         print("🟩 NEW IRR GP → INSERT NEW IRR EVENT (PART SHIPMENT)")
+#         if str(irr.gate_pass_no) == "25277649":
+#             print("🆕 CASE: New IRR Insert")
+
+#         await db.execute(
+#             insert(WorkerAssignmentShipment).values(
+#                 assignment_header_id=header_id,
+#                 gate_pass_no=irr.gate_pass_no,
+#                 gate_pass_issued_date_time_combo=gp_combo,
+#                 gate_pass_end_datetime=irr.gate_pass_end_date_time,
+#                 flight_no=irr.flight_no,
+#                 flight_date=irr.flight_date,
+#                 no_of_pc=irr.pcs,
+#                 no_of_pc_recd=irr.pcs,
+#                 weight_in_kgs=irr.grg_wt,
+#                 chg_wgt_in_kg=irr.chg_wt,
+#                 location=irr.location_pcs,
+#                 agent_name=irr.agent,
+#                 customer_name=irr.consignee,
+#                 release_zone=irr.dlv_zone,
+#                 from_irr_table=True,
+#                 created_at=now,
+#                 updated_at=now
+#             )
+#         )
+
+#     # =====================================================
+#     # END + COMMIT
+#     # =====================================================
+#     await db.commit()
+
+#     print("\n================= 🟦 END PROCESS (DEBUG MODE) =================\n\n")
+
+#     return {
+#         "success": True,
+#         "merge_rows_processed": len(merge_rows),
+#         "irr_rows_processed": len(irr_rows),
+#         "headers_inserted": headers_inserted,
+#         "headers_updated": headers_updated,
+#         "events_processed": events_inserted,
+#         "warnings":errors
+#     }
+
+# ------------ NEW ----- 
+
+# ----------------------- New ----------------
+def _parse_integrity_error(e: IntegrityError) -> dict:
+    """
+    Parses PostgreSQL IntegrityError detail string.
+    Handles patterns like:
+      - Key (oc_no)=(2068979755) already exists.
+      - duplicate key value violates unique constraint "uq_worker_assignment_header_oc_no"
+    Returns dict with constraint name and duplicate value (if extractable).
+    """
+    detail = str(e.orig)
+
+    constraint_match = re.search(r'unique constraint "([^"]+)"', detail)
+    constraint = constraint_match.group(1) if constraint_match else "unknown_constraint"
+
+    key_match = re.search(r'Key \(([^)]+)\)=\(([^)]+)\)', detail)
+    column = key_match.group(1) if key_match else None
+    value  = key_match.group(2) if key_match else None
+
+    return {
+        "constraint": constraint,
+        "column":     column,
+        "value":      value,
+    }
+
+
 async def process_worker_assignment(db: AsyncSession, req):
     """
     ======================================================
     WORKER ASSIGNMENT PROCESS (HYBRID CLEAN + DEBUG LOGGING)
     ======================================================
     """
-
     print("\n\n================= 🟦 START PROCESS ASSIGNMENT (DEBUG MODE ON) =================")
-
     utc_start, utc_end = ist_day_to_utc_range(req.date)
     now = get_utc_now()
-
-    # print(f"\n📌 DATE RANGE (IST converted → UTC):")
-    # print("  → Start:", utc_start)
-    # print("  → End:  ", utc_end)
 
     headers_inserted = 0
     headers_updated = 0
     events_inserted = 0
     errors = []
+
     # =====================================================
     # 1️⃣ FETCH SOURCE DATA (OC + IRR)
     # =====================================================
@@ -1909,34 +2557,13 @@ async def process_worker_assignment(db: AsyncSession, req):
         )
     )).scalars().all()
 
-    # print("\n================= 🟩 MERGE ROWS FOUND =================")
-    # for oc in merge_rows:
-    #     print({
-    #         "awb_no": oc.awb_no,
-    #         "hawb": oc.hawb,
-    #         "oc_no": oc.oc_no,
-    #         "integration": oc.integrate_date_time
-    #     })
-
-    # print("\n================= 🟥 IRR ROWS FOUND =================")
-    # for irr in irr_rows:
-    #     print({
-    #         "awb_no": irr.awb,
-    #         "hawb": irr.hwb,
-    #         "gp_no": irr.gate_pass_no,
-    #         "gp_date": irr.gate_pass_issued_date,
-    #     })
-
     # =====================================================
     # 2️⃣ PROCESS OC-MERGE DATA
     # =====================================================
     for oc in merge_rows:
 
-        # print("\n\n---------------------- 🟦 PROCESSING MERGE ROW ----------------------")
-
         norm_hawb = (oc.hawb or "").strip()
 
-        # ---- HEADER UPSERT (same as your original, correct)
         header_stmt = (
             insert(WorkerAssignmentHeader)
             .values(
@@ -1955,8 +2582,7 @@ async def process_worker_assignment(db: AsyncSession, req):
                 set_={
                     "oc_no": insert(WorkerAssignmentHeader).excluded.oc_no,
                     "temp_irm_oc_no": case(
-                        (WorkerAssignmentHeader.temp_irm_oc_no.is_(None),
-                         insert(WorkerAssignmentHeader).excluded.temp_irm_oc_no),
+                        (WorkerAssignmentHeader.temp_irm_oc_no.is_(None), insert(WorkerAssignmentHeader).excluded.temp_irm_oc_no),
                         else_=WorkerAssignmentHeader.temp_irm_oc_no
                     ),
                     "igp_no": insert(WorkerAssignmentHeader).excluded.igp_no,
@@ -1966,15 +2592,35 @@ async def process_worker_assignment(db: AsyncSession, req):
             .returning(WorkerAssignmentHeader.id, text("CASE WHEN xmax = 0 THEN 1 ELSE 0 END"))
         )
 
-        row = (await db.execute(header_stmt)).first()
-        header_id, is_insert = row
+        # 🔒 SAVEPOINT — catches duplicate oc_no without killing the whole batch
+        try:
+            sp = await db.begin_nested()
+            row = (await db.execute(header_stmt)).first()
+            await sp.commit()
+        except IntegrityError as e:
+            await sp.rollback()
+            parsed = _parse_integrity_error(e)
+            errors.append({
+                "type":       "DUPLICATE_OC_NO",
+                "source":     "OC_MERGE",
+                "awb":        oc.awb_no,
+                "hawb":       oc.hawb or "",
+                "oc_no":      parsed["value"] or oc.oc_no,
+                "constraint": parsed["constraint"],
+                "message": (
+                    f"OC No '{parsed['value'] or oc.oc_no}' already assigned to a different "
+                    f"AWB/HAWB. Skipped → AWB={oc.awb_no}, HAWB={oc.hawb or 'N/A'}."
+                )
+            })
+            continue  # ⛔ skip this OC row, move to next
 
+        header_id, is_insert = row
         if is_insert:
             headers_inserted += 1
         else:
             headers_updated += 1
-        
-         # 🔒 IF IRR shipment already exists for this header → SKIP OC shipment
+
+        # 🔒 IF IRR shipment already exists for this header → SKIP OC shipment
         irr_exists = (await db.execute(
             select(WorkerAssignmentShipment.id).where(
                 WorkerAssignmentShipment.assignment_header_id == header_id,
@@ -1983,7 +2629,6 @@ async def process_worker_assignment(db: AsyncSession, req):
         )).first()
 
         if irr_exists:
-            # OC merge shipment is obsolete once IRR exists
             continue
 
         # ---- OC EVENT UPSERT
@@ -2006,48 +2651,30 @@ async def process_worker_assignment(db: AsyncSession, req):
                 updated_at=now
             )
             .on_conflict_do_update(
-                index_elements=[WorkerAssignmentShipment.assignment_header_id,
-                                WorkerAssignmentShipment.integrate_date_time],
+                index_elements=[WorkerAssignmentShipment.assignment_header_id, WorkerAssignmentShipment.integrate_date_time],
                 set_={
                     "weight_in_kgs": case(
-                        (WorkerAssignmentShipment.weight_in_kgs.is_(None),
-                         insert(WorkerAssignmentShipment).excluded.weight_in_kgs),
+                        (WorkerAssignmentShipment.weight_in_kgs.is_(None), insert(WorkerAssignmentShipment).excluded.weight_in_kgs),
                         else_=WorkerAssignmentShipment.weight_in_kgs
                     ),
                     "chg_wgt_in_kg": case(
-                        (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None),
-                         insert(WorkerAssignmentShipment).excluded.chg_wgt_in_kg),
+                        (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None), insert(WorkerAssignmentShipment).excluded.chg_wgt_in_kg),
                         else_=WorkerAssignmentShipment.chg_wgt_in_kg
                     ),
                     "no_of_pc": case(
-                        (WorkerAssignmentShipment.no_of_pc.is_(None),
-                         insert(WorkerAssignmentShipment).excluded.no_of_pc),
+                        (WorkerAssignmentShipment.no_of_pc.is_(None), insert(WorkerAssignmentShipment).excluded.no_of_pc),
                         else_=WorkerAssignmentShipment.no_of_pc
                     ),
-                        # "location": case(
-                        #          (
-                        #     or_(
-                        #         WorkerAssignmentShipment.location.is_(None),
-                        #         func.trim(WorkerAssignmentShipment.location) == "",
-                        #         func.trim(WorkerAssignmentShipment.location) == "-"
-                        #     ),
-                        #     insert(WorkerAssignmentShipment).excluded.location
-                        # ),
-                        # else_=WorkerAssignmentShipment.location
-
-                        "location": case(
-                            (
-                                and_(
-                                    insert(WorkerAssignmentShipment).excluded.location.isnot(None),
-                                    func.trim(insert(WorkerAssignmentShipment).excluded.location) != "",
-                                    func.trim(insert(WorkerAssignmentShipment).excluded.location) != "-",
-                                    # WorkerAssignmentShipment.location
-                                    # != insert(WorkerAssignmentShipment).excluded.location
-                                ),
-                                insert(WorkerAssignmentShipment).excluded.location
+                    "location": case(
+                        (
+                            and_(
+                                insert(WorkerAssignmentShipment).excluded.location.isnot(None),
+                                func.trim(insert(WorkerAssignmentShipment).excluded.location) != "",
+                                func.trim(insert(WorkerAssignmentShipment).excluded.location) != "-",
                             ),
-                            else_=WorkerAssignmentShipment.location
-
+                            insert(WorkerAssignmentShipment).excluded.location
+                        ),
+                        else_=WorkerAssignmentShipment.location
                     ),
                     "updated_at": now
                 }
@@ -2058,10 +2685,11 @@ async def process_worker_assignment(db: AsyncSession, req):
         events_inserted += 1
 
     # =====================================================
-    # 3️⃣ PROCESS IRR DATA   (THE MOST IMPORTANT PART)
+    # 3️⃣ PROCESS IRR DATA
     # =====================================================
     for irr in irr_rows:
-         # 🎯 DEBUG ONLY THIS GATE PASS
+
+        # 🎯 DEBUG ONLY THIS GATE PASS
         if str(irr.gate_pass_no) == "25277649":
             print("\n================ 🎯 DEBUG GP 25277649 ================")
             print("AWB:", irr.awb)
@@ -2071,14 +2699,12 @@ async def process_worker_assignment(db: AsyncSession, req):
             print("PCS:", irr.pcs)
             print("WEIGHT:", irr.grg_wt)
 
-        # print("\n\n---------------------- 🟥 PROCESSING IRR ROW ----------------------")
-
         norm_hawb = (irr.hwb or "").strip()
         gp_combo = combine_gate_pass_date_with_time_and_return_utc_datetime(
-            irr.gate_pass_issued_date, irr.gate_pass_issued_time
+            irr.gate_pass_issued_date,
+            irr.gate_pass_issued_time
         )
 
-        # ---- HEADER UPSERT (Same as your logic)
         header_stmt = (
             insert(WorkerAssignmentHeader)
             .values(
@@ -2092,18 +2718,40 @@ async def process_worker_assignment(db: AsyncSession, req):
             .on_conflict_do_update(
                 index_elements=[WorkerAssignmentHeader.awb_no, text("COALESCE(hawb, '')")],
                 set_={
-                    "oc_no": insert(WorkerAssignmentHeader).excluded.oc_no,
+                    "oc_no":          insert(WorkerAssignmentHeader).excluded.oc_no,
                     "is_temp_irm_oc": False,
-                    "updated_at": now
+                    "updated_at":     now
                 }
             )
             .returning(WorkerAssignmentHeader.id)
         )
 
-        header_id = (await db.execute(header_stmt)).scalar_one()
+        # 🔒 SAVEPOINT — catches duplicate oc_no without killing the whole batch
+        try:
+            sp = await db.begin_nested()
+            header_id = (await db.execute(header_stmt)).scalar_one()
+            await sp.commit()
+        except IntegrityError as e:
+            await sp.rollback()
+            parsed = _parse_integrity_error(e)
+            errors.append({
+                "type":       "DUPLICATE_OC_NO",
+                "source":     "IRR",
+                "awb":        irr.awb,
+                "hawb":       irr.hwb or "",
+                "gate_pass":  irr.gate_pass_no,
+                "oc_no":      parsed["value"] or irr.oc_num,
+                "constraint": parsed["constraint"],
+                "message": (
+                    f"OC No '{parsed['value'] or irr.oc_num}' already assigned to a different "
+                    f"AWB/HAWB. Skipped → AWB={irr.awb}, HAWB={irr.hwb or 'N/A'}, "
+                    f"GP={irr.gate_pass_no}."
+                )
+            })
+            continue  # ⛔ skip this IRR row, move to next
 
         # ============================================================
-        # ========== IRR EVENT PROCESSING (FINAL BUSINESS RULES) ======
+        # ========== IRR EVENT PROCESSING (FINAL BUSINESS RULES) =====
         # ============================================================
 
         # STEP 1 — Check OC event
@@ -2114,8 +2762,7 @@ async def process_worker_assignment(db: AsyncSession, req):
             )
         )).scalars().first()
 
-
-                # ============================================================
+        # ============================================================
         # 🛡️ START — IRR EXISTENCE GUARD (DO NOT MOVE THIS)
         # ============================================================
         existing_irr_event = (await db.execute(
@@ -2127,12 +2774,7 @@ async def process_worker_assignment(db: AsyncSession, req):
         )).scalars().first()
 
         if existing_irr_event:
-            # print(
-            #     f"🟨 IRR already exists → IGNORE OC update | "
-            #     f"awb={irr.awb}, hawb={irr.hwb}, gp={irr.gate_pass_no}"
-            # )
             if existing_irr_event.gate_pass_end_datetime is None and irr.gate_pass_end_date_time:
-
                 await db.execute(
                     update(WorkerAssignmentShipment)
                     .where(WorkerAssignmentShipment.id == existing_irr_event.id)
@@ -2142,18 +2784,17 @@ async def process_worker_assignment(db: AsyncSession, req):
                         updated_at=now
                     )
                 )
-
                 if str(irr.gate_pass_no) == "25276836":
                     print("✅ FIX: Updated end time on existing IRR")
             continue
+
         # ============================================================
         # 🛡️ END — IRR EXISTENCE GUARD
         # ============================================================
 
-#------------ ---- CASE A: OC EVENT EXISTS
+        # ---- CASE A: OC EVENT EXISTS
         if oc_event:
-            # print("🟦 OC EVENT FOUND → APPLY OC-FIRST LOGIC")
-              # 🛡️ GLOBAL GP DUPLICATE GUARD (MUST BE HERE)
+
             if oc_event and str(irr.gate_pass_no) == "25277649":
                 print("✅ OC EVENT FOUND")
                 print("OC ID:", oc_event.id)
@@ -2173,53 +2814,41 @@ async def process_worker_assignment(db: AsyncSession, req):
                 if str(irr.gate_pass_no) == "25277649":
                     print("❌ CASE: Global GP Duplicate Blocked")
                     print("Existing Event ID:", existing_gp_event.id)
-
-                print(
-                    f"⚠️ DUPLICATE GP BLOCKED → "
-                    f"header={header_id}, gp={irr.gate_pass_no}, "
-                    f"existing_event_id={existing_gp_event.id}"
-                )
-
+                    print(
+                        f"⚠️ DUPLICATE GP BLOCKED → "
+                        f"header={header_id}, gp={irr.gate_pass_no}, "
+                        f"existing_event_id={existing_gp_event.id}"
+                    )
                 errors.append({
-                    "type": "DUPLICATE_GP_CONFLICT",
-                    "awb": irr.awb,
-                    "hawb": irr.hwb,
-                    "gate_pass_no": irr.gate_pass_no,
+                    "type":              "DUPLICATE_GP_CONFLICT",
+                    "awb":               irr.awb,
+                    "hawb":              irr.hwb,
+                    "gate_pass_no":      irr.gate_pass_no,
                     "existing_event_id": existing_gp_event.id,
-                    "action": "oc_update_skipped"
+                    "action":            "oc_update_skipped"
                 })
-
                 continue  # 🔴 DO NOT UPDATE OC EVENT
-            
+
             # CASE A1: OC has no gate pass yet → FIRST IRR ARRIVAL
             if oc_event.gate_pass_no is None:
-                # print("🟩 FIRST IRR FOR OC → UPDATE OC EVENT WITH NEW GP")
                 if str(irr.gate_pass_no) == "25277649":
                     print("✅ CASE: First IRR → Updating OC")
-                # 🫷🫷🫷🫷🫷🫷🫷🫷
-                if (
-                    irr.location_pcs
-                    and oc_event
-                    and oc_event.location != irr.location_pcs
-                ):
-                    print(
-                        f"📍 LOCATION OVERRIDE | "
-                        f"AWB={irr.awb} | "
-                        f"OLD={oc_event.location} → NEW={irr.location_pcs}"
-                    )
-                    # 🫷
-
+                # if (
+                #     irr.location_pcs and oc_event and
+                #     oc_event.location != irr.location_pcs
+                # ):
+                #     print(
+                #         f"📍 LOCATION OVERRIDE | "
+                #         f"AWB={irr.awb} | "
+                #         f"OLD={oc_event.location} → NEW={irr.location_pcs}"
+                #     )
                 await db.execute(
                     update(WorkerAssignmentShipment)
                     .where(WorkerAssignmentShipment.id == oc_event.id)
                     .values(
-
-                        # 🔵 Always update gate pass timestamps (correct)
                         gate_pass_no=irr.gate_pass_no,
                         gate_pass_issued_date_time_combo=gp_combo,
                         gate_pass_end_datetime=irr.gate_pass_end_date_time,
-
-                        # 🔵 IRR updates ONLY IF OC has NULL values
                         no_of_pc=case(
                             (WorkerAssignmentShipment.no_of_pc.is_(None), irr.pcs),
                             else_=WorkerAssignmentShipment.no_of_pc
@@ -2236,31 +2865,17 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None), irr.chg_wt),
                             else_=WorkerAssignmentShipment.chg_wgt_in_kg
                         ),
-                    #    location = case(
-                    #         (
-                    #             or_(
-                    #                 WorkerAssignmentShipment.location.is_(None),
-                    #                 func.trim(WorkerAssignmentShipment.location) == "",
-                    #                 func.trim(WorkerAssignmentShipment.location) == "-"
-                    #             ),
-                    #             irr.location_pcs
-                    #         ),
-                    #         else_=WorkerAssignmentShipment.location
-                    #     ),
-                    location = case(
+                        location=case(
                             (
                                 and_(
-                                    # irr.location_pcs.isnot(None),
-                                      irr.location_pcs != None,
+                                    irr.location_pcs != None,
                                     func.trim(irr.location_pcs) != "",
                                     func.trim(irr.location_pcs) != "-",
-                                    # WorkerAssignmentShipment.location != irr.location_pcs
                                 ),
                                 irr.location_pcs
                             ),
                             else_=WorkerAssignmentShipment.location
                         ),
-
                         agent_name=case(
                             (WorkerAssignmentShipment.agent_name.is_(None), irr.agent),
                             else_=WorkerAssignmentShipment.agent_name
@@ -2273,42 +2888,31 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.release_zone.is_(None), irr.dlv_zone),
                             else_=WorkerAssignmentShipment.release_zone
                         ),
-
                         updated_at=now
                     )
                 )
-
                 continue
 
             # CASE A2: Same GP number (multiple IRR updates)
             if oc_event.gate_pass_no == irr.gate_pass_no:
-                # print("🟩 SAME GP FOR OC → UPDATE OC EVENT")
                 if str(irr.gate_pass_no) == "25277649":
                     print("✅ CASE: Same GP → Updating OC")
-                 # 🫷🫷🫷🫷🫷🫷🫷🫷
-                if (
-                    irr.location_pcs
-                    and oc_event
-                    and oc_event.location != irr.location_pcs
-                ):
-                    print(
-                        f"📍 LOCATION OVERRIDE | "
-                        f"AWB={irr.awb} | "
-                        f"OLD={oc_event.location} → NEW={irr.location_pcs}"
-                    )
-                    # 🫷
-
+                # if (
+                #     irr.location_pcs and oc_event and
+                #     oc_event.location != irr.location_pcs
+                # ):
+                #     print(
+                #         f"📍 LOCATION OVERRIDE | "
+                #         f"AWB={irr.awb} | "
+                #         f"OLD={oc_event.location} → NEW={irr.location_pcs}"
+                #     )
                 await db.execute(
                     update(WorkerAssignmentShipment)
                     .where(WorkerAssignmentShipment.id == oc_event.id)
                     .values(
-
-                        # 🔵 Always update gate pass timestamps (correct)
                         gate_pass_no=irr.gate_pass_no,
                         gate_pass_issued_date_time_combo=gp_combo,
                         gate_pass_end_datetime=irr.gate_pass_end_date_time,
-
-                        # 🔵 IRR updates ONLY IF OC has NULL values
                         no_of_pc=case(
                             (WorkerAssignmentShipment.no_of_pc.is_(None), irr.pcs),
                             else_=WorkerAssignmentShipment.no_of_pc
@@ -2325,23 +2929,17 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.chg_wgt_in_kg.is_(None), irr.chg_wt),
                             else_=WorkerAssignmentShipment.chg_wgt_in_kg
                         ),
-                        # location=case(
-                        #     (WorkerAssignmentShipment.location.is_(None), irr.location_pcs),
-                        #     else_=WorkerAssignmentShipment.location
-                        # ),
-                        location = case(
-                                    (
-                                        and_(
-                                             irr.location_pcs != None,
-                                            func.trim(irr.location_pcs) != "",
-                                            func.trim(irr.location_pcs) != "-",
-                                            # WorkerAssignmentShipment.location != irr.location_pcs
-                                        ),
-                                        irr.location_pcs
-                                    ),
-                                    else_=WorkerAssignmentShipment.location
+                        location=case(
+                            (
+                                and_(
+                                    irr.location_pcs != None,
+                                    func.trim(irr.location_pcs) != "",
+                                    func.trim(irr.location_pcs) != "-",
                                 ),
-
+                                irr.location_pcs
+                            ),
+                            else_=WorkerAssignmentShipment.location
+                        ),
                         agent_name=case(
                             (WorkerAssignmentShipment.agent_name.is_(None), irr.agent),
                             else_=WorkerAssignmentShipment.agent_name
@@ -2354,45 +2952,33 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.release_zone.is_(None), irr.dlv_zone),
                             else_=WorkerAssignmentShipment.release_zone
                         ),
-
                         updated_at=now
                     )
                 )
-
                 continue
 
-            # CASE A3: OC already has GP001, IRR brings GP002 → INVALID
-            # print("🟥 ERROR: OC EVENT HAS AN EXISTING GATE PASS BUT IRR BRINGS A DIFFERENT ONE!")
-            # raise Exception(
-            #     f"Invalid IRR: Different gate_pass_no '{irr.gate_pass_no}' "
-            #     f"received for OC shipment with existing gate_pass_no '{oc_event.gate_pass_no}'"
-            # )
+            # CASE A3: OC already has GP001, IRR brings GP002 → GP MISMATCH
             if str(irr.gate_pass_no) == "25277649":
                 print("❌ CASE: GP MISMATCH")
                 print("OC GP:", oc_event.gate_pass_no)
                 print("IRR GP:", irr.gate_pass_no)
-            print("⚠️OC EVENT HAS AN EXISTING GATE PASS BUT IRR BRINGS A DIFFERENT ONE! (INFO ONLY — PROCESS CONTINUES)")
-            print( f"Info : received for OC shipment with existing gate_pass_no '{oc_event.gate_pass_no}' get different gate paas no '{irr.gate_pass_no}' on awb '{irr.awb} and hawb '{irr.hwb}''")
-
-            # Collect debug / audit info
+                print("⚠️ OC EVENT HAS AN EXISTING GATE PASS BUT IRR BRINGS A DIFFERENT ONE! (INFO ONLY — PROCESS CONTINUES)")
+                print(
+                    f"Info : received for OC shipment with existing gate_pass_no '{oc_event.gate_pass_no}' "
+                    f"get different gate pass no '{irr.gate_pass_no}' on awb '{irr.awb}' and hawb '{irr.hwb}'"
+                )
             errors.append({
-                "type": "GP_MISMATCH",
-                "awb": irr.awb,
-                "hawb": irr.hwb,
+                "type":               "GP_MISMATCH",
+                "awb":                irr.awb,
+                "hawb":               irr.hwb,
                 "existing_gate_pass": oc_event.gate_pass_no,
                 "incoming_gate_pass": irr.gate_pass_no,
-                "action": "ignored_irr_update",
-                "message": "data already created from OC merge and then different data come from IRR with different gatepaas no.| It is may be case of partshipment"
+                "action":             "ignored_irr_update",
+                "message":            "data already created from OC merge and then different data come from IRR with different gate pass no. | It may be a case of part shipment"
             })
-
-            # Skip this IRR row and continue batch
             continue
 
-
         # STEP 2 — No OC event exists → IRR-only shipment
-        # print("🟧 NO OC EVENT FOUND → IRR-ONLY SHIPMENT LOGIC")
-
-        # Try to find existing IRR event with same gate_pass_no
         existing_irr_event = (await db.execute(
             select(WorkerAssignmentShipment).where(
                 WorkerAssignmentShipment.assignment_header_id == header_id,
@@ -2402,20 +2988,15 @@ async def process_worker_assignment(db: AsyncSession, req):
 
         # Case B1: Same GP exists → UPDATE
         if existing_irr_event:
-            # print("🟩 SAME IRR GP → UPDATE IRR EVENT")
-            # 🫷
-            # 🔍 LOCATION DEBUG (IRR→IRR UPDATE)
             if (
-                irr.location_pcs
-                and existing_irr_event.location
-                and existing_irr_event.location != irr.location_pcs
+                irr.location_pcs and existing_irr_event.location and
+                existing_irr_event.location != irr.location_pcs
             ):
                 print(
                     f"📍 [IRR→IRR] LOCATION CHANGED | "
                     f"AWB={irr.awb} | "
                     f"OLD={existing_irr_event.location} → NEW={irr.location_pcs}"
                 )
-# 🫷
             await db.execute(
                 update(WorkerAssignmentShipment)
                 .where(WorkerAssignmentShipment.id == existing_irr_event.id)
@@ -2426,20 +3007,17 @@ async def process_worker_assignment(db: AsyncSession, req):
                     no_of_pc_recd=irr.pcs,
                     weight_in_kgs=irr.grg_wt,
                     chg_wgt_in_kg=irr.chg_wt,
-                    # location=irr.location_pcs,
-                    location = case(
+                    location=case(
                         (
                             and_(
-                                 irr.location_pcs != None,
+                                irr.location_pcs != None,
                                 func.trim(irr.location_pcs) != "",
                                 func.trim(irr.location_pcs) != "-",
-                                # WorkerAssignmentShipment.location != irr.location_pcs
                             ),
                             irr.location_pcs
                         ),
                         else_=WorkerAssignmentShipment.location
                     ),
-
                     agent_name=irr.agent,
                     customer_name=irr.consignee,
                     release_zone=irr.dlv_zone,
@@ -2479,17 +3057,16 @@ async def process_worker_assignment(db: AsyncSession, req):
     # END + COMMIT
     # =====================================================
     await db.commit()
-
     print("\n================= 🟦 END PROCESS (DEBUG MODE) =================\n\n")
 
     return {
-        "success": True,
-        "merge_rows_processed": len(merge_rows),
-        "irr_rows_processed": len(irr_rows),
-        "headers_inserted": headers_inserted,
-        "headers_updated": headers_updated,
-        "events_processed": events_inserted,
-        "warnings":errors
+        "success":               True,
+        "merge_rows_processed":  len(merge_rows),
+        "irr_rows_processed":    len(irr_rows),
+        "headers_inserted":      headers_inserted,
+        "headers_updated":       headers_updated,
+        "events_processed":      events_inserted,
+        "warnings":              errors
     }
 
 
@@ -2506,7 +3083,7 @@ async def process_worker_assignment(db: AsyncSession, req):
 
 
 async def get_all_allowed_users_as_worker(db: AsyncSession) -> list[User]:
-    allowed_roles_for_become_worker = ['imp_gp_user','imp_tracer']  # Define the allowed role
+    allowed_roles_for_become_worker = ['imp_gp_user']  # Define the allowed role
     
     query = select(User).filter(User.role.in_(allowed_roles_for_become_worker), User.is_active == True)
     
@@ -2685,11 +3262,34 @@ async def get_worker_assignment_lists_by_emp_id(
         )
     )
 
-    # ✅ REQUIRED for aggregation
-    .group_by(shipment.id, header.id)
+    # # ✅ REQUIRED for aggregation
+    # .group_by(shipment.id, header.id)
 
-    .order_by(shipment.integrate_date_time.desc())
+    # .order_by(shipment.integrate_date_time.desc())
 )
+    # ✅ ADD ROLE FILTER HERE (before group_by)
+    if user.role == "imp_gp_user":
+        stmt = stmt.where(
+            or_(
+                shipment.damage_report_status.is_(None),
+                shipment.damage_report_status == DamageStatusInWorkerAssignmnet.OPEN.value
+            )
+        )
+
+    elif user.role == "imp_tracer":
+        stmt = stmt.where(
+            shipment.damage_report_status ==
+            DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+        )
+
+
+    # ✅ NOW add aggregation and sorting
+    stmt = stmt.group_by(
+        shipment.id,
+        header.id
+    ).order_by(
+        shipment.integrate_date_time.desc()
+    )
     
     rows = (await db.execute(stmt)).all()
 
@@ -2947,26 +3547,35 @@ async def assign_user_to_worker_assignment(
         if emp_id is None:
 
             # Prevent unassigning active tracer (future policy)
+            # if (
+            #     ENFORCE_TRACER_ALWAYS_ASSIGNED
+            #     and shipment.damage_report_status in [
+            #         DamageStatusInWorkerAssignmnet.NEED_TRACER.value,
+            #         DamageStatusInWorkerAssignmnet.OPEN.value,
+            #         DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+            #     ]
+            # ):
+            #     raise HTTPException(
+            #         400,
+            #          "Cannot unassign. Shipment with damage must remain assigned to tracer"
+            #     )
             if (
                 ENFORCE_TRACER_ALWAYS_ASSIGNED
-                and shipment.damage_report_status in [
-                    DamageStatusInWorkerAssignmnet.OPEN.value,
-                    DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
-                ]
+                and shipment.damage_report_status is not None
             ):
                 raise HTTPException(
                     400,
-                    "Tracer case must have an assigned user"
+                    "Cannot unassign. Shipment with damage must remain assigned to tracer"
                 )
 
 
-            # Clear tracer status (optional)
-            if shipment.damage_report_status in [
-                DamageStatusInWorkerAssignmnet.OPEN.value,
-                DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
-            ]:
-                shipment.damage_report_status = None
-                shipment.damage_resolve_datetime = None
+            # # Clear tracer status (optional)
+            # if shipment.damage_report_status in [
+            #     DamageStatusInWorkerAssignmnet.OPEN.value,
+            #     DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+            # ]:
+            #     shipment.damage_report_status = None
+            #     shipment.damage_resolve_datetime = None
 
 
             shipment.assigned_person = None
@@ -3014,18 +3623,47 @@ async def assign_user_to_worker_assignment(
 
         is_tracer = user.role == "imp_tracer"
 
-        # Prevent ops overriding active tracer
+        # 🚫 Block assignment if shipment already resolved
+        if shipment.damage_report_status == DamageStatusInWorkerAssignmnet.RESOLVED.value:
+            raise HTTPException(
+                400,
+                "Shipment damages already resolved"
+            )
+        # 🚫 Block OPS assignment if ANY damage exists
         if (
-            shipment.damage_report_status in [
-                DamageStatusInWorkerAssignmnet.OPEN.value,
-                DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
-            ]
+            shipment.damage_report_status is not None
             and not is_tracer
         ):
             raise HTTPException(
                 400,
-                "Shipment is under tracer investigation"
+                "Shipment has damage and requires tracer handling"
             )
+
+        # ✅ ADD THIS BLOCK HERE
+        # Prevent OPS assignment when shipment needs tracer
+        if (
+            shipment.damage_report_status
+            == DamageStatusInWorkerAssignmnet.NEED_TRACER.value
+            and not is_tracer
+        ):
+            raise HTTPException(
+                400,
+                "Shipment requires tracer user assignment"
+            )
+
+
+
+        # # Prevent ops overriding active tracer
+        # if (
+        #     shipment.damage_report_status in [
+        #         DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+        #     ]
+        #     and not is_tracer
+        # ):
+        #     raise HTTPException(
+        #         400,
+        #         "Shipment is under tracer investigation"
+        #     )
 
 
         # ─────────────────────────────────────────────
@@ -3038,8 +3676,14 @@ async def assign_user_to_worker_assignment(
 
 
         # Mark shipment under tracer (optional)
-        if is_tracer:
+        # Mark shipment under tracer only if NEED_TRACER
+        if (
+            is_tracer
+            and shipment.damage_report_status
+            == DamageStatusInWorkerAssignmnet.NEED_TRACER.value
+        ):
             shipment.damage_report_status = DamageStatusInWorkerAssignmnet.IN_PROGRESS.value
+
 
 
         await log_worker_assignment_audit(
@@ -3595,7 +4239,7 @@ async def search_in_worker_assignments(
 
     return response_list
 
-# 👌=================== EXPORT WORKER ASSIGNMNET REPORT BASED ON FILTERD (STREAMING) ===================
+# 👌👌=================== EXPORT WORKER ASSIGNMNET REPORT BASED ON FILTERD (STREAMING) ===================
 #============= IT IS USED TO EXPORT EXCEL STREAMING FOR WORKER ASSIGNMENT DATA WITH FILTERS ================
 async def generate_excel_stream_export_worker_assignment(
     db: AsyncSession,
@@ -3924,6 +4568,237 @@ async def generate_excel_stream_export_worker_assignment(
     
     # Yield the complete file
     yield output.read()
+
+# 🫷 Ageing report for worker assignment---------
+
+async def generate_ageing_report_for_worker_assignment(
+    db: AsyncSession,
+    assignment_status: str,
+    start_date: str,
+    end_date: str,
+    chunk_size: int = 1000
+) -> AsyncGenerator[bytes, None]:
+    """
+    AGEING REPORT
+    - Only active Gatepasses
+    - Excludes completed GP
+    - Uses Header + Shipment
+    """
+
+    # ================= BUFFER =================
+
+    output = io.BytesIO()
+
+    workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+    worksheet = workbook.add_worksheet("Ageing Report")
+
+    # ================= FORMATS =================
+
+    header_format = workbook.add_format({
+        "bold": True,
+        "border": 1,
+        "align": "center",
+        "valign": "vcenter"
+    })
+
+    text_format = workbook.add_format({
+        "align": "left",
+        "border": 1
+    })
+
+    number_format = workbook.add_format({
+        "align": "right",
+        "border": 1,
+        "num_format": "0.00"
+    })
+
+    int_format = workbook.add_format({
+        "align": "right",
+        "border": 1,
+        "num_format": "0"
+    })
+
+    date_format = workbook.add_format({
+        "align": "left",
+        "border": 1,
+        "num_format": "dd/mm/yyyy hh:mm"
+    })
+
+    center_format = workbook.add_format({
+        "align": "center",
+        "border": 1
+    })
+
+    # ================= HEADERS =================
+
+    headers = [
+        "S.No",
+        "Gate Pass No",
+        "AWB No",
+        "HAWB",
+        "No of Pieces",
+        "Weight (KG)",
+        "GP Issue Date",
+        "GP End Date",
+        "Assigned Person Name",
+        "Assigned DateTime",
+        "Drop Delivery Zone",
+        "Drop DLV DateTime",
+    ]
+
+    for col, h in enumerate(headers):
+        worksheet.write(0, col, h, header_format)
+        worksheet.set_column(col, col, 18)
+
+    worksheet.freeze_panes(1, 0)
+
+    # ================= QUERY =================
+
+    UserAlias = aliased(User)
+
+    filters = WorkerAssignmentFilters(
+        shipment_model=WorkerAssignmentShipment,
+        status=assignment_status,
+        startDate=start_date,
+        endDate=end_date
+    )
+
+    # 🔥 JOIN HEADER + SHIPMENT (same as default)
+    base_query = (
+        filters.apply_all(
+            select(
+                WorkerAssignmentHeader,
+                WorkerAssignmentShipment,
+                UserAlias.name.label("assigned_person_name")
+            )
+            .join(
+                WorkerAssignmentShipment,
+                WorkerAssignmentHeader.id ==
+                WorkerAssignmentShipment.assignment_header_id
+            )
+            .outerjoin(
+                UserAlias,
+                UserAlias.emp_id ==
+                WorkerAssignmentShipment.assigned_person
+            )
+        )
+
+        # 🔥 Exclude completed GP
+        .where(
+            WorkerAssignmentShipment.gate_pass_end_datetime.is_(None)
+        )
+
+        .order_by(
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.asc()
+        )
+    )
+
+    # ================= IST CONVERTER =================
+
+    IST = pytz.timezone("Asia/Kolkata")
+
+    def to_ist(dt):
+        if not dt:
+            return None
+
+        if dt.tzinfo:
+            dt = dt.astimezone(IST)
+
+        return dt.replace(tzinfo=None)
+
+    # ================= STREAM =================
+
+    row_num = 1
+    offset = 0
+
+    while True:
+
+        result = await db.execute(
+            base_query.offset(offset).limit(chunk_size)
+        )
+
+        rows = result.all()
+
+        if not rows:
+            break
+
+        # Each row = (header, shipment, name)
+        for header, shipment, assigned_person_name in rows:
+
+            worksheet.write(row_num, 0, row_num, center_format)
+
+            # Gate Pass
+            worksheet.write(row_num, 1, shipment.gate_pass_no or "", text_format)
+
+            # AWB / HAWB from HEADER ✅
+            worksheet.write(row_num, 2, header.awb_no or "", text_format)
+            worksheet.write(row_num, 3, header.hawb or "", text_format)
+
+            # PCS
+            if shipment.no_of_pc is not None:
+                worksheet.write_number(row_num, 4, shipment.no_of_pc, int_format)
+            else:
+                worksheet.write_blank(row_num, 4, None)
+
+            # Weight
+            if shipment.weight_in_kgs is not None:
+                worksheet.write_number(
+                    row_num, 5, shipment.weight_in_kgs, number_format
+                )
+            else:
+                worksheet.write_blank(row_num, 5, None)
+
+            # GP Issue Date
+            if shipment.gate_pass_issued_date_time_combo:
+                worksheet.write_datetime(
+                    row_num,
+                    6,
+                    to_ist(shipment.gate_pass_issued_date_time_combo),
+                    date_format
+                )
+            else:
+                worksheet.write(row_num, 6, "", text_format)
+
+            # GP End Date (always empty)
+            worksheet.write(row_num, 7, "", text_format)
+
+            # Assigned Name
+            worksheet.write(row_num, 8, assigned_person_name or "", text_format)
+
+            # Assigned Date
+            if shipment.assigned_person_datetime:
+                worksheet.write_datetime(
+                    row_num,
+                    9,
+                    to_ist(shipment.assigned_person_datetime),
+                    date_format
+                )
+            else:
+                worksheet.write(row_num, 9, "", text_format)
+
+            # Drop Zone
+            worksheet.write(row_num, 10, shipment.drop_dlv_zone or "", text_format)
+
+            # Drop Time
+            if shipment.drop_dlv_zone_datetime:
+                worksheet.write_datetime(
+                    row_num,
+                    11,
+                    to_ist(shipment.drop_dlv_zone_datetime),
+                    date_format
+                )
+            else:
+                worksheet.write(row_num, 11, "", text_format)
+
+            row_num += 1
+
+        offset += chunk_size
+
+    workbook.close()
+    output.seek(0)
+
+    yield output.read()
+
 
 
 #👌 =========================  USER / WORKER ASSIGNMENT SUMMARY ============================
@@ -4705,6 +5580,59 @@ async def get_assignment_overall_summary(
     }
     }
 
+# Get the summary stats data to show in mobile admin dashboard
+async def get_damage_shipment_summary_stats(
+    db,
+    start_utc,
+    end_utc,
+):
+    stmt = (
+        select(
+            func.count().label("total"),
+
+            func.sum(
+                case(
+                    (WorkerAssignmentShipment.damage_report_status == "open", 1),
+                    else_=0
+                )
+            ).label("open"),
+
+            func.sum(
+                case(
+                    (WorkerAssignmentShipment.damage_report_status == "in_progress", 1),
+                    else_=0
+                )
+            ).label("in_progress"),
+
+            func.sum(
+                case(
+                    (WorkerAssignmentShipment.damage_report_status == "resolved", 1),
+                    else_=0
+                )
+            ).label("resolved"),
+        )
+        .where(
+    and_(
+        or_(
+            WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(start_utc, end_utc),
+        ),
+        WorkerAssignmentShipment.damage_report_status.isnot(None)
+    )
+)
+
+    )
+
+    result = await db.execute(stmt)
+    row = result.first()
+
+    return {
+        "total": row.total or 0,
+        "open": row.open or 0,
+        "in_progress": row.in_progress or 0,
+        "resolved": row.resolved or 0,
+    }
+
 
 async def get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no(
     db: AsyncSession,
@@ -5478,7 +6406,7 @@ async def get_shipments_for_loading_in_lift(
     next_date_str = next_day_ist.strftime("%Y-%m-%d")
      #========================================================================
     # Convert IST → UTC
-    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-02-06")
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-01-11")
     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(next_date_str)
 
     # Base filters (reusable)
@@ -5629,7 +6557,7 @@ async def get_shipments_for_unloading_from_lift(
     """
 
     # Convert IST → UTC
-    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(start_date)
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-01-11")
     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
 
     # Common filters
@@ -6552,7 +7480,347 @@ async def mark_final_delivery_by_assigned_worker(
 
 
 # ================================ 😎 IMPORT TRACER RELATED SERVICES  ====================================
+# Previous running code
+# async def get_paginated_worker_assignments_with_damage_filter(
+#     db: AsyncSession,
+#     status: str,
+#     startDate: Optional[str],
+#     endDate: Optional[str],
+#     page: int,
+#     page_size: int,
+# ) -> Dict[str, Any]:
 
+#     shipment_model = WorkerAssignmentShipment
+#     header_model = WorkerAssignmentHeader
+#     damage_model = DamageReport
+
+
+
+#     # =====================================================
+#     # STEP 1 — BASE QUERY
+#     # =====================================================
+
+
+#     user_model = User   # alias
+
+
+#     query = (
+#         select(
+#             shipment_model,
+#             header_model,
+#             damage_model,
+#             user_model
+#         )
+#         .join(
+#             header_model,
+#             shipment_model.assignment_header_id == header_model.id
+#         )
+#         .join(
+#             damage_model,
+#             damage_model.assignment_shipment_id == shipment_model.id,
+#             isouter=True
+#         )
+#         .join(
+#             user_model,
+#             user_model.emp_id == shipment_model.assigned_person,
+#             isouter=True   # LEFT JOIN (important)
+#         )
+#     )
+
+
+
+#     # =====================================================
+#     # STEP 2 — DATE FILTER (IST → UTC SAFE)
+#     # =====================================================
+
+#     if startDate and endDate:
+
+#         start_dt, end_dt = convert_ist_day_to_utc_range_helper(startDate)
+#         _, end_dt2 = convert_ist_day_to_utc_range_helper(endDate)
+
+#         # Use start of startDate and end of endDate
+#         if start_dt and end_dt2:
+
+#             query = query.where(
+#                 damage_model.reported_at.isnot(None),
+#                 damage_model.reported_at.between(start_dt, end_dt2)
+#             )
+
+
+#     # =====================================================
+#     # STEP 3 — DAMAGE STATUS FILTER
+#     # =====================================================
+
+#     if status == "damage_open":
+
+#         query = query.where(
+#             shipment_model.damage_report_status == "open"
+#         )
+
+#     elif status == "damage_resolved":
+
+#         query = query.where(
+#             shipment_model.damage_report_status == "resolved"
+#         )
+#     elif status == "damage_in_progress":
+
+#         query = query.where(
+#             shipment_model.damage_report_status == "in_progress"
+#         )
+
+#     elif status == "all":
+
+#         query = query.where(
+#             shipment_model.damage_report_status.isnot(None)
+#         )
+
+
+#     # =====================================================
+#     # STEP 4 — TOTAL COUNT
+#     # =====================================================
+
+#     total_records = (
+#         await db.execute(
+#             select(func.count())
+#             .select_from(query.subquery())
+#         )
+#     ).scalar() or 0
+
+
+#     total_pages = ceil(total_records / page_size) if page_size else 0
+
+
+#     if page > total_pages and total_pages > 0:
+#         page = total_pages
+
+#     offset = (page - 1) * page_size
+
+
+#     # =====================================================
+#     # STEP 5 — PAGINATION + ORDER
+#     # =====================================================
+
+#     paginated_query = (
+#         query
+#         .order_by(
+#             damage_model.reported_at.desc().nullslast(),
+#             shipment_model.id.desc()
+#         )
+#         .offset(offset)
+#         .limit(page_size)
+#     )
+
+
+#     result = await db.execute(paginated_query)
+
+#     rows = result.all()
+
+
+#     # =====================================================
+#     # STEP 6 — SERIALIZATION
+#     # =====================================================
+
+#     def safe(val, tp):
+#         if val is None:
+#             return None
+#         return tp(val)
+
+
+#     records = []
+
+
+#     for shipment_row, header_row, damage_row, user_row  in rows:
+
+
+#         records.append({
+
+#             # ---------------- HEADER ----------------
+#             "header_id": header_row.id,
+#             "oc_no": header_row.oc_no,
+#             "awb_no": header_row.awb_no,
+#             "hawb": header_row.hawb,
+#             "temp_irm_oc_no":header_row.temp_irm_oc_no,
+
+
+#             # ---------------- SHIPMENT ----------------
+#             "shipment_id": shipment_row.id,
+#                         # Flags
+#             "from_irr_table": shipment_row.from_irr_table,
+
+#             # Package Info
+#             "no_of_pc": shipment_row.no_of_pc,
+#             "no_of_pc_recd": shipment_row.no_of_pc_recd,
+
+#             "weight_in_kgs": shipment_row.weight_in_kgs,
+#             "chg_wgt_in_kg": shipment_row.chg_wgt_in_kg,
+
+#             # Flight
+#             "flight_no": shipment_row.flight_no,
+#             "flight_date": shipment_row.flight_date,
+
+#             # Location
+#             "location": shipment_row.location,
+#             "shc": shipment_row.shc,
+
+#             # IRR
+#             "irr_codes": shipment_row.irr_codes,
+#             "irregularity_remarks": shipment_row.irregularity_remarks,
+
+#             # Parties
+#             "agent_name": shipment_row.agent_name,
+#             "customer_name": shipment_row.customer_name,
+
+#             # Zones
+#             "release_zone": shipment_row.release_zone,
+#             "drop_dlv_zone": shipment_row.drop_dlv_zone,
+#             "drop_dlv_zone_datetime": shipment_row.drop_dlv_zone_datetime,
+
+#             # Integration
+#             "integrate_date_time": shipment_row.integrate_date_time,
+
+#             # Gate Pass
+#             "gate_pass_no": shipment_row.gate_pass_no,
+#             "gate_pass_issued_date_time_combo": shipment_row.gate_pass_issued_date_time_combo,
+#             "gate_pass_end_datetime": shipment_row.gate_pass_end_datetime,
+
+#             # Assignment
+#              "assigned_person": (
+#                 user_row.name if user_row else None
+#             ),
+
+#             "assigned_person_emp_id": (
+#                 user_row.emp_id if user_row else None
+#             ),
+
+#             "assigned_person_datetime": shipment_row.assigned_person_datetime,
+
+#             "verified_by": shipment_row.verified_by,
+#             "pd_in_time": shipment_row.pd_in_time,
+
+#             # Lift Loading
+#             "loading_in_lift_zone": shipment_row.loading_in_lift_zone,
+#             "loading_in_lift_person": shipment_row.loading_in_lift_person,
+#             "loading_in_lift_zone_datetime": shipment_row.loading_in_lift_zone_datetime,
+
+#             # Lift Unloading
+#             "unloading_from_lift_zone": shipment_row.unloading_from_lift_zone,
+#             "unloading_from_lift_person": shipment_row.unloading_from_lift_person,
+#             "unloading_from_lift_zone_datetime": shipment_row.unloading_from_lift_zone_datetime,
+
+#             # Final Delivery
+#             "final_delivery_by_person": shipment_row.final_delivery_by_person,
+#             "final_delivery_datetime": shipment_row.final_delivery_datetime,
+#             "is_final_delivered": shipment_row.is_final_delivered,
+
+#             # Damage Info
+#             "damage_report_status": shipment_row.damage_report_status,
+#             "damage_resolve_datetime": shipment_row.damage_resolve_datetime,
+
+#             # Audit
+#             "created_at": shipment_row.created_at,
+#             "updated_at": shipment_row.updated_at,
+
+
+#             # ---------------- DAMAGE ----------------
+#             "damage_report_id": damage_row.id if damage_row else None,
+
+#             "damage_remarks": damage_row.remarks if damage_row else None,
+
+#             "damage_reported_at": damage_row.reported_at if damage_row else None,
+#             "damage_location": damage_row.location if damage_row else None,
+
+#             # "damage_resolved_at": damage_row.resolved_date_time if damage_row else None,
+#         })
+
+
+#     # =====================================================
+#     # STEP 7 — DAMAGE COUNTS (MATRIX)
+#     # =====================================================
+
+#     open_count = (
+#         await db.execute(
+#             select(func.count())
+#             .select_from(shipment_model)
+#             .where(shipment_model.damage_report_status == "open")
+#         )
+#     ).scalar() or 0
+
+
+#     resolved_count = (
+#         await db.execute(
+#             select(func.count())
+#             .select_from(shipment_model)
+#             .where(shipment_model.damage_report_status == "resolved")
+#         )
+#     ).scalar() or 0
+
+
+#     total_damage = (
+#         await db.execute(
+#             select(func.count())
+#             .select_from(WorkerAssignmentShipment)
+#             .where(shipment_model.damage_report_status.isnot(None))
+#         )
+#     ).scalar() or 0
+
+
+#     # =====================================================
+#     # STEP 8 — FINAL RESPONSE
+#     # =====================================================
+
+#     return {
+
+#         "success": True,
+
+#         "message": "Damage worker assignments fetched successfully",
+
+#         "data": records,
+
+
+#         # ---------------- PAGINATION ----------------
+#         "pagination": {
+
+#             "current_page": int(page),
+
+#             "page_size": int(page_size),
+
+#             "total_records": int(total_records),
+
+#             "total_pages": int(total_pages),
+
+#             "has_previous": bool(page > 1),
+
+#             "has_next": bool(page < total_pages),
+
+#             "previous_page": page - 1 if page > 1 else None,
+
+#             "next_page": page + 1 if page < total_pages else None,
+#         },
+
+
+#         # ---------------- COUNTS ----------------
+#         "damage_summary": {
+
+#             "open": int(open_count),
+
+#             "resolved": int(resolved_count),
+
+#             "total": int(total_damage),
+#         },
+
+
+#         # ---------------- FILTERS ----------------
+#         "filters_applied": {
+
+#             "status": status,
+
+#             "start_date": startDate,
+
+#             "end_date": endDate,
+#         }
+#     }
+
+# New with gatepass issueDate and integration date time range
 async def get_paginated_worker_assignments_with_damage_filter(
     db: AsyncSession,
     status: str,
@@ -6580,17 +7848,11 @@ async def get_paginated_worker_assignments_with_damage_filter(
         select(
             shipment_model,
             header_model,
-            damage_model,
             user_model
         )
         .join(
             header_model,
             shipment_model.assignment_header_id == header_model.id
-        )
-        .join(
-            damage_model,
-            damage_model.assignment_shipment_id == shipment_model.id,
-            isouter=True
         )
         .join(
             user_model,
@@ -6613,10 +7875,14 @@ async def get_paginated_worker_assignments_with_damage_filter(
         # Use start of startDate and end of endDate
         if start_dt and end_dt2:
 
-            query = query.where(
-                damage_model.reported_at.isnot(None),
-                damage_model.reported_at.between(start_dt, end_dt2)
-            )
+          query = query.where(
+    shipment_model.damage_report_status.isnot(None),
+    func.coalesce(
+        shipment_model.gate_pass_issued_date_time_combo,
+        shipment_model.integrate_date_time
+    ).between(start_dt, end_dt2)
+)
+
 
 
     # =====================================================
@@ -6675,7 +7941,7 @@ async def get_paginated_worker_assignments_with_damage_filter(
     paginated_query = (
         query
         .order_by(
-            damage_model.reported_at.desc().nullslast(),
+            shipment_model.created_at.desc(),
             shipment_model.id.desc()
         )
         .offset(offset)
@@ -6692,6 +7958,25 @@ async def get_paginated_worker_assignments_with_damage_filter(
     # STEP 6 — SERIALIZATION
     # =====================================================
 
+    shipment_ids = [shipment_row.id for shipment_row, _, _ in rows]
+
+    damage_counts_map = {}
+
+    if shipment_ids:
+        damage_count_result = await db.execute(
+            select(
+                DamageReport.assignment_shipment_id,
+                func.count(DamageReport.id)
+            )
+            .where(DamageReport.assignment_shipment_id.in_(shipment_ids))
+            .group_by(DamageReport.assignment_shipment_id)
+        )
+
+        damage_counts_map = {
+            shipment_id: count
+            for shipment_id, count in damage_count_result.all()
+        }
+
     def safe(val, tp):
         if val is None:
             return None
@@ -6701,7 +7986,7 @@ async def get_paginated_worker_assignments_with_damage_filter(
     records = []
 
 
-    for shipment_row, header_row, damage_row, user_row  in rows:
+    for shipment_row, header_row, user_row  in rows:
 
 
         records.append({
@@ -6792,14 +8077,17 @@ async def get_paginated_worker_assignments_with_damage_filter(
             "created_at": shipment_row.created_at,
             "updated_at": shipment_row.updated_at,
 
+            "total_damage_count": damage_counts_map.get(shipment_row.id, 0),
+
+
 
             # ---------------- DAMAGE ----------------
-            "damage_report_id": damage_row.id if damage_row else None,
+            # "damage_report_id": damage_row.id if damage_row else None,
 
-            "damage_remarks": damage_row.remarks if damage_row else None,
+            # "damage_remarks": damage_row.remarks if damage_row else None,
 
-            "damage_reported_at": damage_row.reported_at if damage_row else None,
-            "damage_location": damage_row.location if damage_row else None,
+            # "damage_reported_at": damage_row.reported_at if damage_row else None,
+            # "damage_location": damage_row.location if damage_row else None,
 
             # "damage_resolved_at": damage_row.resolved_date_time if damage_row else None,
         })
@@ -7132,6 +8420,7 @@ async def get_full__all_damage_grouped_by_shipment_for_tracer(
             "resolved_date_time": report.resolved_date_time,
 
             "remarks": report.remarks,
+            "tracer_remarks": report.tracer_remarks,
 
             "reported_at": report.reported_at,
 
@@ -7171,6 +8460,201 @@ async def get_full__all_damage_grouped_by_shipment_for_tracer(
     }
 
 
+async def get_all_open_damage_shipments(
+    db: AsyncSession,
+) -> list[dict]:
+
+    shipment = WorkerAssignmentShipment
+    header = WorkerAssignmentHeader
+    damage = DamageReport
+    user = User
+
+
+    query = (
+    select(
+        shipment.id.label("shipment_id"),
+        header.id.label("header_id"),
+        header.oc_no,
+        header.awb_no,
+        header.hawb,
+        shipment.no_of_pc.label("pcs"),
+        shipment.weight_in_kgs.label("weight"),
+        shipment.assigned_person,
+        shipment.damage_report_status.label("damage_report_status"),
+        shipment.gate_pass_no,
+        func.array_agg(
+            func.json_build_object(
+                "id", damage.id,
+                "reported_at", damage.reported_at,
+                "description", damage.remarks
+            )
+        ).filter(damage.id.isnot(None)).label("damages")
+    )
+    .join(header, shipment.assignment_header_id == header.id)
+    .join(damage, damage.assignment_shipment_id == shipment.id, isouter=True)
+    .where(shipment.damage_report_status.in_(["need_tracer", "in_progress"]))
+    .group_by(
+        shipment.id,
+        header.id,
+        header.oc_no,
+        header.awb_no,
+        header.hawb,
+        shipment.no_of_pc,
+        shipment.weight_in_kgs,
+        shipment.assigned_person,
+        shipment.damage_report_status,
+        shipment.gate_pass_no
+    )
+    # .order_by(shipment.id.desc())
+    .order_by(
+    case(
+        (shipment.damage_report_status == "open", 1),
+        (shipment.damage_report_status == "in_progress", 2),
+        else_=3
+    ),
+    shipment.id.desc()
+)
+)
+
+    result = await db.execute(query)
+
+    rows = result.all()
+
+    records = []
+
+    for row in rows:
+        records.append({
+            "id": row.shipment_id,
+            "header_id": row.header_id,
+            "shipment_id":row.shipment_id,
+            "oc_no": row.oc_no,
+            "awb_no": row.awb_no,
+            "hawb": row.hawb,
+            "pcs": row.pcs,
+            "weight": row.weight,
+            "assigned_person": row.assigned_person,
+            "damage_report_status": row.damage_report_status,
+            "gate_pass_no": row.gate_pass_no,
+            "damages": row.damages or []  # aggregated array of damages
+        })
+
+    return records
+
+async def mark_shipment_need_tracer(
+    *,
+    db: AsyncSession,
+    header_id: int,
+    shipment_id: int,
+    oc_no: str,
+    device_id: str,
+    changed_by: str,
+    role: str,
+):
+    now = get_utc_now()
+
+    # ─────────────────────────────
+    # 1️⃣ Validate header
+    # ─────────────────────────────
+    header = (
+        await db.execute(
+            select(WorkerAssignmentHeader)
+            .where(WorkerAssignmentHeader.id == header_id)
+        )
+    ).scalars().first()
+
+    if not header:
+        raise HTTPException(404, "Invalid header_id")
+
+    if header.oc_no != oc_no:
+        raise HTTPException(400, "OC number mismatch")
+
+    # ─────────────────────────────
+    # 2️⃣ Validate shipment belongs to header
+    # ─────────────────────────────
+    shipment = (
+        await db.execute(
+            select(WorkerAssignmentShipment)
+            .where(
+                WorkerAssignmentShipment.id == shipment_id,
+                WorkerAssignmentShipment.assignment_header_id == header_id,
+            )
+        )
+    ).scalars().first()
+
+    if not shipment:
+        raise HTTPException(404, "Shipment not found")
+
+    # ─────────────────────────────
+    # 3️⃣ Validate damage exists
+    # ─────────────────────────────
+    if shipment.damage_report_status is None:
+        raise HTTPException(
+            400,
+            "Cannot mark NEED_TRACER. No damage exists."
+        )
+
+    # ─────────────────────────────
+    # 4️⃣ Only OPEN → NEED_TRACER allowed
+    # ─────────────────────────────
+    if shipment.damage_report_status != DamageStatusInWorkerAssignmnet.OPEN.value:
+        raise HTTPException(
+            400,
+            f"Cannot mark NEED_TRACER from status '{shipment.damage_report_status}'"
+        )
+
+    # Save old value first
+    old_status = shipment.damage_report_status
+
+    # ─────────────────────────────
+    # 5️⃣ Update status
+    # ─────────────────────────────
+    shipment.damage_report_status = DamageStatusInWorkerAssignmnet.NEED_TRACER.value
+    shipment.updated_at = now
+
+    # ─────────────────────────────
+    # 5.1️⃣ Sync ALL related damage reports
+    # ─────────────────────────────
+    await db.execute(
+        update(DamageReport)
+        .where(
+            DamageReport.assignment_shipment_id == shipment.id,
+            DamageReport.status == DamageStatusInWorkerAssignmnet.OPEN.value  # update only open reports
+        )
+        .values(
+            status=DamageStatusInWorkerAssignmnet.NEED_TRACER.value,
+            updated_at=now
+        )
+    )
+
+    # ─────────────────────────────
+    # 6️⃣ Audit log
+    # ─────────────────────────────
+    await log_worker_assignment_audit(
+        db=db,
+        header=header,
+        shipment=shipment,
+
+        field_name="damage_report_status",
+
+        # old_value=DamageStatusInWorkerAssignmnet.OPEN.value,
+        # new_value=DamageStatusInWorkerAssignmnet.NEED_TRACER.value,
+        old_value=old_status,  # use actual old value from DB
+        new_value=DamageStatusInWorkerAssignmnet.NEED_TRACER.value,
+
+        changed_by=changed_by,
+        changed_by_role=role,
+
+        device_id=device_id,
+        ip_address=None,
+        user_agent=None,
+
+        db_action="UPDATE",
+        source_action="mark_need_tracer",
+    )
+
+    await db.commit()
+
+    return shipment
 
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -7336,9 +8820,24 @@ async def update_drop_dlv_zone(
 
         # If not IRM → prevent overwrite (optional)
         # if shipment.drop_dlv_zone and not is_irm:
-        #     raise HTTPException(400, "Already set")
+        #     raise HTTPException(400, "Already set") 
+        # Restrict if shipment is already in loading/unloading process 
+       # In your service, change the loading/unloading check to be explicit:
 
-        # -------------------------------
+        if shipment.unloading_from_lift_zone:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot update drop zone: shipment is already unloaded from {shipment.unloading_from_lift_zone} lift."
+            )
+        
+        if shipment.loading_in_lift_zone:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot update drop zone: shipment is already loaded in {shipment.loading_in_lift_zone} lift."
+            )
+
+      
+                # -------------------------------
         # 4. Update
         # -------------------------------
         old_value = shipment.drop_dlv_zone
@@ -7433,3 +8932,315 @@ async def update_drop_dlv_zone(
             500,
             "Failed to update drop zone"
         )
+
+
+
+
+
+
+
+# =================================== TOP PERFORMER ASSIGNMENT WORKER =========================================
+# async def get_top_performers(
+#     db,
+#     start_date,
+#     end_date,
+#     limit: int = 10
+# ):
+#     """
+#     Get top operators by dropped shipments (drop_dlv_zone present)
+#     Date filter applies on:
+#     - integrate_date_time OR
+#     - gate_pass_issued_date_time_combo
+#     """
+
+#     # =================================================
+#     # Convert IST → UTC Range
+#     # =================================================
+
+#     utc_start, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(
+#         start_date
+#     )
+
+#     _, utc_end = WorkerAssignmentFilters.convert_ist_day_to_utc_range(
+#         end_date
+#     )
+
+#     # =================================================
+#     # Metrics
+#     # =================================================
+
+#     # Total assigned shipments
+#     assigned_count = func.count(
+#         WorkerAssignmentShipment.id
+#     )
+
+#     # Completed = dropped to delivery zone
+#     completed_count = func.sum(
+#         case(
+#             (
+#                 and_(
+#                     WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+#                     WorkerAssignmentShipment.drop_dlv_zone != ""
+#                 ),
+#                 1
+#             ),
+#             else_=0
+#         )
+#     )
+
+#     # =================================================
+#     # Main Query
+#     # =================================================
+
+#     stmt = (
+#         select(
+#             User.id.label("id"),
+#             User.name.label("name"),
+#             User.emp_id.label("code"),
+
+#             assigned_count.label("assigned"),
+#             completed_count.label("completed"),
+            
+#         )
+#         .join(
+#             WorkerAssignmentShipment,
+#             WorkerAssignmentShipment.assigned_person == User.emp_id
+#         )
+#         .where(
+
+#             # Must be assigned
+#             WorkerAssignmentShipment.assigned_person.isnot(None),
+
+#             # Date range: Integrate OR Gatepass
+#             or_(
+#                 WorkerAssignmentShipment.integrate_date_time.between(
+#                     utc_start, utc_end
+#                 ),
+
+#                 WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+#                     utc_start, utc_end
+#                 ),
+#             )
+#         )
+#         .group_by(
+#             User.id,
+#             User.name,
+#             User.emp_id
+#         )
+#         .order_by(
+#             completed_count.desc()
+#         )
+#         .limit(limit)
+#     )
+
+#     result = await db.execute(stmt)
+
+#     rows = result.all()
+
+#     # =================================================
+#     # Format Response
+#     # =================================================
+
+#     performers = []
+
+#     for row in rows:
+
+#         assigned = row.assigned or 0
+#         completed = row.completed or 0
+
+#         performance = (
+#             round((completed / assigned) * 100, 2)
+#             if assigned > 0 else 0
+#         )
+
+#         performers.append({
+#             "id": row.id,
+#             "name": row.name,
+#             "code": row.code,
+#             "assigned": assigned,
+#             "completed": completed,
+#             "performance": performance,
+#         })
+
+#     return performers
+
+
+
+
+
+
+
+async def get_top_performers(
+    db,
+    start_date,
+    end_date,
+    limit: int = 10
+):
+    """
+    Get top operators with:
+    - assigned count / weight / pcs
+    - completed count / weight / pcs
+    """
+
+    # =================================================
+    # Convert IST → UTC
+    # =================================================
+
+    utc_start, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range(
+        start_date
+    )
+
+    _, utc_end = WorkerAssignmentFilters.convert_ist_day_to_utc_range(
+        end_date
+    )
+
+    # =================================================
+    # CONDITIONS
+    # =================================================
+
+    is_completed = and_(
+        WorkerAssignmentShipment.drop_dlv_zone.isnot(None),
+        WorkerAssignmentShipment.drop_dlv_zone != ""
+    )
+
+    # =================================================
+    # COUNTS
+    # =================================================
+
+    assigned_count = func.count(
+        WorkerAssignmentShipment.id
+    )
+
+    completed_count = func.sum(
+        case((is_completed, 1), else_=0)
+    )
+
+    # =================================================
+    # WEIGHT SUMS
+    # =================================================
+
+    assigned_weight = func.coalesce(
+        func.sum(WorkerAssignmentShipment.weight_in_kgs), 0
+    )
+
+    completed_weight = func.coalesce(
+        func.sum(
+            case(
+                (is_completed, WorkerAssignmentShipment.weight_in_kgs),
+                else_=0
+            )
+        ),
+        0
+    )
+
+    # =================================================
+    # PCS SUMS
+    # =================================================
+
+    assigned_pcs = func.coalesce(
+        func.sum(WorkerAssignmentShipment.no_of_pc), 0
+    )
+
+    completed_pcs = func.coalesce(
+        func.sum(
+            case(
+                (is_completed, WorkerAssignmentShipment.no_of_pc),
+                else_=0
+            )
+        ),
+        0
+    )
+
+    # =================================================
+    # MAIN QUERY
+    # =================================================
+
+    stmt = (
+        select(
+            User.id.label("id"),
+            User.name.label("name"),
+            User.emp_id.label("code"),
+
+            # Counts
+            assigned_count.label("assigned"),
+            completed_count.label("completed"),
+
+            # Weight
+            assigned_weight.label("assigned_weight"),
+            completed_weight.label("completed_weight"),
+
+            # PCS
+            assigned_pcs.label("assigned_pcs"),
+            completed_pcs.label("completed_pcs"),
+        )
+        .join(
+            WorkerAssignmentShipment,
+            WorkerAssignmentShipment.assigned_person == User.emp_id
+        )
+        .where(
+
+            WorkerAssignmentShipment.assigned_person.isnot(None),
+
+            # Date filter (Integrate OR Gatepass)
+            or_(
+                WorkerAssignmentShipment.integrate_date_time.between(
+                    utc_start, utc_end
+                ),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(
+                    utc_start, utc_end
+                ),
+            )
+        )
+        .group_by(
+            User.id,
+            User.name,
+            User.emp_id
+        )
+        .order_by(
+            completed_count.desc()
+        )
+        .limit(limit)
+    )
+
+    result = await db.execute(stmt)
+
+    rows = result.all()
+
+    # =================================================
+    # FORMAT RESPONSE
+    # =================================================
+
+    performers = []
+
+    for row in rows:
+
+        assigned = row.assigned or 0
+        completed = row.completed or 0
+
+        performance = (
+            round((completed / assigned) * 100, 2)
+            if assigned > 0 else 0
+        )
+
+        performers.append({
+            "id": row.id,
+            "name": row.name,
+            "code": row.code,
+
+            # Counts
+            "assigned": assigned,
+            "completed": completed,
+
+            # Weight
+            "assigned_weight": float(row.assigned_weight or 0),
+            "completed_weight": float(row.completed_weight or 0),
+
+            # PCS
+            "assigned_pcs": int(row.assigned_pcs or 0),
+            "completed_pcs": int(row.completed_pcs or 0),
+
+            # %
+            "performance": performance,
+        })
+
+    return performers

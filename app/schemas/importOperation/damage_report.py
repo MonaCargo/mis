@@ -83,6 +83,8 @@ class DamageReportCreate(BaseModel):
         return v
 
     remarks: Optional[str] = Field(None, max_length=500)
+    tracer_remarks: Optional[str] = Field(None, max_length=1000)
+
     reported_at: datetime
 
     class Config:
@@ -104,7 +106,12 @@ class DamageReportCreate(BaseModel):
 class DamageReportUpdate(BaseModel):
     """Schema for updating a damage report"""
     reason_ids: Optional[List[int]] = Field(None, min_items=1)
-    remarks: Optional[str] = Field(None, max_length=500)
+    remarks: Optional[str] = Field(None, max_length=1000)
+
+    # ✅ ADD THIS
+    tracer_remarks: Optional[str] = Field(None, max_length=1000)
+
+
 
 
 class DamageReportResponse(BaseModel):
@@ -118,6 +125,7 @@ class DamageReportResponse(BaseModel):
     location: str
     # emp_id: str
     remarks: Optional[str]
+    tracer_remarks: Optional[str] | None   
     reported_at: datetime
     created_at: datetime
     updated_at: Optional[datetime]

@@ -88,6 +88,8 @@ class DamageReport(Base):
     # 📋 Damage Details
     remarks = Column(Text, nullable=True)
 
+    tracer_remarks = Column(Text, nullable=True)
+    
     # ⏱️ Timestamps
     reported_at = Column(DateTime(timezone=True), nullable=False)   # save time
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

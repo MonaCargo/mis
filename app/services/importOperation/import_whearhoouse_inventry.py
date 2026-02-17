@@ -51,7 +51,7 @@ from datetime import date
 from app.db.models.importOperation.import_wherehouse_inventry import ImportWhereHouseInventry
 from app.utils.stable_advisary_dblock_hash import stable_int32_lock_key
 from sqlalchemy.dialects.postgresql import insert
-
+from app.utils.common.helperFunction import get_utc_now
 class ImportWhereHouseInventryService:
 
     #=================== inser unique on combination of awb and hwb  version  ==========================
@@ -184,10 +184,13 @@ class ImportWhereHouseInventryService:
                 )
             )
 
-            # Add metadata
+            # Add metadata 
+            now = get_utc_now()
             for record in records_data:
                 record['cosys_report_date'] = cosys_report_date
                 record['uploaded_by'] = uploaded_by
+                record['created_at'] = now 
+                record['updated_at'] = now
 
             total_inserted = 0
 

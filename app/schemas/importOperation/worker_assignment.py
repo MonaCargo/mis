@@ -376,6 +376,8 @@ class WorkerAssignmentExportRequest(BaseModel):
     startDate: str = Field(..., description="Start date in YYYY-MM-DD format")
     endDate: str = Field(..., description="End date in YYYY-MM-DD format")
 
+    report_type: str = "DEFAULT" 
+
 class WorkerAssignmentExportResponse(APIResponseBase):
     message: str
     total_records: int
@@ -417,6 +419,11 @@ class RequestOfImprtTracerAssign(BaseModel):
 
 
 
+class MarkNeedTracerRequest(BaseModel):
+    oc_no: str
+    header_id: int
+    shipment_id: int
+    device_id: str | None = None
 
 
 

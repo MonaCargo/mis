@@ -663,20 +663,69 @@ class DamageReportService:
         await self._validate_reason_ids(report_data.reason_ids)
 
         try:
+            # # =================================================
+            # # UPDATE
+            # # =================================================
+            # if existing_report:
+            #     changes = []
+
+            #     # ---- Remarks ----
+            #     if report_data.remarks != existing_report.remarks:
+            #         existing_report.remarks = report_data.remarks
+            #         changes.append("remarks updated")
+
+            #     existing_report.updated_at = get_utc_now()
+
+            #     await self.db.flush()
+
             # =================================================
             # UPDATE
             # =================================================
             if existing_report:
                 changes = []
 
-                # ---- Remarks ----
-                if report_data.remarks != existing_report.remarks:
-                    existing_report.remarks = report_data.remarks
-                    changes.append("remarks updated")
+                role = user_info.get("role")
+
+                # -----------------------------------
+                # NORMAL USER → update remarks only
+                # -----------------------------------
+                if role != "imp_tracer":
+
+                    if report_data.remarks is not None and report_data.remarks != existing_report.remarks:
+
+                        old_val = existing_report.remarks
+
+                        existing_report.remarks = report_data.remarks
+
+                        # changes.append(("remarks", old_val, report_data.remarks))
+                        changes.append(f"remarks updated: {old_val} → {report_data.remarks}")
+
+                        
+
+
+
+                # -----------------------------------
+                # TRACER → update tracer_remarks only
+                # -----------------------------------
+                else:
+                    print("Tracer updating report...", report_data.tracer_remarks, "------------",existing_report.tracer_remarks)
+
+                    if report_data.tracer_remarks is not None and report_data.tracer_remarks != existing_report.tracer_remarks:
+
+                        old_val = existing_report.tracer_remarks
+
+                        existing_report.tracer_remarks = report_data.tracer_remarks
+
+                        # changes.append(("tracer_remarks", old_val, report_data.tracer_remarks))
+                        changes.append(f"tracer remarks updated: {old_val} → {report_data.tracer_remarks}")
+
+
+
 
                 existing_report.updated_at = get_utc_now()
 
                 await self.db.flush()
+
 
                 # ---- Sync Reasons ----
                 old_ids = {r.reason_id for r in existing_report.reasons}
@@ -976,84 +1025,94 @@ class DamageReportService:
         oc_no: str,
         location: str
     ) -> List[DamageReport]:
+        
+        try:
 
-        # =====================================================
-        # 1️⃣ Fetch Shipment
-        # =====================================================
-        shipment_result = await self.db.execute(
-            select(WorkerAssignmentShipment)
-            .where(
-                WorkerAssignmentShipment.id == assignment_shipment_id
-            )
-        )
-
-        shipment = shipment_result.scalar_one_or_none()
-
-        if not shipment:
-            raise HTTPException(
-                status_code=404,
-                detail="Invalid assignment_shipment_id"
+            # =====================================================
+            # 1️⃣ Fetch Shipment
+            # =====================================================
+            shipment_result = await self.db.execute(
+                select(WorkerAssignmentShipment)
+                .where(
+                    WorkerAssignmentShipment.id == assignment_shipment_id
+                )
             )
 
+            shipment = shipment_result.scalar_one_or_none()
 
-        # =====================================================
-        # 2️⃣ Fetch Header Manually (NO RELATIONSHIP)
-        # =====================================================
-        header_result = await self.db.execute(
-            select(WorkerAssignmentHeader)
-            .where(
-                WorkerAssignmentHeader.id == shipment.assignment_header_id
-            )
-        )
-
-        header = header_result.scalar_one_or_none()
-
-        if not header:
-            raise HTTPException(
-                status_code=404,
-                detail="Shipment header missing"
-            )
+            if not shipment:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Invalid assignment_shipment_id"
+                )
 
 
-        # =====================================================
-        # 3️⃣ Validate OC (DO NOT TRUST CLIENT)
-        # =====================================================
-        if oc_no != header.oc_no:
-            raise HTTPException(
-                status_code=400,
-                detail="OC number does not match shipment header"
+            # =====================================================
+            # 2️⃣ Fetch Header Manually (NO RELATIONSHIP)
+            # =====================================================
+            header_result = await self.db.execute(
+                select(WorkerAssignmentHeader)
+                .where(
+                    WorkerAssignmentHeader.id == shipment.assignment_header_id
+                )
             )
 
+            header = header_result.scalar_one_or_none()
 
-        # =====================================================
-        # 4️⃣ Fetch Damage Reports (Shipment + Location)
-        # =====================================================
-        stmt = (
-            select(DamageReport)
+            if not header:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Shipment header missing"
+                )
 
-            .options(
-                selectinload(DamageReport.reasons)
-                    .selectinload(DamageReportReason.reason),
 
-                selectinload(DamageReport.images)
+            # =====================================================
+            # 3️⃣ Validate OC (DO NOT TRUST CLIENT)
+            # =====================================================
+            if oc_no != header.oc_no:
+                raise HTTPException(
+                    status_code=400,
+                    detail="OC number does not match shipment header"
+                )
+
+
+            # =====================================================
+            # 4️⃣ Fetch Damage Reports (Shipment + Location)
+            # =====================================================
+            stmt = (
+                select(DamageReport)
+
+                .options(
+                    selectinload(DamageReport.reasons)
+                        .selectinload(DamageReportReason.reason),
+
+                    selectinload(DamageReport.images)
+                )
+
+                .where(
+                    DamageReport.assignment_shipment_id == assignment_shipment_id,
+                    DamageReport.location == location  # ✅ use DB value
+                )
+
+                .order_by(
+                    DamageReport.reported_at.desc()
+                )
             )
 
-            .where(
-                DamageReport.assignment_shipment_id == assignment_shipment_id,
-                DamageReport.location == location  # ✅ use DB value
-            )
 
-            .order_by(
-                DamageReport.reported_at.desc()
-            )
-        )
+            result = await self.db.execute(stmt)
 
+            reports = result.scalars().all()
 
-        result = await self.db.execute(stmt)
+            return reports
+        except Exception as e:
 
-        reports = result.scalars().all()
+            import traceback
 
-        return reports
+            print("\n🚨 SERVICE ERROR 🚨")
+            traceback.print_exc()
+
+            raise
 
 
     async def get_damage_reports_by_employee(

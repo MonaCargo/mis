@@ -11,6 +11,7 @@ class OriginSourceType(str, Enum):
 
 class DamageStatusInWorkerAssignmnet(str, Enum):
     OPEN = "open"
+    NEED_TRACER = "need_tracer"
     IN_PROGRESS = "in_progress"
     RESOLVED = "resolved"
     # CLOSED = "closed"
