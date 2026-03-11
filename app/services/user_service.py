@@ -305,6 +305,60 @@ async def update_user_password(emp_id: str, new_password: str, db: AsyncSession)
 
 
 # =================== bulk upload
+# async def bulk_create_users(
+#     users: list[dict],
+#     db: AsyncSession,
+#     created_by: str,
+#     changed_by_role: str,
+#     ip_address: str | None,
+#     user_agent: str | None,
+#     device_id: str | None,
+# ):
+#     created_users = []
+
+#     for user_data in users:
+#         # ❌ DB duplicate check
+#         existing = await get_user_by_emp_id(user_data["emp_id"], db)
+#         if existing:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail=f"Employee ID already exists: {user_data['emp_id']}"
+#             )
+
+#         new_user = User(
+#             emp_id=user_data["emp_id"],
+#             name=user_data["name"],
+#             role=user_data["role"],
+#             password=hash_password("cargo123"),  # default password
+#             created_by=created_by,
+#         )
+
+#         db.add(new_user)
+#         await db.flush()
+
+#         # 🧾 AUDIT LOG
+#         await log_user_audit(
+#             db=db,
+#             user=new_user,
+#             field_name="user",
+#             old_value=None,
+#             new_value=f"User {new_user.emp_id} created via bulk upload",
+#             changed_by=created_by,
+#             changed_by_role=changed_by_role,
+#             ip_address=ip_address,
+#             user_agent=user_agent,
+#             device_id=device_id,
+#             db_action="CREATE",
+#             source_action="bulk_user_upload",
+#         )
+
+#         created_users.append(new_user)
+
+#     await db.commit()
+
+#     return created_users
+
+
 async def bulk_create_users(
     users: list[dict],
     db: AsyncSession,
@@ -315,49 +369,50 @@ async def bulk_create_users(
     device_id: str | None,
 ):
     created_users = []
+    skipped_users = []  # track already existing
 
-    for user_data in users:
-        # ❌ DB duplicate check
-        existing = await get_user_by_emp_id(user_data["emp_id"], db)
-        if existing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Employee ID already exists: {user_data['emp_id']}"
+    try:
+        for user_data in users:
+            existing = await get_user_by_emp_id(user_data["emp_id"], db)
+            if existing:
+                skipped_users.append(user_data["emp_id"])  # skip, don't raise
+                continue
+
+            new_user = User(
+                emp_id=user_data["emp_id"],
+                name=user_data["name"],
+                role=user_data["role"],
+                password=hash_password("cargo123"),
+                created_by=created_by,
             )
 
-        new_user = User(
-            emp_id=user_data["emp_id"],
-            name=user_data["name"],
-            role=user_data["role"],
-            password=hash_password("cargo123"),  # default password
-            created_by=created_by,
-        )
+            db.add(new_user)
+            await db.flush()
 
-        db.add(new_user)
-        await db.flush()
+            await log_user_audit(
+                db=db,
+                user=new_user,
+                field_name="user",
+                old_value=None,
+                new_value=f"User {new_user.emp_id} created via bulk upload",
+                changed_by=created_by,
+                changed_by_role=changed_by_role,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                device_id=device_id,
+                db_action="CREATE",
+                source_action="bulk_user_upload",
+            )
 
-        # 🧾 AUDIT LOG
-        await log_user_audit(
-            db=db,
-            user=new_user,
-            field_name="user",
-            old_value=None,
-            new_value=f"User {new_user.emp_id} created via bulk upload",
-            changed_by=created_by,
-            changed_by_role=changed_by_role,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            device_id=device_id,
-            db_action="CREATE",
-            source_action="bulk_user_upload",
-        )
+            created_users.append(new_user)
 
-        created_users.append(new_user)
+        await db.commit()
 
-    await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Bulk upload failed: {str(e)}")
 
-    return created_users
-
+    return created_users, skipped_users
 
 
 
