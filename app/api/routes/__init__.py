@@ -19,6 +19,10 @@ from .importOperation.damage_report import router as damage_report
 
 
 from .domesticOperation.domestic_xray_report import router as domestic_xray_report_route
+from .exportOperation.car_message import router as export_car_message_awb_router
+from .exportOperation.export_skid_master import router as export_skid_master_router
+from .exportOperation.export_uld_master import router as export_uld_master_router
+from .exportOperation.export_location_master import router as export_location_master_router
 
 
 # You can add more routes here as your app grows
@@ -33,6 +37,14 @@ api_v1_router.include_router(export_slot_file_upload, prefix="/truck", tags=["Ex
 api_v1_router.include_router(manual_slot_file_router, prefix="/manualSlot", tags=["Manual Slot File Upload || truck"])
 api_v1_router.include_router(dock_availability_router, prefix="/dockAvailability", tags=["Dock Availability"])
 
+# Car message --------
+api_v1_router.include_router(export_car_message_awb_router, prefix="/export/car", tags=["Export Car Message AWB"])
+# 
+api_v1_router.include_router(export_skid_master_router, prefix="/export/skid", tags=["Export Skid Master"])
+api_v1_router.include_router(export_uld_master_router, prefix="/export/uld", tags=["Export ULD Master"])
+api_v1_router.include_router(export_location_master_router, prefix="/export/location-master", tags=["Export Locations Master"])
+
+ 
 
 
 

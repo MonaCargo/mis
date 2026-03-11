@@ -28,3 +28,6 @@ class WorkerAssignmentAuditSource(str, Enum):
 #     ADMIN = "admin"
 
 
+class ExoportSkidtypeValue(str,Enum):
+    INHOUSE_REAL ="REAL",
+    VIRTUAL = "VIRTUAL"

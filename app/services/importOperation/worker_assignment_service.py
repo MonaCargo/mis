@@ -5255,6 +5255,34 @@ async def get_assignment_category_summary(
 
     rows = (await db.execute(stmt)).all()
 
+    # ADD THIS AFTER rows for get those data which deleiverd but take more than four hours
+    outside_sla_stmt = (
+        select(WorkerAssignmentShipment, WorkerAssignmentHeader)
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentHeader.id == WorkerAssignmentShipment.assignment_header_id
+        )
+        .where(
+            WorkerAssignmentShipment.gate_pass_no.isnot(None),
+            WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.isnot(None),
+            func.extract(
+                "epoch",
+                WorkerAssignmentShipment.gate_pass_end_datetime
+                - WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+            ) > 14400,
+            or_(
+                WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(start_utc, end_utc)
+            )
+        )
+        .order_by(WorkerAssignmentShipment.id.asc())
+    )
+
+    outside_sla_records = (await db.execute(outside_sla_stmt)).all()
+    # -----
+
+
     data_map = {row.category: row for row in rows}
 
     summary = []
@@ -5272,6 +5300,22 @@ async def get_assignment_category_summary(
             "gatepass_end_date_present_means_delivered": row.gatepass_end_date_present_means_delivered if row else 0,
             "dropped_at_lift_with_gatepass_end_date_present": row.dropped_at_lift_with_gatepass_end_date_present if row else 0,
             "delivered_within_defined_hours": row.delivered_within_defined_hours if row else 0,
+
+            "delivered_outside_defined_hours_shipments": [
+                {
+                    "id": shipment.id,
+                    "gate_pass_no": shipment.gate_pass_no,
+                    "oc_no": header.oc_no,        # 👈 from header
+                    "awb_no": header.awb_no,      # 👈 from header
+                    "hawb_no": header.hawb,       # 👈 from header (column name is hawb)
+                    "gate_pass_issued_date_time_combo": shipment.gate_pass_issued_date_time_combo,
+                    "gate_pass_end_datetime": shipment.gate_pass_end_datetime,
+                    "assigned_person": shipment.assigned_person,
+                    "drop_dlv_zone": shipment.drop_dlv_zone,
+                }
+                for shipment, header in outside_sla_records  # 👈 unpack both
+            ],
+
             "balance_for_delivered": (
                 row.total_data - row.assigned_and_dropped_at_lift
                 if row else 0
@@ -5544,6 +5588,31 @@ async def get_assignment_overall_summary(
         overall_totals["total_gross_weight"] += ton_row.total_gross_weight
         overall_totals["total_chargeable_weight"] += ton_row.total_chargeable_weight
 
+        # =====
+    outside_sla_stmt = (
+        select(WorkerAssignmentShipment, WorkerAssignmentHeader)
+        .join(
+            WorkerAssignmentHeader,
+            WorkerAssignmentHeader.id == WorkerAssignmentShipment.assignment_header_id
+        )
+        .where(
+            WorkerAssignmentShipment.gate_pass_no.isnot(None),
+            WorkerAssignmentShipment.gate_pass_end_datetime.isnot(None),
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo.isnot(None),
+            func.extract(
+                "epoch",
+                WorkerAssignmentShipment.gate_pass_end_datetime
+                - WorkerAssignmentShipment.gate_pass_issued_date_time_combo
+            ) > 14400,
+            or_(
+                WorkerAssignmentShipment.integrate_date_time.between(start_utc, end_utc),
+                WorkerAssignmentShipment.gate_pass_issued_date_time_combo.between(start_utc, end_utc)
+            )
+        )
+        .order_by(WorkerAssignmentShipment.id.asc())
+         )
+    outside_sla_records = (await db.execute(outside_sla_stmt)).all()
+
 
 
 
@@ -5556,6 +5625,22 @@ async def get_assignment_overall_summary(
         "assigned_and_dropped_at_lift": row.assigned_and_dropped_at_lift,
         "gatepass_end_date_present_means_delivered": row.gatepass_end_date_present_means_delivered,
         "delivered_within_defined_hours": row.delivered_within_defined_hours,
+
+        "delivered_outside_defined_hours_shipments": [
+            {
+                "id": shipment.id,
+                "gate_pass_no": shipment.gate_pass_no,
+                "oc_no": header.oc_no,
+                "awb_no": header.awb_no,
+                "hawb_no": header.hawb,
+                "gate_pass_issued_date_time_combo": shipment.gate_pass_issued_date_time_combo,
+                "gate_pass_end_datetime": shipment.gate_pass_end_datetime,
+                "assigned_person": shipment.assigned_person,
+                "drop_dlv_zone": shipment.drop_dlv_zone,
+            }
+            for shipment, header in outside_sla_records
+        ],
+
         # FIXED: Use the correct label name
         "not_gatepass_end_date_but_have_gp_no_and_assigned_dropatlift": row.not_gatepass_end_date_but_have_gp_no_and_assigned_dropatlift,
         "not_gatepass_end_date_but_have_gp_no_and_assigned_notdropatlift": row.not_gatepass_end_date_but_have_gp_no_and_assigned_notdropatlift,
@@ -6406,7 +6491,7 @@ async def get_shipments_for_loading_in_lift(
     next_date_str = next_day_ist.strftime("%Y-%m-%d")
      #========================================================================
     # Convert IST → UTC
-    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-01-11")
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-02-11")
     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(next_date_str)
 
     # Base filters (reusable)
@@ -6557,7 +6642,7 @@ async def get_shipments_for_unloading_from_lift(
     """
 
     # Convert IST → UTC
-    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-01-11")
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-02-11")
     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
 
     # Common filters

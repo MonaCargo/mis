@@ -281,6 +281,34 @@ async def update_user_password_api(
 
 # ==================== bulk upload
 
+# @router.post("/bulk-upload", summary="Bulk upload users via Excel")
+# async def bulk_upload_users(
+#     request: Request,
+#     file: UploadFile = File(...),
+#     db: AsyncSession = Depends(get_db),
+#     current_user: User = Depends(verify_token_and_get_user),
+# ):
+#     if not file.filename.endswith((".xlsx", ".xls")):
+#         raise HTTPException(status_code=400, detail="Only Excel files allowed")
+
+#     users = parse_user_excel(file.file)
+
+#     created_users = await bulk_create_users(
+#         users=users,
+#         db=db,
+#         created_by=current_user.emp_id,
+#         changed_by_role=current_user.role,
+#         ip_address=get_request_ip(request),
+#         user_agent=request.headers.get("user-agent"),
+#         device_id=None,
+#     )
+
+#     return {
+#         "success": True,
+#         "message": f"{len(created_users)} users created successfully",
+#     }
+
+
 @router.post("/bulk-upload", summary="Bulk upload users via Excel")
 async def bulk_upload_users(
     request: Request,
@@ -293,7 +321,7 @@ async def bulk_upload_users(
 
     users = parse_user_excel(file.file)
 
-    created_users = await bulk_create_users(
+    created_users,skipped_users = await bulk_create_users(
         users=users,
         db=db,
         created_by=current_user.emp_id,
@@ -305,9 +333,11 @@ async def bulk_upload_users(
 
     return {
         "success": True,
-        "message": f"{len(created_users)} users created successfully",
+        "created_count": len(created_users),
+        "skipped_count": len(skipped_users),
+        "skipped_emp_ids": skipped_users,  # so frontend knows exactly who was skipped
+        "message": f"{len(created_users)} users created, {len(skipped_users)} already existed and were skipped.",
     }
-
 
 
 # Get a user by emp_id
