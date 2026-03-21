@@ -136,17 +136,66 @@ class DeleteSequenceResponse(BaseModel):
 # LOCATION ASSIGNMENT
 # ──────────────────────────────────────────────────────────────
 
-class SkidBySequenceResponse(BaseModel):
-    sequence_no: str
-    skid_id: int
-    skid_no: str
-    skid_type: str          # "real" or "virtual" — frontend can show label
-    mapping_id: int
-    awb_master_id: int
-    awb_no: str
-    pcs:Optional[int] = None
-    scanned_count: int      # how many items on this skid total
+# class SkidBySequenceResponse(BaseModel):
+#     sequence_no: str
+#     skid_id: int
+#     skid_no: str
+#     skid_type: str          # "real" or "virtual" — frontend can show label
+#     mapping_id: int
+#     awb_master_id: int
+#     awb_no: str
+#     pcs:Optional[int] = None
+#     scanned_count: int      # how many items on this skid total
 
+
+# Virtual skid mapping location ------------------------
+
+class SkidInfo(BaseModel):
+    id: int
+    skid_no: str
+    skid_type: str
+    skid_wgt: Optional[float] = None
+    skid_capacity: Optional[float] = None
+    is_active: bool
+    is_locked: bool
+    locked_by: Optional[str] = None
+    locked_at: Optional[datetime] = None
+    is_virtual_used: bool
+
+
+class SequenceItem(BaseModel):
+    id: int
+    sequence_no: str
+    sequence_date_time: Optional[datetime] = None
+    scan_by_device: Optional[str] = None
+    scanned_by: Optional[str] = None
+
+
+class MappingInfo(BaseModel):
+    id: int
+    awb_master_id: int
+    is_virtual: bool
+    virtual_skid_no: Optional[str] = None
+    created_at: Optional[datetime] = None
+    scanned_count: int
+    current_location: Optional[str] = None
+    sequences: list[SequenceItem] = []
+
+
+class AwbInfo(BaseModel):
+    id: int
+    awb_no: str
+    pcs: Optional[int] = None
+
+
+# ── Main response ─────────────────────────────────────────────────
+class SkidBySequenceResponse(BaseModel):
+    success: bool
+    message: str
+    skid: SkidInfo
+    mapping: Optional[MappingInfo] = None
+    awb: Optional[AwbInfo] = None
+# ====================
 
 class AssignLocationRequest(BaseModel):
     skid_no: str                # scanned barcode or typed — works for both real/virtual

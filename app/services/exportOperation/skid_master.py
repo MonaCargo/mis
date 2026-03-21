@@ -11,6 +11,7 @@ from app.db.models.exportOperation.car_message import (
     ExportCarMessageAwbMaster,
     ExportAwbSkidMapping,
     ExportAwbSkidItemSequence,
+    ExportSkidBaseMapping,
     ExportSkidLocationMapping,
 )
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
@@ -68,6 +69,38 @@ async def generate_virtual_skid(
         "message": f"Virtual skid {skid_no} generated successfully.",
     }
 
+async def _get_base_drop_for_skid(
+    db: AsyncSession,
+    skid_id: int,
+    awb_master_id: int,    # ← ADD — scope to current AWB session
+) -> bool:
+    """
+    For new mapping — check if this skid has been dropped at base
+    in any recent session by skid_id.
+    Used when mapping_id does not exist yet (first scan).
+    """
+    result = await db.execute(
+        select(ExportSkidBaseMapping.id).where(
+            ExportSkidBaseMapping.skid_id == skid_id,
+            ExportSkidBaseMapping.awb_master_id == awb_master_id,  # ← scope to current AWB
+        )
+        .order_by(ExportSkidBaseMapping.dropped_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _get_base_drop_for_mapping(
+    db: AsyncSession,
+    mapping_id: int,
+) -> bool:
+    """Returns True if skid has been dropped at base for this mapping session."""
+    result = await db.execute(
+        select(ExportSkidBaseMapping.id).where(
+            ExportSkidBaseMapping.mapping_id == mapping_id,
+        )
+    )
+    return result.scalar_one_or_none() is not None
 
 
 # async def validate_and_lock_skid(
@@ -626,6 +659,8 @@ async def scan_sequence_item(
             skid_id=skid_id,
             is_virtual=(skid.skid_type == "virtual"),
             virtual_skid_no=(skid.skid_no if skid.skid_type == "virtual" else None),
+            mapped_by=scanned_by,   # ✅ emp_id who created the mapping
+            mapped_at=now_utc,      # ✅ when mapping was created
             created_at=now_utc,
         )
         is_new_mapping = True
@@ -633,6 +668,36 @@ async def scan_sequence_item(
     # ──> 2. Skid lock must still be valid ──────────────────────────
     await _assert_skid_still_locked(db, mapping.skid_id)
 
+    # # ──> 2.5 Base drop check — runs for ALL scans ─────────────────
+    # # For existing mapping → check by mapping_id
+    # # For new mapping → check by skid_id (mapping not created yet)
+
+    # if not is_new_mapping:
+    #     # existing mapping — check by mapping_id
+    #     is_at_base = await _get_base_drop_for_mapping(db, mapping_id)
+    # else:
+    #     # new mapping — check by skid_id
+    #     # skid must have a base drop record for ANY recent session
+    #     is_at_base = await _get_base_drop_for_skid(db, mapping.skid_id, awb_master_id)
+
+    # if not is_at_base:
+    #     skid_no = mapping.virtual_skid_no or str(mapping.skid_id)
+    #     return {
+    #         "success": False,
+    #         "message": (
+    #             f"Skid {skid_no} has not been dropped at base yet. "
+    #             "Please retrieve from location and drop at base before scanning."
+    #         ),
+    #         "inserted_count": 0,
+    #         "skipped_duplicates": [],
+    #         "mapping_id": mapping_id,
+    #         "awb_master_id": awb_master_id,
+    #         "total_scanned": await _get_sequence_count_by_awb(db, awb_master_id),
+    #         "awb_total_pcs": (await _get_awb_master(db, awb_master_id)).pcs,
+    #         "items": [],
+    #         "is_unlocked": False,
+    #         "reason": "NOT_AT_BASE",
+    #     }
     # ──> 3. Empty array guard ──────────────────────────────────────
     seq_strings = [item.sequence_no for item in sequence_nos]
 
@@ -913,19 +978,85 @@ async def force_unlock_skid(
 # PUBLIC — LOCATION SKID MAPPING ASSIGNMENT (and skid Relocation)
 # ═════════════════════════════════════════════════════════════════════
 
+# async def get_skid_by_sequence(
+#     db: AsyncSession,
+#     sequence_no: str,
+# ) -> dict:
+#     """
+#     Reverse lookup — given any scanned sequence item barcode,
+#     returns the skid it belongs to along with mapping + AWB context.
+
+#     Used for virtual skids where user has no skid barcode
+#     but holds the item barcode. Frontend calls this first,
+#     gets skid_no + mapping_id + awb_master_id, then proceeds
+#     to assign-location with that data.
+#     """
+#     # ── Find sequence item ────────────────────────────────────────
+#     result = await db.execute(
+#         select(ExportAwbSkidItemSequence).where(
+#             ExportAwbSkidItemSequence.sequence_no == sequence_no
+#         )
+#     )
+#     item = result.scalar_one_or_none()
+
+#     if not item:
+#         raise HTTPException(
+#             status_code=status.HTTP_404_NOT_FOUND,
+#             detail=(
+#                 f"Sequence item '{sequence_no}' not found. "
+#                 "Please check the barcode and try again."
+#             ),
+#         )
+
+#     # ── Get mapping from item ─────────────────────────────────────
+#     mapping = await _get_mapping(db, item.mapping_id)
+
+#     # ── Get skid from mapping ─────────────────────────────────────
+#     result = await db.execute(
+#         select(ExportSkidMaster).where(
+#             ExportSkidMaster.id == mapping.skid_id
+#         )
+#     )
+#     skid = result.scalar_one_or_none()
+
+#     if not skid:
+#         raise HTTPException(
+#             status_code=status.HTTP_404_NOT_FOUND,
+#             detail=f"Skid not found for sequence item '{sequence_no}'.",
+#         )
+#     # ── Only virtual skids allowed here ───────────────────────────
+#     if skid.skid_type != "virtual":
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail=(
+#                 f"Sequence item '{sequence_no}' belongs to a real skid '{skid.skid_no}'. "
+#                 "This lookup is only for virtual skids. "
+#                 "Please scan the skid barcode in Normal mode."
+#             ),
+#         )
+
+#     # ── Get AWB master ────────────────────────────────────────────
+#     awb = await _get_awb_master(db, item.awb_master_id)
+
+#     # ── Get total scanned count for this skid mapping ─────────────
+#     scanned_count = await _get_sequence_count(db, mapping.id)
+
+#     return {
+#         "sequence_no": sequence_no,
+#         "skid_id": skid.id,
+#         "skid_no": skid.skid_no,
+#         "skid_type": skid.skid_type,
+#         "mapping_id": mapping.id,
+#         "awb_master_id": awb.id,
+#         "awb_no": awb.awb_no,
+#         "pcs": awb.pcs,  # total pcs in awb
+#         "scanned_count": scanned_count,
+#     }
+
 async def get_skid_by_sequence(
     db: AsyncSession,
     sequence_no: str,
 ) -> dict:
-    """
-    Reverse lookup — given any scanned sequence item barcode,
-    returns the skid it belongs to along with mapping + AWB context.
-
-    Used for virtual skids where user has no skid barcode
-    but holds the item barcode. Frontend calls this first,
-    gets skid_no + mapping_id + awb_master_id, then proceeds
-    to assign-location with that data.
-    """
     # ── Find sequence item ────────────────────────────────────────
     result = await db.execute(
         select(ExportAwbSkidItemSequence).where(
@@ -937,10 +1068,7 @@ async def get_skid_by_sequence(
     if not item:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"Sequence item '{sequence_no}' not found. "
-                "Please check the barcode and try again."
-            ),
+            detail=f"Sequence item '{sequence_no}' not found. Please check the barcode and try again.",
         )
 
     # ── Get mapping from item ─────────────────────────────────────
@@ -948,9 +1076,7 @@ async def get_skid_by_sequence(
 
     # ── Get skid from mapping ─────────────────────────────────────
     result = await db.execute(
-        select(ExportSkidMaster).where(
-            ExportSkidMaster.id == mapping.skid_id
-        )
+        select(ExportSkidMaster).where(ExportSkidMaster.id == mapping.skid_id)
     )
     skid = result.scalar_one_or_none()
 
@@ -959,7 +1085,7 @@ async def get_skid_by_sequence(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Skid not found for sequence item '{sequence_no}'.",
         )
-    # ── Only virtual skids allowed here ───────────────────────────
+
     if skid.skid_type != "virtual":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -973,21 +1099,69 @@ async def get_skid_by_sequence(
     # ── Get AWB master ────────────────────────────────────────────
     awb = await _get_awb_master(db, item.awb_master_id)
 
-    # ── Get total scanned count for this skid mapping ─────────────
-    scanned_count = await _get_sequence_count(db, mapping.id)
+    # ── Get ALL sequences for this mapping (replaces _get_sequence_count) ──
+    seq_result = await db.execute(
+        select(ExportAwbSkidItemSequence)
+        .where(ExportAwbSkidItemSequence.mapping_id == mapping.id)
+        .order_by(ExportAwbSkidItemSequence.sequence_date_time.asc())
+    )
+    sequences = seq_result.scalars().all()
+
+    # ── Get current location for this skid ───────────────────────
+    loc_result = await db.execute(
+        select(ExportSkidLocationMapping, ExportLocationsMaster)
+        .join(
+            ExportLocationsMaster,
+            ExportLocationsMaster.id == ExportSkidLocationMapping.location_id,
+        )
+        .where(
+            ExportSkidLocationMapping.skid_id == skid.id,
+            ExportSkidLocationMapping.is_current == True,
+        )
+    )
+    loc_row = loc_result.first()
+    current_location = loc_row.ExportLocationsMaster.loc if loc_row else None
 
     return {
-        "sequence_no": sequence_no,
-        "skid_id": skid.id,
-        "skid_no": skid.skid_no,
-        "skid_type": skid.skid_type,
-        "mapping_id": mapping.id,
-        "awb_master_id": awb.id,
-        "awb_no": awb.awb_no,
-        "pcs": awb.pcs,  # total pcs in awb
-        "scanned_count": scanned_count,
+        "success": True,
+        "message": f"Skid '{skid.skid_no}' found via sequence item '{sequence_no}'.",
+        "skid": {
+            "id": skid.id,
+            "skid_no": skid.skid_no,
+            "skid_type": skid.skid_type,
+            "skid_wgt": skid.skid_wgt,
+            "skid_capacity": skid.skid_capacity,
+            "is_active": skid.is_active,
+            "is_locked": skid.is_locked,
+            "locked_by": skid.locked_by_user_id,
+            "locked_at": skid.locked_at,
+            "is_virtual_used": skid.is_virtual_used,
+        },
+        "mapping": {
+            "id": mapping.id,
+            "awb_master_id": mapping.awb_master_id,
+            "is_virtual": mapping.is_virtual,
+            "virtual_skid_no": mapping.virtual_skid_no,
+            "created_at": mapping.created_at,
+            "scanned_count": len(sequences),
+            "current_location": current_location,
+            "sequences": [
+                {
+                    "id": s.id,
+                    "sequence_no": s.sequence_no,
+                    "sequence_date_time": s.sequence_date_time,
+                    "scan_by_device": s.scan_by_device,
+                    "scanned_by": s.scanned_by,
+                }
+                for s in sequences
+            ],
+        },
+        "awb": {
+            "id": awb.id,
+            "awb_no": awb.awb_no,
+            "pcs": awb.pcs,
+        } if awb else None,
     }
-
 
 async def assign_skid_to_location(
     db: AsyncSession,

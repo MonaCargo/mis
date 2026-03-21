@@ -2,7 +2,6 @@
 
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 from io import BytesIO
 from sqlalchemy.ext.asyncio import AsyncSession

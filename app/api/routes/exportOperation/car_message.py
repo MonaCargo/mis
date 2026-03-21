@@ -1,3 +1,4 @@
+from datetime import date
 from io import BytesIO
 from typing import Any
 
@@ -11,9 +12,11 @@ from app.db.models.exportOperation.car_message import ExportAwbSkidItemSequence,
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.session import get_db
-from app.services.exportOperation.car_message import save_export_car_message_awbs
+from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse
+from app.schemas.user import UserRead
+from app.services.exportOperation.car_message import create_flight_booking, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, get_available_awbs_for_flight_booking_dropdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, verify_uld_for_loading
 from app.utils.exportOperation.car_message import clean_car_message
-from app.utils.exportOperation.wh_inventry_pdf_data_extract import extract_inventory_pdf
+from app.utils.exportOperation.wh_inventry_pdf_data_extract import extract_export_inventory
 
 
 router = APIRouter(
@@ -135,7 +138,7 @@ async def process_export_car_message_file(
 @router.get("/search/by-awb", summary="Search AWB by exact match")
 async def search_awb(
     q: str = Query(..., min_length=1, description="AWB no to search"),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db)
 ):
     from collections import defaultdict
 
@@ -158,6 +161,7 @@ async def search_awb(
 
     if not row:
         return {"success": True, "message": "No records found.", "data": None}
+    
 
     awb = row.ExportCarMessageAwbMaster
     scanned_pcs = row.scanned_pcs
@@ -168,7 +172,7 @@ async def search_awb(
         .where(ExportAwbSkidItemSequence.awb_master_id == awb.id)
         .order_by(
             ExportAwbSkidItemSequence.mapping_id,
-            ExportAwbSkidItemSequence.sequence_date_time,
+            ExportAwbSkidItemSequence.sequence_no,
         )
     )
     seq_result = await db.execute(seq_stmt)
@@ -320,46 +324,266 @@ async def get_all_awb(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 # =========== ✌️ UPLOAD CAR message pdf wh inventry for fligh booking page ===================
 
-@router.post("/wh-inventry-pdf/upload-and-extract")
+@router.post("/wh-inventry-pdf/upload-extract-and-save")
 async def upload_inventory_pdf(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files allowed")
-    
-    contents = await file.read()
+
+    contents = await file.read()  # ← read once here
 
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large (Max 10MB)")
 
-    # Direct file-like object (best)
-    pdf_stream = file.file
-
-    df = extract_inventory_pdf(pdf_stream)
+    # ✅ Wrap already-read bytes in BytesIO — do NOT use file.file again
+    import io
+    df = extract_export_inventory(io.BytesIO(contents))
 
     if df.empty:
         raise HTTPException(status_code=400, detail="No valid records found")
-    
-    print("Service not defined now , first defined it ✌️✌️")
 
-    # inserted = await InventoryDBService.bulk_insert_inventory(db, df)
+    print(df.head(3))
+
+    result = await enrich_awb_from_wh_inventory(db, df)
+
 
     return {
-        "message": "PDF processed successfully | service not defined",
-        # "records_inserted": inserted
+        "success": True,
+        "message": "PDF processed successfully.",
+        "total_in_pdf":    result["total_in_pdf"],
+        "matched_updated": result["matched"],
+        "not_found_count": result["not_found_count"],
+        "not_found_awbs":  result["not_found"],
     }
+
+
+
+
+# ======✌️ Get those awb which is allowed to select in flight booking screen dropdown 
+@router.get(
+    "/flight-booking/available-awbs",
+    response_model=AvailableAwbForFlightBookingResponseList,
+    summary="AWBs available for flight booking",
+)
+async def get_available_awbs(
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        data =  await get_available_awbs_for_flight_booking_dropdown(
+            db=db,
+        )
+
+        return AvailableAwbForFlightBookingResponseList(
+            success=True,
+            message="Get all valid and availble awb for flight booking",
+            data = data
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+# ✌️======Create new flight booking =============== 
+@router.post(
+    "/flight-booking/create",
+    response_model=CreateFlightBookingResponse,
+    summary="Create a new flight booking",
+    status_code=201
+)
+async def create_booking(
+    payload: CreateFlightBookingRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user:UserRead= Depends(verify_token_and_get_user),
+):
+    
+    return await create_flight_booking(db=db, payload=payload, booked_by=current_user.emp_id)
+
+
+
+
+# Edit flight booking 
+@router.get(
+    "/flight-booking/by-flt-no-and-date",
+    response_model=FlightBookingByFlightResponse,
+    summary="Get flight booking by flight number and date",
+)
+async def get_booking_by_flight(
+    flight_no: str = Query(..., description="e.g. AI101"),
+    flight_date: date = Query(..., description="e.g. 2026-03-16"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_flight_booking_by_flight_no_and_date(
+        db=db,
+        flight_no=flight_no,
+        flight_date=flight_date,
+    )
+
+
+# ✌️ Edit flight booking--------=====
+@router.patch(
+    "/flight-booking/{header_id}/edit",
+    response_model=EditFlightBookingResponse,
+    summary="Edit an existing flight booking",
+)
+async def edit_booking(
+    header_id: int,
+    payload: EditFlightBookingRequest,
+    db: AsyncSession = Depends(get_db),
+     current_user:UserRead= Depends(verify_token_and_get_user),
+   
+):
+    return await edit_flight_booking(
+        db=db,
+        header_id=header_id,
+        payload=payload,
+        edited_by=current_user.emp_id,
+    )
+
+# =================== ✌️ ULD ASSIGNMENT ✌️ ========================================
+
+@router.get("/uld-assignment/uld-master", response_model=list[UldMasterResponse])
+async def get_uld_master(db: AsyncSession = Depends(get_db)):
+    return await get_uld_master_list(db=db)
+
+
+@router.get("/uld-assignment/uld-master/eligible-for-uld-assignment", response_model=list[UldMasterResponse])
+async def get_uld_master(db: AsyncSession = Depends(get_db)):
+    return await get_uld_master_list_eligeble_for_assignment(db=db)
+
+
+@router.get("/uld-assignment/by-flight", response_model=UldAssignmentDataResponse | None, description="GET CREATED ULD ASSIGNMENT BY FLIGHT NO. AND FLIGHT DATE")
+async def get_assignment_by_flight(
+    flight_no: str = Query(...),
+    flight_date: date = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_uld_assignment_by_flight(
+        db=db,
+        flight_no=flight_no,
+        flight_date=flight_date,
+    )
+
+
+@router.post("/uld-assignment/create", response_model=UldAssignmentResponse, status_code=201)
+async def create_assignment(
+    payload: CreateUldAssignmentRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user:UserRead= Depends(verify_token_and_get_user),
+):
+    
+    return await create_uld_assignment(db=db, payload=payload, assigned_by=current_user.emp_id)
+
+
+@router.patch("/uld-assignment/{assignment_id}/edit", response_model=UldAssignmentResponse)
+async def edit_assignment(
+    assignment_id: int,
+    payload: EditUldAssignmentRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user:UserRead= Depends(verify_token_and_get_user),
+):
+  
+    return await edit_uld_assignment(
+        db=db,
+        assignment_id=assignment_id,
+        payload=payload,
+        edited_by=current_user.emp_id,
+    )
+
+
+# ========================= ✌️ Skid retrival from location ==============================
+
+
+@router.get(
+"/flight-booking/get-all-flight/by-date",
+summary="Get all booked flights on a particular date",
+)
+async def get_flights_by_date_route(
+    flight_date: date = Query(..., description="e.g. 2026-03-16"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_flights_by_date(db=db, flight_date=flight_date)
+
+
+@router.get(
+    "/flight-booking/{header_id}/full-flight-detail",
+    summary="Get full flight detail — AWBs + skids + sequences + ULDs",
+)
+async def get_flight_full_detail_route(
+    header_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_flight_full_detail(db=db, header_id=header_id)
+
+@router.patch(
+    "/skid/retrieve",
+    summary="Retrieve skid from its current location by mapping id",
+)
+async def retrieve_skid(
+    payload: RetrieveSkidFromLocationRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+):
+    return await retrieve_skid_from_location(
+        db=db,
+        mapping_id=payload.mapping_id,
+        retrieved_by=current_user.emp_id,
+    )
+
+
+
+
+
+# ===============👌👌 EXPORT ULD/PALLET LOADING BY SCANNING SEQUENCE [LAST STEP OF PROCESS]====================
+
+# ── 1. Verify ULD ──────────────────────────────────────────
+@router.get(
+    "/flight/{flight_header_id}/uld-loading/verify-uld",
+    response_model=UldVerifyForLoadingResponse,
+    summary="Verify ULD belongs to flight before scanning",
+)
+async def verify_uld_for_loading_route(
+    flight_header_id: int,
+    uld_no: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await verify_uld_for_loading(db=db, flight_header_id=flight_header_id, uld_no=uld_no)
+
+
+# ── 2. Scan item into ULD ──────────────────────────────────
+@router.post(
+    "/flight/{flight_header_id}/uld-loading/scan-item",
+    response_model=ScanItemIntoUldResponse,
+    summary="Scan item barcode into selected ULD",
+    status_code=201,
+)
+async def scan_item_into_uld_route(
+    flight_header_id: int,
+    payload: ScanItemIntoUldRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await scan_item_into_uld(
+        db=db,
+        flight_header_id=flight_header_id,
+        payload=payload,
+        loaded_by=current_user.emp_id,
+    )
+
+
+# ── 3. Get loading status ──────────────────────────────────
+@router.get(
+    "/flight/{flight_header_id}/uld-loading/status",
+    response_model=FlightUldLoadingStatusResponse,
+    summary="Get ULD loading status for flight",
+)
+async def get_loading_status_route(
+    flight_header_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await get_flight_uld_loading_status(db=db, flight_header_id=flight_header_id)
