@@ -54,7 +54,7 @@ def parse_user_excel(file) -> list[dict]:
         users.append({
             "emp_id": emp_id,
             "name": name,
-            "role": "imp_gp_user"
+            "role": "exp_skd_cargo_loc_user"
         })
     
     print(df.head(10))

@@ -209,7 +209,7 @@ async def force_unlock_skid_route(
 @router.post(
     "/sequence/scan",
     response_model=ScanSequenceResponse,
-    status_code=status.HTTP_201_CREATED,
+    # status_code=status.HTTP_201_CREATED,
     summary="Scan and persist one item sequence — called on every individual scan",
 )
 async def scan_sequence_item_route(
