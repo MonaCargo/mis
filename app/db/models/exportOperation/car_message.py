@@ -24,6 +24,13 @@ class ExportCarMessageAwbMaster(Base):
             "idx_car_message_date_time_combo",
             "car_message_datetime_combo"
         ),
+
+         # ✅ Partial index — only indexes RCS rows, skips all null/other status rows
+    Index(
+        "idx_awb_rcs_status",
+        "status",
+        postgresql_where=(Column("status") == "RCS")
+    ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -54,6 +61,16 @@ class ExportCarMessageAwbMaster(Base):
 
     # ✅ UTC combo datetime
     car_message_datetime_combo = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True
+    )
+
+    # These fields come from pdf extraction
+    status = Column(String(50), nullable=True)
+    agent = Column(String(50), nullable=True)
+    vol_mc = Column(Float, nullable=True)
+    rcs_datetime = Column(
         DateTime(timezone=True),
         nullable=True,
         index=True
@@ -96,6 +113,9 @@ class ExportAwbSkidMapping(Base):
     is_virtual = Column(Boolean, default=False)
 
     is_skid_used_complete = Column(Boolean, nullable=False, default=False) 
+
+    mapped_by = Column(String(20), nullable=True)  # ✅ emp_id who linked skid to AWB
+    mapped_at  =  Column(DateTime(timezone=True), nullable=True) # when emp/user mapping created
 
     created_at = Column(DateTime(timezone=True),
                         server_default=func.now(),
@@ -207,6 +227,248 @@ class ExportSkidLocationMapping(Base):
     location = relationship("ExportLocationsMaster", backref="skid_mappings")
     awb = relationship("ExportCarMessageAwbMaster", backref="skid_locations")
     mapping = relationship("ExportAwbSkidMapping", backref="location_assignments")
+
+
+
+# ====================== ✌️✌️ FLIGHT BOOKING HEADER =========================================
+
+class ExportFlightBookingHeader(Base):
+    __tablename__ = "export_flight_booking_header"
+
+    __table_args__ = (
+        # Same flight not booked twice on same date
+        UniqueConstraint("flight_no", "flight_date", name="uq_flight_per_date"),
+        Index("idx_flight_header_date", "flight_date"),
+    )
+
+    id = Column(Integer, primary_key=True)
+
+    flight_no = Column(String(20), nullable=False)
+    flight_date = Column(Date, nullable=False)  # 😎 this is saved as ist date
+    flight_dpt_datetime = Column(DateTime(timezone=True), nullable=False)  # stored as UTC {b/c it have time}
+
+    booked_by = Column(String(20), nullable=False)      # emp_id
+    booked_at = Column(DateTime(timezone=True), nullable=False)
+
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    details = relationship("ExportFlightBookingDetail", backref="header")
+
+
+class ExportFlightBookingDetail(Base):
+    __tablename__ = "export_flight_booking_detail"
+
+    __table_args__ = (
+        # One AWB only once per flight header
+        UniqueConstraint("flight_header_id", "awb_master_id", name="uq_awb_per_flight"),
+        Index("idx_flight_detail_awb", "awb_master_id"),
+        # In ExportFlightBookingDetail.__table_args__
+    Index(
+        "idx_flight_detail_awb_header",
+        "awb_master_id",
+        "flight_header_id"       # covers the join to header for is_active check
+    ),
+
+    )
+
+    id = Column(Integer, primary_key=True)
+
+    flight_header_id = Column(
+        Integer,
+        ForeignKey("export_flight_booking_header.id"),
+        nullable=False
+    )
+
+    awb_master_id = Column(
+        Integer,
+        ForeignKey("export_car_message_awb_master.id"),
+        nullable=False
+    )
+
+    # Pcs being booked in THIS flight for this AWB
+    booked_pcs = Column(Integer, nullable=False)
+
+    awb = relationship("ExportCarMessageAwbMaster", backref="flight_details")
+
+
+
+# =======================✌️✌️  ULD BOOKING MODELS =================================
+
+class ExportUldAssignment(Base):
+    __tablename__ = "export_uld_assignment"
+
+    __table_args__ = (
+        # one active assignment per flight
+        UniqueConstraint("flight_header_id", name="uq_uld_assignment_per_flight"),
+        Index("idx_uld_assignment_flight", "flight_header_id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+
+    flight_header_id = Column(
+        Integer,
+        ForeignKey("export_flight_booking_header.id"),
+        nullable=False,
+    )
+
+    assigned_by = Column(String(20), nullable=False)
+    assigned_at = Column(DateTime(timezone=True), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    flight_header = relationship("ExportFlightBookingHeader", backref="uld_assignment")
+    details = relationship(
+        "ExportUldAssignmentDetail",
+        backref="assignment",
+        cascade="all, delete-orphan",
+    )
+
+class ExportUldAssignmentDetail(Base):
+    __tablename__ = "export_uld_assignment_detail"
+
+    __table_args__ = (
+        # same ULD not twice on same assignment
+        UniqueConstraint("assignment_id", "uld_id", name="uq_uld_per_assignment"),
+        Index("idx_uld_detail_assignment", "assignment_id"),
+        Index("idx_uld_detail_uld", "uld_id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+
+    assignment_id = Column(
+        Integer,
+        ForeignKey("export_uld_assignment.id"),
+        nullable=False,
+    )
+
+    uld_id = Column(
+        Integer,
+        ForeignKey("export_uld_master.id"),
+        nullable=False,
+    )
+
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    uld = relationship("ExportUldMaster", backref="assignment_details")
+
+
+
+# ============================= 👌 Skid base Mapping table ==================================
+
+class ExportSkidBaseMapping(Base):
+    __tablename__ = "export_skid_base_mapping"
+
+    __table_args__ = (
+        # ✅ one base drop per mapping session — not per skid
+        # mapping_id is unique per skid use (one AWB+skid session)
+        # so same skid can appear multiple times across different sessions
+        UniqueConstraint(
+            "mapping_id",
+            name="uq_skid_base_per_mapping"
+        ),
+
+        Index("idx_skid_base_mapping_id", "mapping_id"),
+        Index("idx_skid_base_skid_id", "skid_id"),
+        Index("idx_skid_base_awb", "awb_master_id"),
+        Index("idx_skid_base_base_id", "base_id"),
+        Index("idx_skid_base_dropped_at", "dropped_at"),
+    )
+
+    id = Column(Integer, primary_key=True)
+
+    # mapping id created based on skid and awb mapping
+    mapping_id = Column(
+        Integer,
+        ForeignKey("export_awb_skid_mapping.id"),
+        nullable=False,
+    )
+
+    skid_id = Column(
+        Integer,
+        ForeignKey("export_skid_master.id"),
+        nullable=False,
+    )
+
+    awb_master_id = Column(
+        Integer,
+        ForeignKey("export_car_message_awb_master.id"),
+        nullable=False,
+    )
+
+    base_id = Column(
+        Integer,
+        ForeignKey("export_base_master.id"),
+        nullable=False,
+    )
+
+    dropped_by = Column(String(20), nullable=False)
+    dropped_at = Column(DateTime(timezone=True), nullable=False)
+
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    # ── Relationships ──────────────────────────────────────────
+    mapping = relationship("ExportAwbSkidMapping", backref="base_mapping")
+    skid = relationship("ExportSkidMaster", backref="base_mappings")
+    awb = relationship("ExportCarMessageAwbMaster", backref="base_mappings")
+    base = relationship("ExportBaseMaster", backref="skid_mappings")
+
+
+
+
+# =========== ✌️✌️✌️PUT ON ULD / PALLET AFTER TAKING FROM BASE ===================================
+
+class ExportSequenceItemUldLoading(Base):
+    __tablename__ = "export_item_uld_loading"
+
+    __table_args__ = (
+        UniqueConstraint("sequence_id", name="uq_item_uld_loading"),
+        Index("idx_item_uld_flight", "flight_header_id"),
+        Index("idx_item_uld_detail", "uld_assignment_detail_id"),
+        Index("idx_item_uld_sequence", "sequence_id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+
+    flight_header_id = Column(
+        Integer,
+        ForeignKey("export_flight_booking_header.id"),
+        nullable=False,
+    )
+    uld_assignment_detail_id = Column(
+        Integer,
+        ForeignKey("export_uld_assignment_detail.id"),
+        nullable=False,
+    )
+    sequence_id = Column(
+        Integer,
+        ForeignKey("export_awb_skid_item_sequence.id"),
+        nullable=False,
+    )
+
+    # denormalized for fast lookup without joins
+    awb_master_id = Column(Integer, nullable=False)
+    mapping_id = Column(Integer, nullable=False)
+
+    loaded_by = Column(String(20), nullable=False)
+    loaded_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
