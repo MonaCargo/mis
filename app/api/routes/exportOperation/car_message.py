@@ -12,9 +12,9 @@ from app.db.models.exportOperation.car_message import ExportAwbSkidItemSequence,
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.session import get_db
-from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse
+from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse
 from app.schemas.user import UserRead
-from app.services.exportOperation.car_message import create_flight_booking, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, get_available_awbs_for_flight_booking_dropdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, verify_uld_for_loading
+from app.services.exportOperation.car_message import create_flight_booking, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, verify_uld_for_loading
 from app.utils.exportOperation.car_message import clean_car_message
 from app.utils.exportOperation.wh_inventry_pdf_data_extract import extract_export_inventory
 
@@ -160,7 +160,7 @@ async def search_awb(
     row = result.first()
 
     if not row:
-        return {"success": True, "message": "No records found.", "data": None}
+        return {"success": False, "message": "No records found.", "data": None}
     
 
     awb = row.ExportCarMessageAwbMaster
@@ -587,3 +587,63 @@ async def get_loading_status_route(
     current_user: UserRead = Depends(verify_token_and_get_user),
 ):
     return await get_flight_uld_loading_status(db=db, flight_header_id=flight_header_id)
+
+
+
+
+
+
+
+
+
+# ======================================= car message report related ====================
+
+
+@router.get(
+    "/flight-date-report",
+    summary="Download full flight report by date as Excel",
+)
+async def download_flight_date_report(
+    # flight_date: date = Query(..., description="e.g. 2026-03-20"),
+    from_date: date = Query(..., description="e.g. 2026-03-20"),
+    to_date: date = Query(..., description="e.g. 2026-03-25"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await generate_flight_date_report(db=db, from_date=from_date,to_date=to_date)
+
+
+
+
+
+@router.get(
+    "/dashboard/stats",
+    # response_model=DashboardStatsResponse,
+    summary="Get dashboard stats for a selected IST date",
+)
+async def get_dashboard_stats_route(
+    report_date: date = Query(..., description="IST date e.g. 2026-03-20"),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await get_car_message_dashboard_stats(db=db, report_date=report_date)
+
+
+
+@router.get(
+    "/dashboard/drilldown/detail",
+    summary="Get drilldown detail for a dashboard stat box",
+)
+async def get_dashboard_detail_route(
+    report_date: date = Query(..., description="IST date e.g. 2026-03-20"),
+    detail_type: str = Query(
+        ...,
+        description="all_awbs | rcs_awbs | non_rcs_awbs | scanned_awbs | used_skids"
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await get_dashboard_drilldown_detail(
+        db=db,
+        report_date=report_date,
+        detail_type=detail_type,
+    )

@@ -17,3 +17,4 @@ class ExportBaseMaster(Base):
     base_name = Column(String(50), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    created_by = Column(String(20), nullable=True)

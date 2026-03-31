@@ -52,6 +52,8 @@ class ExportSkidMaster(Base):
         nullable=False
     )
 
+    created_by = Column(String(20), nullable=True)
+
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False

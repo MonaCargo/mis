@@ -16,7 +16,7 @@ from app.db.models.exportOperation.car_message import (
 )
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
-from app.schemas.exportOperation.skid_master import ScanSequenceItemInput
+from app.schemas.exportOperation.skid_master import CreateSkidRequest, ScanSequenceItemInput
 from app.utils.common.helperFunction import get_utc_now
 
 # ─────────────────────────────────────────────
@@ -1859,3 +1859,55 @@ async def _get_current_location_mapping(
         )
     )
     return result.scalar_one_or_none()
+
+
+
+
+
+
+
+# ====== create new skid master entry
+
+async def create_new_skid_in_skid_master(
+    db: AsyncSession,
+    payload: CreateSkidRequest,
+    created_by: str,
+) -> dict:
+
+    now = get_utc_now()
+
+    # check duplicate skid_no
+    existing = await db.execute(
+        select(ExportSkidMaster.id).where(
+            ExportSkidMaster.skid_no == payload.skid_no
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Skid '{payload.skid_no}' already exists",
+        )
+
+    skid = ExportSkidMaster(
+        skid_no=payload.skid_no,
+        skid_type="real",           # ← fixed — physical only from this form
+        is_active=True,
+        is_locked=False,
+        is_virtual_used=True,       # real skid — always True
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(skid)
+    await db.commit()
+    await db.refresh(skid)
+
+    return {
+        "success": True,
+        "message": f"Skid '{skid.skid_no}' created successfully",
+        "data": {
+            "id": skid.id,
+            "skid_no": skid.skid_no,
+            "skid_type": skid.skid_type,
+            "is_active": skid.is_active,
+        },
+    }

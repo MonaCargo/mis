@@ -13,6 +13,7 @@ class ExportLocationsMaster(Base):
     loc = Column(String(50), nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True),nullable=False)
+    created_by = Column(String(20), nullable=True)
     
 
     __table_args__ = (

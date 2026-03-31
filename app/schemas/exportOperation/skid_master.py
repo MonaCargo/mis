@@ -2,7 +2,7 @@
 
 # =================================== ✌️✌️✌️✌️✌️✌️✌️ ==================================================
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Optional
 from datetime import datetime
 
@@ -297,3 +297,27 @@ class SkidInfoResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
+
+
+
+
+
+# Cretae new skid items in skid mstaer
+
+class CreateSkidRequest(BaseModel):
+    skid_no: str
+
+    @field_validator("skid_no")
+    @classmethod
+    def skid_no_not_empty(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("Skid number cannot be empty")
+        return v
+
+
+class CreateSkidResponse(BaseModel):
+    success: bool
+    message: str
+    data: dict

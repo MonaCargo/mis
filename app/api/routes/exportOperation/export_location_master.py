@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependency import verify_token_and_get_user
 from app.db.session import get_db
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
-from app.schemas.exportOperation.location_master import ValidateLocationResponse
+from app.schemas.exportOperation.location_master import CreateLocationRequest, ValidateLocationResponse
 from app.utils.common.helperFunction import get_utc_now
 from app.utils.exportOperation.export_location_master import clean_export_location_master
 
@@ -163,3 +163,67 @@ async def validate_location_route(
         db=db,
         location=location_val,
     )
+
+
+
+# Create New location items in export location master
+@router.post(
+    "/locations/create",
+    summary="Create a new export location",
+    status_code=201,
+)
+async def create_location_route(
+    payload: CreateLocationRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+):
+    created_by = current_user.emp_id
+    now = get_utc_now()
+
+    # check duplicate loc name
+    existing = await db.execute(
+        select(ExportLocationsMaster.id).where(
+            ExportLocationsMaster.loc == payload.loc
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Location '{payload.loc}' already exists",
+        )
+
+    # check duplicate area_code
+    existing_code = await db.execute(
+        select(ExportLocationsMaster.id).where(
+            ExportLocationsMaster.area_code == payload.area_code
+        )
+    )
+    if existing_code.scalar_one_or_none():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Area code '{payload.area_code}' already exists",
+        )
+
+    location = ExportLocationsMaster(
+        ops_type="EXPORT",
+        loc=payload.loc,
+        area_code=payload.area_code,
+        is_active=True,
+        created_at=now,
+        created_by=created_by,
+    )
+    db.add(location)
+    await db.commit()
+    await db.refresh(location)
+
+    return {
+        "success": True,
+        "message": f"Location '{location.loc}' created successfully",
+        "data": {
+            "id": location.id,
+            "loc": location.loc,
+            "area_code": location.area_code,
+            "ops_type": location.ops_type,
+            "is_active": location.is_active,
+        },
+    }
