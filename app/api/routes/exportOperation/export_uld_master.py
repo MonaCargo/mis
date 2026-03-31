@@ -88,14 +88,17 @@
 
 
 
+from sqlalchemy import select
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
+from app.core.dependency import verify_token_and_get_user
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.db.session import get_db
+from app.schemas.exportOperation.location_master import CreateUldRequest
 from app.utils.common.helperFunction import get_utc_now
 from app.utils.exportOperation.export_uld_master_cleaner import parse_uld_excel
 
@@ -154,4 +157,46 @@ async def upload_uld_excel(
         "inserted": result["inserted"],
         "skipped_duplicates": result["skipped"],
         "total_rows_processed": result["total"],
+    }
+
+
+
+@router.post(
+    "/new-uld/create",
+    summary="Create a new ULD",
+    status_code=201,
+)
+async def create_uld(
+    payload: CreateUldRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+):
+    # check duplicate
+    existing = await db.execute(
+        select(ExportUldMaster).where(ExportUldMaster.uld_no == payload.uld_no.strip().upper())
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail=f"ULD '{payload.uld_no}' already exists")
+
+    now = get_utc_now()
+    uld = ExportUldMaster(
+        uld_no=payload.uld_no.strip().upper(),
+        carrier=payload.carrier.strip().upper(),
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+        created_by=current_user.emp_id, 
+    )
+    db.add(uld)
+    await db.commit()
+    await db.refresh(uld)
+
+    return {
+        "success": True,
+        "message": f"ULD '{uld.uld_no}' created successfully",
+        "data": {
+            "uld_id": uld.id,
+            "uld_no": uld.uld_no,
+            "carrier": uld.carrier,
+        }
     }

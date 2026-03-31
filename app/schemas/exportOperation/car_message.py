@@ -398,3 +398,39 @@ class FlightUldLoadingStatusResponse(APIResponseBase):
     ulds: list[UldLoadingStatusItem]
     awbs: list[AwbLoadingStatusItem]
     all_sequences: list[SequenceWithLoadingStatus]   # ← ADD {all included which load in uld or not {all to attahed with that flights}}
+
+
+
+
+
+
+    # ============================== DASHBOAERD SUMMARY SCHEMA ==============================
+
+class AwbDaySummary(BaseModel):
+    total_awbs: int
+    total_pcs: int
+    total_gross_wt: float | None
+
+class ScanningDaySummary(BaseModel):
+    # same day AWBs scanning
+    scanned_awbs: int
+    scanned_pcs: int
+    unscanned_awbs: int
+    unscanned_pcs: int
+    # other day AWBs scanned on selected date
+    others_scanned_awbs: int
+    others_scanned_pcs: int
+
+class SkidDaySummary(BaseModel):
+    total_skids_used: int
+    skids_at_location: int
+    skids_not_at_location: int
+
+class DashboardStatsResponse(APIResponseBase):
+    date: date
+    awb_summary: AwbDaySummary
+    scanning_summary: ScanningDaySummary
+    skid_summary: SkidDaySummary
+
+
+

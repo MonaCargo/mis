@@ -18,6 +18,7 @@ class ExportCarrierMaster(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    created_by = Column(String(20), nullable=True)
 
     pfx_list = relationship("ExportCarrierPfx", backref="carrier")
 
