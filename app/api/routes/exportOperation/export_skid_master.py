@@ -17,6 +17,7 @@ from app.utils.exportOperation.export_skid_master_cleaner import clean_export_sk
 from app.db.session import get_db
 from app.services.exportOperation.skid_master import (
     assign_skid_to_location,
+    create_new_skid_in_skid_master,
     delete_sequence_item,
     force_unlock_skid,
     generate_virtual_skid,
@@ -29,6 +30,7 @@ from app.services.exportOperation.skid_master import (
 from app.schemas.exportOperation.skid_master import (
     AssignLocationRequest,
     AssignLocationResponse,
+    CreateSkidRequest,
     DeleteSequenceResponse,
     ForceUnlockResponse,
     GenerateVirtualSkidResponse,
@@ -381,3 +383,18 @@ async def relocate_skid(
         db=db,
     )
 
+
+
+
+@router.post(
+    "/skids/create",
+    summary="Create a new physical skid",
+    status_code=201,
+)
+async def create_skid_route(
+    payload: CreateSkidRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+):
+    created_by = current_user.emp_id
+    return await create_new_skid_in_skid_master(db=db, payload=payload, created_by=created_by)
