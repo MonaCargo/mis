@@ -41,3 +41,10 @@ class ExportUldMaster(Base):
         DateTime(timezone=True),
         nullable=False
     )
+
+    # ULD type (e.g. PMC, PAG, AKE) — sourced from PDF, updated on every sync
+    uld_type = Column(String(10), nullable=True)
+
+    is_available = Column(Boolean, default=True, nullable=False)
+
+    updated_by = Column(String(50), nullable=True)

@@ -1,6 +1,6 @@
 # models/export_car_message_awb_master.py
 
-from sqlalchemy import Boolean, Column, Date, ForeignKey, Integer, String, DateTime, Float, UniqueConstraint,Index
+from sqlalchemy import Boolean, Column, Date, ForeignKey, Integer, String, DateTime, Float, Text, UniqueConstraint,Index
 from sqlalchemy.sql import func
 from app.db.base import Base
 from sqlalchemy.orm import relationship
@@ -37,8 +37,8 @@ class ExportCarMessageAwbMaster(Base):
 
     awb_no = Column(String(11), index=True, nullable=False)
 
-    origin = Column(String(10), nullable=False)
-    destination = Column(String(10), nullable=False)
+    origin = Column(String(10), nullable=True)
+    destination = Column(String(10), nullable=True)
 
     sb_no = Column(String(50), nullable=True)
     sb_date = Column(DateTime, nullable=True)
@@ -76,7 +76,24 @@ class ExportCarMessageAwbMaster(Base):
         index=True
     )
 
+    # This is set to true when AWB is marked for ultra-fast processing (bypassing some normal checks and flows)
+    is_ultra_fast = Column(Boolean, nullable=False, default=False)
 
+
+    is_ultra_fast_marked_by = Column(String(20), nullable=True)  # emp_id of user who marked this AWB as ultra-fast, null if not marked or auto-marked
+    is_ultra_fast_marked_at = Column(DateTime(timezone=True), nullable=True)
+
+
+    is_manually_created= Column(Boolean, nullable=False, default=False)  # True if created manually via API, False if created via PDF upload
+    manual_created_by = Column(String(20), nullable=True)  # emp_id of user who manually created this AWB, null if created via PDF upload
+
+    remarks = Column(Text, nullable=True)  # any manual remarks or notes about this AWB
+
+    manual_creation_remarks = Column(Text, nullable=True)  # remarks specifically for manually created AWBs (e.g. reason for manual creation)
+
+    manual_pcs = Column(Integer, nullable=True)  # manually entered pcs count (if any)
+    
+    
     created_at = Column(DateTime(timezone=True),nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
  
@@ -367,9 +384,16 @@ class ExportSkidBaseMapping(Base):
         # ✅ one base drop per mapping session — not per skid
         # mapping_id is unique per skid use (one AWB+skid session)
         # so same skid can appear multiple times across different sessions
+        # UniqueConstraint(
+        #     "mapping_id",
+        #     name="uq_skid_base_per_mapping"
+        # ),
+
+        #🤢 Now allows multiple base drops per mapping (one per cycle)
         UniqueConstraint(
             "mapping_id",
-            name="uq_skid_base_per_mapping"
+            "cycle_no",
+            name="uq_skid_base_per_mapping_cycle"
         ),
 
         Index("idx_skid_base_mapping_id", "mapping_id"),
@@ -410,6 +434,9 @@ class ExportSkidBaseMapping(Base):
     dropped_at = Column(DateTime(timezone=True), nullable=False)
 
     created_at = Column(DateTime(timezone=True), nullable=False)
+
+     #🤢 ✅ ADD — cycle number for repeated base drops on same mapping
+    cycle_no = Column(Integer, nullable=False, default=1)
 
     # ── Relationships ──────────────────────────────────────────
     mapping = relationship("ExportAwbSkidMapping", backref="base_mapping")

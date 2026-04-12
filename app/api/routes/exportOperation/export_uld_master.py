@@ -88,19 +88,25 @@
 
 
 
+import io
+
+import pandas as pd
 from sqlalchemy import select
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
 from app.core.dependency import verify_token_and_get_user
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.db.session import get_db
+from app.schemas.exportOperation.car_message import UldStockRecord, UldStockSyncResponse
 from app.schemas.exportOperation.location_master import CreateUldRequest
+from app.services.exportOperation.uld_master_service import MultipleCarriersError, UldStockSyncService
 from app.utils.common.helperFunction import get_utc_now
 from app.utils.exportOperation.export_uld_master_cleaner import parse_uld_excel
+from app.utils.exportOperation.extract_uld_inventry_pdf import extract_uld_stock
 
 
 router = APIRouter(prefix="/export-uld", tags=["Export ULD Master"])
@@ -200,3 +206,98 @@ async def create_uld(
             "carrier": uld.carrier,
         }
     }
+
+
+
+    # ======================== 🤢🤮
+
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+@router.post(
+"/upload-and-sync-by-inventry-pdf",
+response_model=UldStockSyncResponse,
+status_code=status.HTTP_200_OK,
+summary="Upload ULD stock PDF and sync to database",
+description=(
+    "Accepts a ULD stock PDF, extracts all ULD records from it, "
+    "then upserts them into export_uld_master. "
+    "Existing ULDs are marked available and refreshed. "
+    "New ULDs are created. ULDs not in this PDF are left untouched."
+),
+responses={
+    200: {"description": "PDF processed and database synced successfully"},
+    400: {"description": "Invalid file, empty PDF, or mixed carriers"},
+    413: {"description": "File exceeds 10 MB limit"},
+    500: {"description": "Unexpected error during extraction or sync"},
+},
+)
+async def upload_and_sync_uld_stock(
+    db: AsyncSession = Depends(get_db),
+    file: UploadFile = File(...),
+    current_user = Depends(verify_token_and_get_user),
+) -> UldStockSyncResponse:
+
+    # ── 1. Validate file type ─────────────────────────────────────────────────
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF files are allowed.",
+        )
+
+    # ── 2. Read & validate file size ──────────────────────────────────────────
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="File too large. Maximum allowed size is 10 MB.",
+        )
+
+
+    # ── 3. Extract records from PDF ───────────────────────────────────────────
+    try:
+        df = extract_uld_stock(io.BytesIO(contents))
+    except Exception as exc:
+      
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to extract data from the PDF.",
+        ) from exc
+
+    if df.empty:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid ULD records found in the uploaded PDF.",
+        )
+
+    
+
+    # ── 4. Convert DataFrame rows → UldStockRecord objects ────────────────────
+    records: list[UldStockRecord] = []
+    for row in df.where(pd.notnull(df), None).to_dict(orient="records"):
+        # Normalize datetime/Timestamp fields to ISO strings for Pydantic
+        normalized = {
+            k: v.isoformat() if hasattr(v, "isoformat") else v
+            for k, v in row.items()
+        }
+        records.append(UldStockRecord(**normalized))
+
+    # ── 5. Sync into DB ───────────────────────────────────────────────────────
+    service = UldStockSyncService(db=db)
+
+    try:
+        response = await service.sync(
+            records=records,
+            synced_by= current_user.emp_id,  # pass the employee ID of the authenticated user
+        )
+    except MultipleCarriersError as exc:
+       
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+       
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during ULD stock synchronization.",
+        ) from exc
+    return response

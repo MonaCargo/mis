@@ -1,8 +1,10 @@
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
+import io
+import math
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Depends
+from fastapi import APIRouter, Form, HTTPException, Query, UploadFile, File, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,10 +14,12 @@ from app.db.models.exportOperation.car_message import ExportAwbSkidItemSequence,
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.session import get_db
-from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse
+from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, AwbLookupError, AwbManualCreateRequest, AwbManualCreateResponse, CreateFlightBookingFromPdfResponse, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse, UltraFastScanRequest
 from app.schemas.user import UserRead
-from app.services.exportOperation.car_message import create_flight_booking, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, verify_uld_for_loading
+from app.services.exportOperation.base_master import ultra_fast_scan_and_load
+from app.services.exportOperation.car_message import create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, upsert_flight_booking_from_pdf, verify_uld_for_loading
 from app.utils.exportOperation.car_message import clean_car_message
+from app.utils.exportOperation.extract_flight_planning_data import extract_flight_planning
 from app.utils.exportOperation.wh_inventry_pdf_data_extract import extract_export_inventory
 
 
@@ -233,6 +237,8 @@ async def search_awb(
             "awb_no": awb.awb_no,
             "origin": awb.origin,
             "destination": awb.destination,
+            "is_ultra_fast": getattr(awb, "is_ultra_fast", False),
+            "is_manually_created": getattr(awb, "is_manually_created", False),
             "sb_no": awb.sb_no,
             "sb_date": awb.sb_date,
             "hwb_no": awb.hwb_no,
@@ -241,6 +247,8 @@ async def search_awb(
             "chg_wt": awb.chg_wt,
             "nog": awb.nog,
             "shc": awb.shc,
+            "remarks": awb.remarks,
+            "manual_creation_remarks": awb.manual_creation_remarks,
             "car_msg_date": awb.car_msg_date,
             "car_msg_time": awb.car_msg_time,
             "car_message_datetime_combo": awb.car_message_datetime_combo,
@@ -317,6 +325,52 @@ async def get_all_awb(
             for r in rows
         ],
     }
+
+
+# 🤢 Get all awb of car message based on date filter status feature ....
+@router.get("/awb-data-with-paginatoin", summary="Get AWB master records with filters and pagination")
+async def get_awb_data(
+    startDate: str = Query(..., example="2026-01-24"),
+    endDate: str = Query(..., example="2026-01-24"),
+    status: str = Query("all", example="all"),  # all | rcs | not_rcs
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=501),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    """
+    Get AWB master records filtered by date range and status (paginated).
+    status options: all | rcs | not_rcs
+    """
+    records, total = await get_awb_data_filtered(
+        db=db,
+        start_date=startDate,
+        end_date=endDate,
+        status=status,
+        page=page,
+        page_size=page_size,
+    )
+
+    total_pages = math.ceil(total / page_size) if total else 1
+
+    pagination = {
+        "current_page": page,
+        "page_size": page_size,
+        "total_records": total,
+        "total_pages": total_pages,
+        "has_previous": page > 1,
+        "has_next": page < total_pages,
+        "previous_page": page - 1 if page > 1 else None,
+        "next_page": page + 1 if page < total_pages else None,
+    }
+
+    return {
+        "success": True,
+        "message": f"{total} record(s) found.",
+        "pagination": pagination,
+        "data": records,
+    }
+
 
 
 
@@ -567,6 +621,7 @@ async def scan_item_into_uld_route(
     db: AsyncSession = Depends(get_db),
     current_user: UserRead = Depends(verify_token_and_get_user),
 ):
+    print(f"Received scan request: flight_header_id={flight_header_id}, payload={payload}")
     return await scan_item_into_uld(
         db=db,
         flight_header_id=flight_header_id,
@@ -646,4 +701,271 @@ async def get_dashboard_detail_route(
         db=db,
         report_date=report_date,
         detail_type=detail_type,
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ========================================= Flight booking by pdf ==========================
+# @router.post(
+#     "/create-flight-from-pdf-upload",
+#     response_model=CreateFlightBookingFromPdfResponse,
+#     summary="Create flight booking by uploading the planning PDF",
+#     status_code=201,
+# )
+# async def create_booking_from_pdf_upload(
+#     pdf_file: UploadFile = File(..., description="Export Planning Report PDF"),
+#     flight_dpt_datetime: datetime = Form(
+#         ...,
+#         description="Departure datetime in IST. e.g. 2026-04-02T22:30:00",
+#     ),
+#     db: AsyncSession = Depends(get_db),
+#     current_user: UserRead = Depends(verify_token_and_get_user),
+# ):
+#     # ── Step 1: validate file type ────────────────────────────────────────
+#     if pdf_file.content_type not in ("application/pdf", "application/octet-stream"):
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Uploaded file must be a PDF.",
+#         )
+ 
+#     # ── Step 2: read bytes and run OCR extraction ─────────────────────────
+#     pdf_bytes = await pdf_file.read()
+#     if not pdf_bytes:
+#         raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
+ 
+#     try:
+#         df = extract_flight_planning(io.BytesIO(pdf_bytes))
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=422,
+#             detail=f"PDF extraction failed: {str(e)}",
+#         )
+ 
+#     if df.empty:
+#         raise HTTPException(
+#             status_code=422,
+#             detail="No AWB records could be extracted from the PDF. "
+#                    "Check that the file is a valid Export Planning Report.",
+#         )
+ 
+#     # ── Step 3: pull flight-level fields (same value on every row) ────────
+#     flight_no   = df["FLIGHT_NUM"].iloc[0]
+#     flight_date = df["FLIGHT_DATE"].iloc[0]     # already a date object after extraction
+ 
+#     if not flight_no:
+#         raise HTTPException(status_code=422, detail="Could not extract Flight Number from PDF.")
+#     if not flight_date:
+#         raise HTTPException(status_code=422, detail="Could not extract Flight Date from PDF.")
+ 
+#     # ── Step 4: deduplicate AWB numbers ───────────────────────────────────
+#     # The same AWB appears on multiple rows in the PDF (one per location/ULD).
+#     # We collapse to unique AWB numbers — pcs come from the DB, not the PDF.
+#     unique_awb_nos: list[str] = (
+#         df["AWB_NUM"]
+#         .dropna()
+#         .drop_duplicates()
+#         .tolist()
+#     )
+ 
+#     if not unique_awb_nos:
+#         raise HTTPException(
+#             status_code=422,
+#             detail="No valid AWB numbers found in the extracted PDF data.",
+#         )
+ 
+#     # ── Step 5: bulk-fetch AWB master records ─────────────────────────────
+#     result = await db.execute(
+#         select(
+#             ExportCarMessageAwbMaster.id,
+#             ExportCarMessageAwbMaster.awb_no,
+#             ExportCarMessageAwbMaster.pcs,
+#         ).where(ExportCarMessageAwbMaster.awb_no.in_(unique_awb_nos))
+#     )
+#     db_awb_map = {row.awb_no: row for row in result.mappings().all()}
+ 
+#     # ── Step 6: resolve awb_no → AwbBookingItem (book ALL pcs) ───────────
+#     not_found: list[AwbLookupError] = []
+#     awb_items: list[FlightBookingAwbItem] = []
+ 
+#     for awb_no in unique_awb_nos:
+#         db_row = db_awb_map.get(awb_no)
+ 
+#         if not db_row:
+#             not_found.append(AwbLookupError(
+#                 awb_no=awb_no,
+#                 reason="Not found in export_car_message_awb_master",
+#             ))
+#             continue
+ 
+#         if not db_row.pcs:
+#             not_found.append(AwbLookupError(
+#                 awb_no=awb_no,
+#                 reason="AWB has no pcs recorded — cannot book",
+#             ))
+#             continue
+ 
+#         awb_items.append(FlightBookingAwbItem(
+#             awb_master_id=db_row.id,
+#             booked_pcs=db_row.pcs,      # always book full pcs from DB
+#         ))
+ 
+#     if not awb_items:
+#         raise HTTPException(
+#             status_code=400,
+#             detail={
+#                 "message": "None of the AWBs from the PDF exist in the database.",
+#                 "not_found_awbs": [e.model_dump() for e in not_found],
+#             },
+#         )
+ 
+#     # ── Step 7: build standard request and delegate to existing service ───
+#     booking_request = CreateFlightBookingRequest(
+#         flight_no=flight_no,
+#         flight_date=flight_date,
+#         flight_dpt_datetime=flight_dpt_datetime,
+#         awbs=awb_items,
+#     )
+
+#     print("Booking request constructed from PDF:", booking_request)
+
+#     # return {
+#     #     "success": True,
+#     #     "message": "Flight booking created from PDF. See 'booking' for details. "
+#     #                "Any AWBs that could not be processed are listed in 'not_found_awbs'.",
+#     # }
+ 
+#     booking_result = await create_flight_booking(
+#         db=db,
+#         payload=booking_request,
+#         booked_by=current_user.emp_id,
+#     )
+ 
+#     return CreateFlightBookingFromPdfResponse(
+#           success=True,                                          # ← add
+#     message="Flight booking created successfully from PDF.",  # ← add
+#         booking=booking_result,
+#         not_found_awbs=not_found,
+#     )
+ 
+
+
+
+
+@router.post(
+    "/create-flight-from-pdf-upload",
+    response_model=PdfUpsertResponse,
+    summary="Create or update flight booking by uploading the planning PDF",
+    status_code=200,
+)
+async def create_booking_from_pdf_upload(
+    pdf_file: UploadFile = File(...),
+    # flight_dpt_datetime: datetime = Form(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    if pdf_file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be a PDF.")
+
+    pdf_bytes = await pdf_file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
+
+    try:
+        df = extract_flight_planning(io.BytesIO(pdf_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"PDF extraction failed: {str(e)}")
+
+    if df.empty:
+        raise HTTPException(
+            status_code=422,
+            detail="No AWB records could be extracted from the PDF.",
+        )
+
+    return await upsert_flight_booking_from_pdf(
+        db=db,
+        df=df,
+        # flight_dpt_datetime=flight_dpt_datetime,
+        booked_by=current_user.emp_id,
+    )
+
+
+
+
+
+
+# ========= ultra fast process 🤢 ============
+
+# ── Mark AWB ultra-fast ────────────────────────────────────────
+@router.patch(
+    "/awb/{awb_master_id}/mark-ultra-fast",
+    summary="Mark or unmark AWB as ultra-fast",
+)
+async def mark_awb_ultra_fast_route(
+    awb_master_id: int,
+    is_ultra_fast: bool = Query(...),
+    remarks: str | None = Query(
+        None,
+        description="Remarks for marking ultra-fast (required if is_ultra_fast=true)",
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    # print(f"mark_awb_ultra_fast_route called with: awb_master_id={awb_master_id}, is_ultra_fast={is_ultra_fast}, remarks={remarks}")
+    return await mark_awb_ultra_fast(
+        db=db,
+        awb_master_id=awb_master_id,
+        is_ultra_fast=is_ultra_fast,
+        marked_by=current_user.emp_id,
+        remarks=remarks 
+    )
+
+
+# ── Ultra-fast ULD scan ────────────────────────────────────────
+@router.post(
+    "/uld-loading/{flight_header_id}/ultra-fast-scan",
+    summary="Scan barcodes directly into ULD for ultra-fast AWB",
+)
+async def ultra_fast_scan_route(
+    flight_header_id: int,
+    payload: UltraFastScanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await ultra_fast_scan_and_load(
+        db=db,
+        flight_header_id=flight_header_id,
+        uld_assignment_detail_id=payload.uld_assignment_detail_id,
+        awb_master_id=payload.awb_master_id,
+        sequence_nos=payload.sequence_nos,
+        loaded_by=current_user.emp_id,
+    )
+
+
+
+# ====================== Manual awb creation ===========
+@router.post(
+    "/awb/manual-create",
+    response_model=AwbManualCreateResponse,
+    status_code=201,
+    summary="Create AWB manually",
+)
+async def create_manual_awb(
+    payload: AwbManualCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    return await create_manual_awb_service(
+        db=db,
+        data=payload,
+        emp_id=current_user.emp_id,
     )

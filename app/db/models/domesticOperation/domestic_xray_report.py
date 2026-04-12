@@ -56,6 +56,8 @@ class DomesticXray(Base):
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False )
 
+    is_processing = Column(Boolean, default=False, nullable=False, server_default='false')
+
 # Create indexes
 Index('idx_awb_no_domestic_xray', DomesticXray.awb_no)
 # Index('idx_cosys_report_date_domestic_xray', DomesticXray.cosys_report_date)

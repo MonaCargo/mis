@@ -181,6 +181,12 @@ class MappingInfo(BaseModel):
     current_location: Optional[str] = None
     sequences: list[SequenceItem] = []
 
+    loaded_count: int
+    remaining_pcs: int
+    is_fully_loaded: bool
+    is_at_base: bool
+    allowed_action: str
+
 
 class AwbInfo(BaseModel):
     id: int
@@ -271,6 +277,13 @@ class SkidInfoMappingDetail(BaseModel):
     current_location: Optional[str] = None          # ← added
     sequences: List[SkidInfoSequenceDetail] = []    # ← added
 
+      # 🔥 ADD THESE
+    loaded_count: int
+    remaining_pcs: int
+    is_fully_loaded: bool
+    is_at_base: bool
+    allowed_action: str
+
     class Config:
         from_attributes = True
 
@@ -321,3 +334,14 @@ class CreateSkidResponse(BaseModel):
     success: bool
     message: str
     data: dict
+
+
+
+
+
+
+
+class RelocateRequest(BaseModel):
+    location_id: int
+    mapping_id: Optional[int] = None
+    relocation_from_base: bool = False
