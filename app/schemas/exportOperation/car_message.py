@@ -1,6 +1,8 @@
 # schemas/export_car_message_awb.py
 
-from pydantic import BaseModel, field_validator
+
+
+from pydantic import BaseModel, Field, field_validator
 from datetime import date, datetime
 from typing import Optional
 
@@ -41,13 +43,15 @@ class ExportCarMessageAwbResponse(ExportCarMessageAwbCreate):
 class AvailableAwbForFlightBookingResponse(BaseModel):
     awb_master_id: int
     awb_no: str
-    origin: str
-    destination: str
+    origin: Optional[str]
+    destination: Optional[str]
     total_pcs: int
     booked_pcs: int
-    remaining_pcs: int
+    scanned_pcs: int        # ✅ NEW
+    remaining_pcs: int      # now = scanned_pcs - booked_pcs
     agent: Optional[str] = None
     rcs_datetime: Optional[datetime] = None
+    is_ultra_fast: bool = False    # ← ADD — frontend uses for tag
 
     class Config:
         from_attributes = True   # Pydantic v2
@@ -154,14 +158,18 @@ class FlightBookingDetailWithAwbResponse(BaseModel):
     detail_id: int
     awb_master_id: int
     awb_no: str
-    origin: str
-    destination: str
+    origin: Optional[str]
+    destination: Optional[str]
     total_pcs: int
     booked_pcs: int                    # booked in THIS flight
     booked_in_other_flights: int       # booked in other flights
     remaining_pcs: int                 # available across all flights
     agent: Optional[str] = None
     rcs_datetime: Optional[datetime] = None
+
+    scanned_pcs: int = 0
+    is_ultra_fast: bool = False
+
     class Config:
         from_attributes = True   # Pydantic v2
 
@@ -362,6 +370,8 @@ class AwbLoadingStatusItem(BaseModel):
     booked_pcs: int
     loaded_pcs: int
     pending_pcs: int
+    is_manually_created: bool = False   # ← ADD
+    is_ultra_fast: bool = False        # ← ADD
 
 class SequenceWithLoadingStatus(BaseModel):
     sequence_id: int
@@ -434,3 +444,148 @@ class DashboardStatsResponse(APIResponseBase):
 
 
 
+# =============== pdf flight creation=============
+class AwbLookupError(BaseModel):
+    awb_no: str
+    reason: str
+ 
+ 
+class CreateFlightBookingFromPdfResponse(APIResponseBase):
+    booking: CreateFlightBookingResponse
+    not_found_awbs: list[AwbLookupError] = []
+ 
+
+# --------------
+
+
+class AwbLookupError(BaseModel):
+    awb_no: str
+    reason: str
+
+
+class AwbChangeRecord(BaseModel):
+    awb_no: str
+    action: str          # "ADDED" | "REMOVED" | "PCS_UPDATED" | "SKIPPED" | "UNCHANGED"
+    reason: str
+    old_pcs: Optional[int] = None
+    new_pcs: Optional[int] = None
+    scanning_started: bool = False
+
+
+class PdfUpsertResponse(BaseModel):
+    success: bool
+    message: str
+    flight_no: str
+    flight_date: str
+    is_new_flight: bool
+
+    # Change summary
+    total_awbs_in_pdf: int
+    added: list[AwbChangeRecord]
+    removed: list[AwbChangeRecord]
+    updated: list[AwbChangeRecord]
+    skipped: list[AwbChangeRecord]
+    unchanged: list[AwbChangeRecord]
+    not_found_in_db: list[AwbLookupError]
+
+    # Counts
+    added_count: int
+    removed_count: int
+    updated_count: int
+    skipped_count: int
+    unchanged_count: int
+    not_found_count: int
+
+
+
+
+
+class UltraFastScanRequest(BaseModel):
+    uld_assignment_detail_id: int
+    awb_master_id: int
+    sequence_nos: list[str]
+
+class AwbManualCreateRequest(BaseModel):
+    awb_no: str 
+    pcs: int
+    manual_creation_remarks: Optional[str] = None
+
+class AwbManualCreateResponse(BaseModel):
+    success: bool
+    message: str
+    awb_id: int
+    awb_no: str
+    is_ultra_fast: bool
+    is_manually_created: bool
+    manual_pcs: int
+
+
+
+
+
+    # ============================== 🤢ULD STOCK PDF EXTRACTION SCHEMA ==============================
+
+    # ── Inbound ───────────────────────────────────────────────────────────────────
+
+class UldStockRecord(BaseModel):
+    """Single ULD record as returned by the PDF extractor."""
+
+    SL_NO: Optional[int] = Field(None, description="Serial number from the PDF")
+    ULD_TYPE: Optional[str] = Field(None, max_length=10)
+    ULD_NUMBER: str = Field(..., min_length=5, max_length=25)
+    CARRIER: str = Field(..., min_length=1, max_length=20)
+    DATETIME: Optional[datetime] = None
+    SOURCE_FILE: Optional[str] = Field(None, max_length=255)
+    EXTRACTED_AT: Optional[datetime] = None
+
+    @field_validator("ULD_NUMBER", "CARRIER", mode="before")
+    @classmethod
+    def strip_upper(cls, v: str) -> str:
+        return v.strip().upper() if isinstance(v, str) else v
+
+
+class UldStockSyncRequest(BaseModel):
+    """Full payload posted to the sync endpoint."""
+
+    records: list[UldStockRecord] = Field(
+        ...,
+        min_length=1,
+        description="Extracted ULD records from the PDF",
+    )
+
+    @field_validator("records")
+    @classmethod
+    def no_duplicate_uld_numbers(
+        cls, records: list[UldStockRecord]
+    ) -> list[UldStockRecord]:
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for r in records:
+            if r.ULD_NUMBER in seen:
+                duplicates.add(r.ULD_NUMBER)
+            seen.add(r.ULD_NUMBER)
+        if duplicates:
+            raise ValueError(
+                f"Duplicate ULD numbers in payload: {', '.join(sorted(duplicates))}"
+            )
+        return records
+
+
+# ── Outbound ──────────────────────────────────────────────────────────────────
+
+class UldSyncResult(BaseModel):
+    """Per-ULD outcome reported in the response."""
+
+    uld_number: str
+    action: str  # "created" | "updated"
+
+
+class UldStockSyncResponse(BaseModel):
+    """Response returned after a successful sync."""
+
+    success: bool = True
+    carrier: str
+    total_received: int
+    total_created: int
+    total_updated: int
+    results: list[UldSyncResult]
