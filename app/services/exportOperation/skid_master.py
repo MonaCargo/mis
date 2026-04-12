@@ -11,6 +11,7 @@ from app.db.models.exportOperation.car_message import (
     ExportCarMessageAwbMaster,
     ExportAwbSkidMapping,
     ExportAwbSkidItemSequence,
+    ExportSequenceItemUldLoading,
     ExportSkidBaseMapping,
     ExportSkidLocationMapping,
 )
@@ -1095,73 +1096,82 @@ async def get_skid_by_sequence(
                 "Please scan the skid barcode in Normal mode."
             ),
         )
+    
+    # ------======-----===-------
 
-    # ── Get AWB master ────────────────────────────────────────────
-    awb = await _get_awb_master(db, item.awb_master_id)
+    # # ── Get AWB master ────────────────────────────────────────────
+    # awb = await _get_awb_master(db, item.awb_master_id)
 
-    # ── Get ALL sequences for this mapping (replaces _get_sequence_count) ──
-    seq_result = await db.execute(
-        select(ExportAwbSkidItemSequence)
-        .where(ExportAwbSkidItemSequence.mapping_id == mapping.id)
-        .order_by(ExportAwbSkidItemSequence.sequence_date_time.asc())
+    # # ── Get ALL sequences for this mapping (replaces _get_sequence_count) ──
+    # seq_result = await db.execute(
+    #     select(ExportAwbSkidItemSequence)
+    #     .where(ExportAwbSkidItemSequence.mapping_id == mapping.id)
+    #     .order_by(ExportAwbSkidItemSequence.sequence_date_time.asc())
+    # )
+    # sequences = seq_result.scalars().all()
+
+    # # ── Get current location for this skid ───────────────────────
+    # loc_result = await db.execute(
+    #     select(ExportSkidLocationMapping, ExportLocationsMaster)
+    #     .join(
+    #         ExportLocationsMaster,
+    #         ExportLocationsMaster.id == ExportSkidLocationMapping.location_id,
+    #     )
+    #     .where(
+    #         ExportSkidLocationMapping.skid_id == skid.id,
+    #         ExportSkidLocationMapping.is_current == True,
+    #     )
+    # )
+    # loc_row = loc_result.first()
+    # current_location = loc_row.ExportLocationsMaster.loc if loc_row else None
+
+    # return {
+    #     "success": True,
+    #     "message": f"Skid '{skid.skid_no}' found via sequence item '{sequence_no}'.",
+    #     "skid": {
+    #         "id": skid.id,
+    #         "skid_no": skid.skid_no,
+    #         "skid_type": skid.skid_type,
+    #         "skid_wgt": skid.skid_wgt,
+    #         "skid_capacity": skid.skid_capacity,
+    #         "is_active": skid.is_active,
+    #         "is_locked": skid.is_locked,
+    #         "locked_by": skid.locked_by_user_id,
+    #         "locked_at": skid.locked_at,
+    #         "is_virtual_used": skid.is_virtual_used,
+    #     },
+    #     "mapping": {
+    #         "id": mapping.id,
+    #         "awb_master_id": mapping.awb_master_id,
+    #         "is_virtual": mapping.is_virtual,
+    #         "virtual_skid_no": mapping.virtual_skid_no,
+    #         "created_at": mapping.created_at,
+    #         "scanned_count": len(sequences),
+    #         "current_location": current_location,
+    #         "sequences": [
+    #             {
+    #                 "id": s.id,
+    #                 "sequence_no": s.sequence_no,
+    #                 "sequence_date_time": s.sequence_date_time,
+    #                 "scan_by_device": s.scan_by_device,
+    #                 "scanned_by": s.scanned_by,
+    #             }
+    #             for s in sequences
+    #         ],
+    #     },
+    #     "awb": {
+    #         "id": awb.id,
+    #         "awb_no": awb.awb_no,
+    #         "pcs": awb.pcs,
+    #     } if awb else None,
+    # }
+    # -------=======------
+
+    # ✅ CALL SHARED FUNCTION
+    return await get_skid_mapping_full_info_with_action_status(
+        db=db,
+        mapping_id=mapping.id
     )
-    sequences = seq_result.scalars().all()
-
-    # ── Get current location for this skid ───────────────────────
-    loc_result = await db.execute(
-        select(ExportSkidLocationMapping, ExportLocationsMaster)
-        .join(
-            ExportLocationsMaster,
-            ExportLocationsMaster.id == ExportSkidLocationMapping.location_id,
-        )
-        .where(
-            ExportSkidLocationMapping.skid_id == skid.id,
-            ExportSkidLocationMapping.is_current == True,
-        )
-    )
-    loc_row = loc_result.first()
-    current_location = loc_row.ExportLocationsMaster.loc if loc_row else None
-
-    return {
-        "success": True,
-        "message": f"Skid '{skid.skid_no}' found via sequence item '{sequence_no}'.",
-        "skid": {
-            "id": skid.id,
-            "skid_no": skid.skid_no,
-            "skid_type": skid.skid_type,
-            "skid_wgt": skid.skid_wgt,
-            "skid_capacity": skid.skid_capacity,
-            "is_active": skid.is_active,
-            "is_locked": skid.is_locked,
-            "locked_by": skid.locked_by_user_id,
-            "locked_at": skid.locked_at,
-            "is_virtual_used": skid.is_virtual_used,
-        },
-        "mapping": {
-            "id": mapping.id,
-            "awb_master_id": mapping.awb_master_id,
-            "is_virtual": mapping.is_virtual,
-            "virtual_skid_no": mapping.virtual_skid_no,
-            "created_at": mapping.created_at,
-            "scanned_count": len(sequences),
-            "current_location": current_location,
-            "sequences": [
-                {
-                    "id": s.id,
-                    "sequence_no": s.sequence_no,
-                    "sequence_date_time": s.sequence_date_time,
-                    "scan_by_device": s.scan_by_device,
-                    "scanned_by": s.scanned_by,
-                }
-                for s in sequences
-            ],
-        },
-        "awb": {
-            "id": awb.id,
-            "awb_no": awb.awb_no,
-            "pcs": awb.pcs,
-        } if awb else None,
-    }
 
 async def assign_skid_to_location(
     db: AsyncSession,
@@ -1297,7 +1307,7 @@ async def get_skid_recent_mapping_info(
     mapping_result = await db.execute(
         select(ExportAwbSkidMapping)
         .where(ExportAwbSkidMapping.skid_id == skid.id,
-               ExportAwbSkidMapping.is_skid_used_complete == False,
+            #    ExportAwbSkidMapping.is_skid_used_complete == False,
                )
         .order_by(ExportAwbSkidMapping.created_at.desc())
         
@@ -1345,6 +1355,8 @@ async def get_skid_recent_mapping_info(
     )
     sequences = seq_result.scalars().all()
 
+
+
     # ── 6. Get current location for this skid ────────────────────
     loc_result = await db.execute(
         select(ExportSkidLocationMapping, ExportLocationsMaster)
@@ -1358,7 +1370,76 @@ async def get_skid_recent_mapping_info(
         )
     )
     loc_row = loc_result.first()
+    location_mapping = loc_row.ExportSkidLocationMapping if loc_row else None
     current_location = loc_row.ExportLocationsMaster.loc if loc_row else None
+
+        # 7 ── Get loaded in uld pcs count (VERY IMPORTANT) ─────────────
+    loaded_result = await db.execute(
+        select(func.count(ExportSequenceItemUldLoading.id))
+        .where(ExportSequenceItemUldLoading.mapping_id == mapping.id)
+    )
+    loaded_count = loaded_result.scalar() or 0
+    scanned_count = len(sequences)
+    remaining_pcs = scanned_count - loaded_count
+
+     # ── Get last location (retrieval time) ─────────────
+    base_result = await db.execute(
+    select(ExportSkidBaseMapping)
+    .where(ExportSkidBaseMapping.mapping_id == mapping.id)
+    .order_by(ExportSkidBaseMapping.dropped_at.desc())
+    .limit(1)
+    )
+    last_base = base_result.scalar_one_or_none()
+
+    last_base_drop_at = last_base.dropped_at if last_base else None
+
+    # last_retrieved_at = location_mapping.picked_at if location_mapping else None
+    # last_retrieved_at = (
+    # location_mapping.picked_at if location_mapping and location_mapping.picked_at else None
+    # )
+
+    retrieval_result = await db.execute(
+    select(ExportSkidLocationMapping.picked_at)
+    .where(
+        ExportSkidLocationMapping.skid_id == skid.id,
+        ExportSkidLocationMapping.picked_at.isnot(None),
+    )
+    .order_by(ExportSkidLocationMapping.picked_at.desc())
+    .limit(1)
+    )
+
+    last_retrieved_at = retrieval_result.scalar_one_or_none()
+
+    is_at_base = (
+        last_base_drop_at is not None
+        and last_retrieved_at is not None
+        and last_base_drop_at >= last_retrieved_at
+    )
+
+    if mapping.is_skid_used_complete:
+        allowed_action = "COMPLETE"
+    
+    # 🟢 NEW CASE — never placed anywhere
+    elif current_location is None and last_retrieved_at is None:
+        allowed_action = "NEW_ASSIGN"
+
+    elif current_location:
+        allowed_action = "RELOCATE_OR_RETRIEVE"
+    
+    # 🔵 PARTIAL LOAD → return to location
+    elif remaining_pcs > 0 and loaded_count > 0 and not is_at_base:
+        allowed_action = "RETURN_TO_LOCATION"
+
+    elif not is_at_base:
+        allowed_action = "DROP_AT_BASE"
+
+    elif remaining_pcs > 0:
+        allowed_action = "SCAN_INTO_ULD"
+
+    else:
+        allowed_action = "COMPLETE"
+
+    # -------🤮
 
     return {
         "success": True,
@@ -1383,6 +1464,15 @@ async def get_skid_recent_mapping_info(
             "created_at": mapping.created_at,
             "scanned_count": len(sequences),   # ← derived from list, no separate query needed
     "current_location": current_location,
+
+# -----🤮
+     "loaded_count": loaded_count,
+    "remaining_pcs": remaining_pcs,
+     "is_fully_loaded": remaining_pcs == 0,
+    "is_at_base": is_at_base,
+    "allowed_action": allowed_action,
+
+
     "sequences": [
         {
             "id": s.id,
@@ -1401,72 +1491,233 @@ async def get_skid_recent_mapping_info(
         } if awb else None,
     }
 
-# =================== skid relocation service --------------
+# =================== skid relocation service 🤢 --------------
+
 async def relocate_skid_service(
     skid_id: int,
     location_id: int,
     moved_by: str,
     db: AsyncSession,
+    mapping_id: Optional[int] = None,   # ✅ ADD — required for post-base case
+    relocation_from_base: bool = False,
 ):
-    # ── 1. Find the current active location row ───────────────────
-    current_stmt = (
-        select(ExportSkidLocationMapping)
-        .where(
+    now = datetime.now(timezone.utc)
+
+    # ── validate location exists ───────────────────────────────
+    new_location = await db.get(ExportLocationsMaster, location_id)
+    if not new_location:
+        raise HTTPException(status_code=404, detail="Location not found")
+
+    # ── CASE 1 — Normal relocation (location → location) ───────
+    # skid has is_current=True location row
+    current_result = await db.execute(
+        select(ExportSkidLocationMapping).where(
             ExportSkidLocationMapping.skid_id == skid_id,
             ExportSkidLocationMapping.is_current == True,
         )
     )
-    result = await db.execute(current_stmt)
-    current_loc = result.scalar_one_or_none()
+    current_loc = current_result.scalar_one_or_none()
 
-    if not current_loc:
-        raise HTTPException(
-            status_code=400,
-            detail="Skid has no current location.First assign location then re-locate.",
+    if current_loc:
+        # same location guard
+        if current_loc.location_id == location_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Skid is already at this location",
+            )
+
+        # close old location
+        current_loc.is_current = False
+        current_loc.picked_at = now
+        current_loc.picked_by = moved_by
+        current_loc.is_relocation = True
+
+        # create new location row
+        db.add(ExportSkidLocationMapping(
+            skid_id=skid_id,
+            location_id=location_id,
+            awb_master_id=current_loc.awb_master_id,
+            mapping_id=current_loc.mapping_id,
+            assigned_at=now,
+            assigned_by=moved_by,
+            is_current=True,
+            is_relocation=False,
+        ))
+
+        await db.commit()
+        return {
+            "success": True,
+            "case": "LOCATION_TO_LOCATION",
+            "message": f"Skid relocated to {new_location.loc}",
+            "new_location": new_location.loc,
+        }
+
+   
+    # ── CASE 2 — Post-base relocation (base → location) ────────
+    # skid has no is_current=True — was retrieved and dropped at base
+    if relocation_from_base:
+        if not mapping_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Skid has no current location. "
+                    "If relocating after base drop, provide mapping_id."
+                ),
+            )
+
+        # validate mapping belongs to this skid
+        mapping = await db.get(ExportAwbSkidMapping, mapping_id)
+        if not mapping or mapping.skid_id != skid_id:
+            raise HTTPException(
+                status_code=400,
+                detail="mapping_id does not belong to this skid",
+            )
+
+        # ── get last retrieval time ────────────────────────────────
+        last_retrieval_result = await db.execute(
+            select(ExportSkidLocationMapping.picked_at)
+            .where(
+                ExportSkidLocationMapping.mapping_id == mapping_id,
+                ExportSkidLocationMapping.picked_at.isnot(None),
+            )
+            .order_by(ExportSkidLocationMapping.picked_at.desc())
+            .limit(1)
         )
-    # ── Guard: same location check ────────────────────────────────
-    if current_loc.location_id == location_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Skid is already allocated to this location.",
+        last_retrieval_at = last_retrieval_result.scalar_one_or_none()
+
+        if not last_retrieval_at:
+            raise HTTPException(
+                status_code=400,
+                detail="Skid not retrieved yet — cannot relocate",
+            )
+
+        # ── base drop must exist AFTER last retrieval (current cycle)
+        valid_base = await db.execute(
+            select(ExportSkidBaseMapping.id).where(
+                ExportSkidBaseMapping.mapping_id == mapping_id,
+                ExportSkidBaseMapping.dropped_at >= last_retrieval_at,
+            )
         )
+        if not valid_base.scalar_one_or_none():
+            raise HTTPException(
+                status_code=400,
+                detail="Skid not dropped at base for current cycle — drop at base first",
+            )
 
-    now = datetime.now(timezone.utc)
+        # ── must have remaining pcs ────────────────────────────────
+        total = await db.scalar(
+            select(func.count(ExportAwbSkidItemSequence.id)).where(
+                ExportAwbSkidItemSequence.mapping_id == mapping_id,
+            )
+        ) or 0
 
-    # ── 2. Close old location row ─────────────────────────────────
-    current_loc.is_current = False
-    current_loc.picked_at = now
-    current_loc.picked_by = moved_by
-    current_loc.is_relocation = True 
+        loaded = await db.scalar(
+            select(func.count(ExportSequenceItemUldLoading.id))
+            .join(
+                ExportAwbSkidItemSequence,
+                ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id,
+            )
+            .where(ExportAwbSkidItemSequence.mapping_id == mapping_id)
+        ) or 0
 
-    # ── 3. Validate new location exists ──────────────────────────
-    loc_stmt = select(ExportLocationsMaster).where(ExportLocationsMaster.id == location_id)
-    loc_result = await db.execute(loc_stmt)
-    new_location = loc_result.scalar_one_or_none()
+        if loaded >= total:
+            raise HTTPException(
+                status_code=400,
+                detail="All pcs already loaded — skid complete, relocation not needed",
+            )
 
-    if not new_location:
-        raise HTTPException(status_code=404, detail="Location not found")
+        # ── create fresh location row for remaining pcs ────────────
+        db.add(ExportSkidLocationMapping(
+            skid_id=skid_id,
+            location_id=location_id,
+            awb_master_id=mapping.awb_master_id,
+            mapping_id=mapping_id,
+            assigned_at=now,
+            assigned_by=moved_by,
+            is_current=True,
+            is_relocation=True,
+        ))
 
-    # ── 4. Insert new current location row ───────────────────────
-    new_loc = ExportSkidLocationMapping(
-        skid_id=skid_id,
-        location_id=location_id,
-        awb_master_id=current_loc.awb_master_id,
-        mapping_id=current_loc.mapping_id,
-        assigned_at=now,
-        assigned_by=moved_by,
-        is_current=True,
-        is_relocation=False,  # ← fresh current, default anyway
+        await db.commit()
+
+        return {
+            "success": True,
+            "case": "BASE_TO_LOCATION",
+            "message": f"Remaining {total - loaded} pcs relocated to {new_location.loc}",
+            "new_location": new_location.loc,
+            "remaining_pcs": total - loaded,
+        }
+    # ── FINAL CATCH-ALL ──────────────────────────────────────────
+    raise HTTPException(
+        status_code=400, 
+        detail="Skid has no current location and relocation_from_base was not specified."
     )
-    db.add(new_loc)
-    await db.commit()
 
-    return {
-        "success": True,
-        "message": f"Skid moved to {new_location.loc} successfully.",
-        "previous_location_id": current_loc.location_id,
-        "new_location": new_location.loc,
-    }
+# async def relocate_skid_service(
+#     skid_id: int,
+#     location_id: int,
+#     moved_by: str,
+#     db: AsyncSession,
+# ):
+#     # ── 1. Find the current active location row ───────────────────
+#     current_stmt = (
+#         select(ExportSkidLocationMapping)
+#         .where(
+#             ExportSkidLocationMapping.skid_id == skid_id,
+#             ExportSkidLocationMapping.is_current == True,
+#         )
+#     )
+#     result = await db.execute(current_stmt)
+#     current_loc = result.scalar_one_or_none()
+
+#     if not current_loc:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Skid has no current location.First assign location then re-locate.",
+#         )
+#     # ── Guard: same location check ────────────────────────────────
+#     if current_loc.location_id == location_id:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Skid is already allocated to this location.",
+#         )
+
+#     now = datetime.now(timezone.utc)
+
+#     # ── 2. Close old location row ─────────────────────────────────
+#     current_loc.is_current = False
+#     current_loc.picked_at = now
+#     current_loc.picked_by = moved_by
+#     current_loc.is_relocation = True 
+
+#     # ── 3. Validate new location exists ──────────────────────────
+#     loc_stmt = select(ExportLocationsMaster).where(ExportLocationsMaster.id == location_id)
+#     loc_result = await db.execute(loc_stmt)
+#     new_location = loc_result.scalar_one_or_none()
+
+#     if not new_location:
+#         raise HTTPException(status_code=404, detail="Location not found")
+
+#     # ── 4. Insert new current location row ───────────────────────
+#     new_loc = ExportSkidLocationMapping(
+#         skid_id=skid_id,
+#         location_id=location_id,
+#         awb_master_id=current_loc.awb_master_id,
+#         mapping_id=current_loc.mapping_id,
+#         assigned_at=now,
+#         assigned_by=moved_by,
+#         is_current=True,
+#         is_relocation=False,  # ← fresh current, default anyway
+#     )
+#     db.add(new_loc)
+#     await db.commit()
+
+#     return {
+#         "success": True,
+#         "message": f"Skid moved to {new_location.loc} successfully.",
+#         "previous_location_id": current_loc.location_id,
+#         "new_location": new_location.loc,
+#     }
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1491,6 +1742,157 @@ async def _get_mapping(
         )
     return mapping
 
+# 🤮🤢
+async def get_skid_mapping_full_info_with_action_status(
+    db: AsyncSession,
+    mapping_id: int,
+) -> dict:
+    """
+    Shared logic: returns full skid + mapping + allowed_action
+    Used by:
+    - get by skid_no (get_skid_recent_mapping_info | /get-mapping-by-skid-no)
+    - get by sequence (//by-seq)
+    """
+    # ── get mapping ─────────────────────────────
+    mapping = await db.get(ExportAwbSkidMapping, mapping_id)
+
+    if not mapping:
+        raise HTTPException(404, "Mapping not found")
+
+    # ── get skid ────────────────────────────────
+    skid = await db.get(ExportSkidMaster, mapping.skid_id)
+
+    # ── get awb ─────────────────────────────────
+    awb = await db.get(ExportCarMessageAwbMaster, mapping.awb_master_id)
+
+    # ── sequences ───────────────────────────────
+    seq_result = await db.execute(
+        select(ExportAwbSkidItemSequence)
+        .where(ExportAwbSkidItemSequence.mapping_id == mapping.id)
+        .order_by(ExportAwbSkidItemSequence.sequence_date_time.asc())
+    )
+    sequences = seq_result.scalars().all()
+
+    # ── current location ────────────────────────
+    loc_result = await db.execute(
+        select(ExportSkidLocationMapping, ExportLocationsMaster)
+        .join(ExportLocationsMaster,
+              ExportLocationsMaster.id == ExportSkidLocationMapping.location_id)
+        .where(
+            ExportSkidLocationMapping.skid_id == skid.id,
+            ExportSkidLocationMapping.is_current == True,
+        )
+    )
+    loc_row = loc_result.first()
+    current_location = loc_row.ExportLocationsMaster.loc if loc_row else None
+
+    # ── loaded / remaining ──────────────────────
+    loaded = await db.scalar(
+        select(func.count(ExportSequenceItemUldLoading.id))
+        .where(ExportSequenceItemUldLoading.mapping_id == mapping.id)
+    ) or 0
+
+    scanned = len(sequences)
+    remaining = scanned - loaded
+
+    # ── base / retrieval ────────────────────────
+    last_base = await db.scalar(
+        select(ExportSkidBaseMapping.dropped_at)
+        .where(ExportSkidBaseMapping.mapping_id == mapping.id)
+        .order_by(ExportSkidBaseMapping.dropped_at.desc())
+        .limit(1)
+    )
+
+    last_retrieval = await db.scalar(
+        select(ExportSkidLocationMapping.picked_at)
+        .where(
+            ExportSkidLocationMapping.skid_id == skid.id,
+            ExportSkidLocationMapping.picked_at.isnot(None),
+        )
+        .order_by(ExportSkidLocationMapping.picked_at.desc())
+        .limit(1)
+    )
+
+    is_at_base = (
+        last_base is not None and
+        last_retrieval is not None and
+        last_base >= last_retrieval
+    )
+
+    # ── allowed_action (same logic) ─────────────
+    if mapping.is_skid_used_complete:
+        action = "COMPLETE"
+
+    elif current_location is None and last_retrieval is None:
+        action = "NEW_ASSIGN"
+
+    elif current_location:
+        action = "RELOCATE_OR_RETRIEVE"
+
+    elif remaining > 0 and loaded > 0 and not is_at_base:
+        action = "RETURN_TO_LOCATION"
+
+    elif not is_at_base:
+        action = "DROP_AT_BASE"
+
+    elif remaining > 0:
+        action = "SCAN_INTO_ULD"
+
+    else:
+        action = "COMPLETE"
+
+    # ── return ─────────────────────────────────
+    return {
+        "success": True,
+        "message": f"Skid '{skid.skid_no}' fetched successfully",  # ✅ ADD
+        "skid": {
+            "id": skid.id,
+            "skid_no": skid.skid_no,
+        "skid_type": skid.skid_type,
+           "skid_wgt": skid.skid_wgt, 
+        "skid_capacity": skid.skid_capacity,
+                     # ✅ ADD
+        "is_active": skid.is_active,            # ✅ ADD
+        "is_locked": skid.is_locked,            # ✅ ADD
+        "is_virtual_used": skid.is_virtual_used, # ✅ ADD
+        "locked_by": skid.locked_by_user_id,   # ✅ ADD
+         "locked_at": skid.locked_at,           # ✅ ADD
+
+        },
+        "mapping": {
+            "id": mapping.id,
+            "awb_master_id": mapping.awb_master_id,
+            "scanned_count": scanned,
+            "is_virtual": mapping.is_virtual,       # ✅ ADD
+            "virtual_skid_no": mapping.virtual_skid_no,
+            "loaded_count": loaded,
+
+            "is_fully_loaded": remaining == 0,
+
+            "remaining_pcs": remaining,
+            "current_location": current_location,
+            "created_at": mapping.created_at,
+            "is_at_base": is_at_base,
+            "allowed_action": action,
+
+            "sequences": [
+    {
+        "id": s.id,
+        "sequence_no": s.sequence_no,
+        "sequence_date_time": s.sequence_date_time,
+        "scan_by_device": s.scan_by_device,
+        "scanned_by": s.scanned_by,
+    }
+    for s in sequences
+],
+        },
+
+        "awb": {
+            "id": awb.id,
+            "awb_no": awb.awb_no,
+            "pcs": awb.pcs,
+        } if awb else None,
+    }
 
 async def _assert_skid_still_locked(
     db: AsyncSession,
@@ -1896,6 +2298,7 @@ async def create_new_skid_in_skid_master(
         is_virtual_used=True,       # real skid — always True
         created_at=now,
         updated_at=now,
+        created_by=created_by,
     )
     db.add(skid)
     await db.commit()

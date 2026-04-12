@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Body, UploadFile, File, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from io import BytesIO
 import pandas as pd
 import numpy as np
@@ -34,6 +34,7 @@ from app.schemas.exportOperation.skid_master import (
     DeleteSequenceResponse,
     ForceUnlockResponse,
     GenerateVirtualSkidResponse,
+    RelocateRequest,
     ScanSequenceRequest,
     ScanSequenceResponse,
     SkidBySequenceResponse,
@@ -365,7 +366,10 @@ async def get_skid_info_route(
 @router.patch("/skid/{skid_id}/relocate", summary="Move skid to a new location")
 async def relocate_skid(
     skid_id: int,
-    location_id: int = Body(..., embed=True),
+    # location_id: int = Body(..., embed=True),
+    # mapping_id: Optional[int] = Body(None),   # ← ADD — needed for case 2 in service, optional for case 1
+    # relocation_from_base: bool = Body(False),
+     payload: RelocateRequest,
     db: AsyncSession = Depends(get_db),
     current_user=Depends(verify_token_and_get_user),
 ):
@@ -376,11 +380,14 @@ async def relocate_skid(
     If skid not found → 404.
     ⚠️Need to add gaurd to restrict to relocate after a particular point {when skid is free or picked for base or location is free from this skid}
     """
+    print(f"🤢🤢Relocate request for skid_id={skid_id} to location_id={payload.location_id} with mapping_id={payload.mapping_id} || {payload.relocation_from_base}")
     return await relocate_skid_service(
         skid_id=skid_id,
-        location_id=location_id,
+        location_id=payload.location_id,
         moved_by=current_user.emp_id,  # ← adjust to your user model field
         db=db,
+        mapping_id=payload.mapping_id,
+        relocation_from_base=payload.relocation_from_base,
     )
 
 

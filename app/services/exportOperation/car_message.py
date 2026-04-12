@@ -1,12 +1,14 @@
 # services/export_car_message_awb_service.py
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
+from fastapi import status
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
+import pytz
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import and_, distinct, func, select
+from sqlalchemy import and_, case, distinct, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from app.db.models.exportOperation.car_message import (
     ExportAwbSkidItemSequence,
@@ -24,7 +26,7 @@ from app.db.models.exportOperation.export_base_master import ExportBaseMaster
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
-from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AwbDaySummary, AwbLoadingStatusItem, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingByFlightResponse, FlightBookingDetailResponse, FlightBookingDetailWithAwbResponse, FlightUldLoadingStatusResponse, ScanItemIntoUldRequest, ScanItemIntoUldResponse, ScanItemResult, ScanningDaySummary, SkidDaySummary, UldAssignmentDataResponse, UldAssignmentDetailResponse, UldAssignmentResponse, UldLoadingStatusItem, UldMasterResponse, UldVerifyForLoadingResponse
+from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AwbChangeRecord, AwbDaySummary, AwbLoadingStatusItem, AwbLookupError, AwbManualCreateRequest, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightBookingDetailResponse, FlightBookingDetailWithAwbResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, ScanItemIntoUldRequest, ScanItemIntoUldResponse, ScanItemResult, ScanningDaySummary, SkidDaySummary, UldAssignmentDataResponse, UldAssignmentDetailResponse, UldAssignmentResponse, UldLoadingStatusItem, UldMasterResponse, UldVerifyForLoadingResponse
 from app.services.exportOperation.car_message_flow_audit_log import write_car_message_flow_audit
 from app.utils.common.car_message_flow_audit_utils import CarMessageFlowModule, CarMessageFlowStep
 from app.utils.common.helperFunction import get_utc_now
@@ -56,16 +58,100 @@ def to_utc(dt: datetime) -> datetime:
     return (dt - ist_offset).replace(tzinfo=timezone.utc)
 
 
+# def _build_skid_activity_log(
+#     skid: dict,
+#     mapping_row,
+#     location_history: list,
+#     base_drop: dict | None = None, 
+# ) -> list[dict]:
+
+#     activity = []
+
+#     # ── 1. Skid assigned to AWB ────────────────────────────────
+#     activity.append({
+#         "action": "SKID_ASSIGNED",
+#         "label": "Skid assigned to AWB",
+#         "performed_by": skid.get("mapped_by"),
+#         "timestamp": mapping_row.mapping_created_at,
+#         "detail": {
+#             "skid_no": skid.get("skid_no"),
+#             "virtual_skid_no": skid.get("virtual_skid_no"),
+#             "is_virtual": skid.get("is_virtual"),
+#         },
+#     })
+
+#     # ── 2. Retrieved — most recent is_current=False + picked_at set ──
+#     retrieved = [
+#         loc for loc in location_history
+#         if not loc.is_current and
+#         loc.picked_at and loc.picked_by
+#          and not loc.is_relocation
+      
+#     ]
+
+#     if retrieved:
+#         # ✅ most recent retrieval only
+#         most_recent = max(retrieved, key=lambda x: x.picked_at)
+#         activity.append({
+#             "action": "RETRIEVED_FROM_LOCATION",
+#             "label": f"Retrieved from {most_recent.area_code} — {most_recent.loc}",
+#             "performed_by": most_recent.picked_by,
+#             "timestamp": most_recent.picked_at,
+#             "detail": {
+#                 "location_code": most_recent.area_code,
+#                 "location_name": most_recent.loc,
+#             },
+#         })
+
+#        # ── 3. Dropped at base ─────────────────────────────────────
+#     # if base_drop:
+#     #     activity.append({
+#     #         "action": "DROPPED_AT_BASE",
+#     #         "label": f"Dropped at base — {base_drop['base_name']}",
+#     #         "performed_by": base_drop["dropped_by"],
+#     #         "timestamp": base_drop["dropped_at"],
+#     #         "detail": {
+#     #             "base_id": base_drop["base_id"],
+#     #             "base_name": base_drop["base_name"],
+#     #         },
+#     #     })
+
+#     # ── BASE DROP EVENTS (all cycles) ─────────────────────────
+#     # base_drop is now a list (multiple cycles possible)
+#     if base_drop:
+#         base_drops = base_drop if isinstance(base_drop, list) else [base_drop]
+#         for drop in base_drops:
+#             activity.append({
+#                 "action": "DROPPED_AT_BASE",
+#                 "label": f"Dropped at base — {drop.get('base_name')} (cycle {drop.get('cycle_no', 1)})",
+#                 "performed_by": drop.get("dropped_by"),
+#                 "timestamp": drop.get("dropped_at"),
+#                 "detail": {
+#                     "base_id": drop.get("base_id"),
+#                     "base_name": drop.get("base_name"),
+#                     "cycle_no": drop.get("cycle_no", 1),   # ✅ shows cycle
+#                 },
+#             })
+
+
+#     # ── sort by timestamp ──────────────────────────────────────
+#     activity.sort(
+#         key=lambda x: x["timestamp"] if x["timestamp"]
+#         else datetime.min.replace(tzinfo=timezone.utc)
+#     )
+
+#     return activity
+
 def _build_skid_activity_log(
     skid: dict,
     mapping_row,
     location_history: list,
-    base_drop: dict | None = None, 
+    base_drop: list | dict | None = None,
 ) -> list[dict]:
 
     activity = []
 
-    # ── 1. Skid assigned to AWB ────────────────────────────────
+    # ── 1. Skid assigned ──────────────────────────────────────
     activity.append({
         "action": "SKID_ASSIGNED",
         "label": "Skid assigned to AWB",
@@ -78,44 +164,59 @@ def _build_skid_activity_log(
         },
     })
 
-    # ── 2. Retrieved — most recent is_current=False + picked_at set ──
-    retrieved = [
-        loc for loc in location_history
-        if not loc.is_current and
-        loc.picked_at and loc.picked_by
-         and not loc.is_relocation
-      
-    ]
+    # ── 2. ALL location events in chronological order ──────────
+    # Each location row gives us:
+    #   assigned_at → PLACED / RELOCATED event
+    #   picked_at   → RETRIEVED event (if set)
+    for loc in location_history:
 
-    if retrieved:
-        # ✅ most recent retrieval only
-        most_recent = max(retrieved, key=lambda x: x.picked_at)
+        # placed or relocated
         activity.append({
-            "action": "RETRIEVED_FROM_LOCATION",
-            "label": f"Retrieved from {most_recent.area_code} — {most_recent.loc}",
-            "performed_by": most_recent.picked_by,
-            "timestamp": most_recent.picked_at,
+            "action": "RELOCATED_TO_LOCATION" if loc.is_relocation else "PLACED_AT_LOCATION",
+            "label": (
+                f"Relocated to {loc.area_code} — {loc.loc}"
+                if loc.is_relocation
+                else f"Placed at {loc.area_code} — {loc.loc}"
+            ),
+            "performed_by": loc.assigned_by,
+            "timestamp": loc.assigned_at,
             "detail": {
-                "location_code": most_recent.area_code,
-                "location_name": most_recent.loc,
+                "location_code": loc.area_code,
+                "location_name": loc.loc,
+                "is_relocation": loc.is_relocation,
             },
         })
 
-       # ── 3. Dropped at base ─────────────────────────────────────
+        # retrieved from this location (if picked)
+        if loc.picked_at and loc.picked_by:
+            activity.append({
+                "action": "RETRIEVED_FROM_LOCATION",
+                "label": f"Retrieved from {loc.area_code} — {loc.loc}",
+                "performed_by": loc.picked_by,
+                "timestamp": loc.picked_at,
+                "detail": {
+                    "location_code": loc.area_code,
+                    "location_name": loc.loc,
+                },
+            })
+
+    # ── 3. ALL base drop events (multi-cycle) ─────────────────
     if base_drop:
-        activity.append({
-            "action": "DROPPED_AT_BASE",
-            "label": f"Dropped at base — {base_drop['base_name']}",
-            "performed_by": base_drop["dropped_by"],
-            "timestamp": base_drop["dropped_at"],
-            "detail": {
-                "base_id": base_drop["base_id"],
-                "base_name": base_drop["base_name"],
-            },
-        })
+        base_drops = base_drop if isinstance(base_drop, list) else [base_drop]
+        for drop in base_drops:
+            activity.append({
+                "action": "DROPPED_AT_BASE",
+                "label": f"Dropped at base — {drop.get('base_name')} (cycle {drop.get('cycle_no', 1)})",
+                "performed_by": drop.get("dropped_by"),
+                "timestamp": drop.get("dropped_at"),
+                "detail": {
+                    "base_id": drop.get("base_id"),
+                    "base_name": drop.get("base_name"),
+                    "cycle_no": drop.get("cycle_no", 1),
+                },
+            })
 
-
-    # ── sort by timestamp ──────────────────────────────────────
+    # ── sort all events by timestamp ───────────────────────────
     activity.sort(
         key=lambda x: x["timestamp"] if x["timestamp"]
         else datetime.min.replace(tzinfo=timezone.utc)
@@ -123,19 +224,42 @@ def _build_skid_activity_log(
 
     return activity
 
+# def _get_skid_retrieval_status(
+#     location_history: list,
+#     base_drop: dict | None,
+# ) -> str:
+#     if base_drop:
+#         return "AT_BASE"
+#     if location_history:
+#         most_recent = max(location_history, key=lambda x: x.assigned_at)
+#         if not most_recent.is_current and most_recent.picked_at:
+#             return "RETRIEVED"
+#     return "PENDING"
 
-def _get_skid_retrieval_status(
-    location_history: list,
-    base_drop: dict | None,
-) -> str:
-    if base_drop:
-        return "AT_BASE"
-    if location_history:
-        most_recent = max(location_history, key=lambda x: x.assigned_at)
-        if not most_recent.is_current and most_recent.picked_at:
-            return "RETRIEVED"
+# 🤢
+def _get_skid_retrieval_status(location_history, base_drop) -> str:
+    if not location_history:
+        return "PENDING"
+
+    base_drops = base_drop if isinstance(base_drop, list) else ([base_drop] if base_drop else [])
+
+    last_loc = sorted(location_history, key=lambda x: x.assigned_at)[-1]
+
+    if base_drops:
+        last_drop = sorted(base_drops, key=lambda x: x.get("dropped_at"))[-1]
+        last_drop_at = last_drop.get("dropped_at")
+        last_picked_at = last_loc.picked_at
+
+        if last_picked_at and last_drop_at and last_drop_at >= last_picked_at:
+            return "AT_BASE"
+
+    if last_loc.picked_at:
+        return "RETRIEVED"
+
+    if last_loc.is_current:
+        return "AT_LOCATION"
+
     return "PENDING"
-
 
 # COMMON PRIVATE FUN END ---------------------------------------------------
 
@@ -163,8 +287,44 @@ async def save_export_car_message_awbs(db: AsyncSession, df, uploaded_by: str = 
 
     stmt = insert(ExportCarMessageAwbMaster).values(records)
 
-    stmt = stmt.on_conflict_do_nothing(
-        constraint="uq_awb_car_msg"
+    # stmt = stmt.on_conflict_do_nothing(
+    #     constraint="uq_awb_car_msg"
+    # )
+
+    # 🤢🤮
+    stmt = stmt.on_conflict_do_update(
+    constraint="uq_awb_car_msg",
+    set_={
+        "pcs": stmt.excluded.pcs,
+        "gross_wt": stmt.excluded.gross_wt,
+        "hwb_no": stmt.excluded.hwb_no,
+        "volumetric_wt": stmt.excluded.volumetric_wt,
+        "chg_wt": stmt.excluded.chg_wt,
+
+        "nog":                      stmt.excluded.nog,   # ✅ was missing
+        "shc":                      stmt.excluded.shc,   # ✅ was missing
+
+            "car_msg_date": stmt.excluded.car_msg_date,
+        "car_msg_time": stmt.excluded.car_msg_time,
+
+        "origin": stmt.excluded.origin,
+        "destination": stmt.excluded.destination,
+
+        "sb_no": stmt.excluded.sb_no,
+        "sb_date": stmt.excluded.sb_date,
+
+    
+        "car_message_datetime_combo": stmt.excluded.car_message_datetime_combo,
+        # "rcs_datetime": stmt.excluded.rcs_datetime,
+
+        
+
+        # "status": stmt.excluded.status,
+        # "agent": stmt.excluded.agent,
+
+        "updated_at": now,
+    },
+    where=(ExportCarMessageAwbMaster.is_manually_created == True)
     )
 
     result = await db.execute(stmt)
@@ -311,58 +471,6 @@ def _to_float(val):
 
 
 #✌️=======Get allowed awb for fligh booking screen dropdown =======================
-# async def get_available_awbs_for_flight_booking_dropdown(
-#     db: AsyncSession,
-#     origin: Optional[str] = None,
-#     destination: Optional[str] = None,
-# ) -> list[AvailableAwbForFlightBookingResponse]:
-
-#     # ── Subquery: sum booked_pcs per AWB across active flights only ──
-#     booked_subq = _booked_pcs_subquery()
-
-#     # ── Main query ──
-#     remaining_pcs_expr = (
-#         ExportCarMessageAwbMaster.pcs
-#         - func.coalesce(booked_subq.c.booked_pcs, 0)
-#     )
-
-#     stmt = (
-#         select(
-#             ExportCarMessageAwbMaster.id.label("awb_master_id"),
-#             ExportCarMessageAwbMaster.awb_no,
-#             ExportCarMessageAwbMaster.origin,
-#             ExportCarMessageAwbMaster.destination,
-#             ExportCarMessageAwbMaster.pcs.label("total_pcs"),
-#             func.coalesce(booked_subq.c.booked_pcs, 0).label("booked_pcs"),
-#             remaining_pcs_expr.label("remaining_pcs"),
-#             ExportCarMessageAwbMaster.agent,
-#             ExportCarMessageAwbMaster.rcs_datetime,
-#         )
-#         .outerjoin(
-#             booked_subq,
-#             ExportCarMessageAwbMaster.id == booked_subq.c.awb_master_id,
-#         )
-#         .where(
-#             ExportCarMessageAwbMaster.status == "RCS",          # hits partial index
-#             ExportCarMessageAwbMaster.pcs.isnot(None),
-#             remaining_pcs_expr > 0,                             # only with pcs left
-#         )
-#         .order_by(ExportCarMessageAwbMaster.rcs_datetime.desc())
-#     )
-
-#     if origin:
-#         stmt = stmt.where(
-#             ExportCarMessageAwbMaster.origin == origin.strip().upper()
-#         )
-#     if destination:
-#         stmt = stmt.where(
-#             ExportCarMessageAwbMaster.destination == destination.strip().upper()
-#         )
-
-#     result = await db.execute(stmt)
-#     rows = result.mappings().all()
-
-#     return [AvailableAwbForFlightBookingResponse(**row) for row in rows]
 
 # async def get_available_awbs_for_flight_booking_dropdown(
 #     db: AsyncSession,
@@ -370,10 +478,10 @@ def _to_float(val):
 #     destination: Optional[str] = None,
 # ) -> list[AvailableAwbForFlightBookingResponse]:
 
-#     # ── Subquery 1: sum booked_pcs per AWB across active flights ──
+#     # ── Subquery 1: booked pcs ─────────────────────────────
 #     booked_subq = _booked_pcs_subquery()
 
-#     # ── Subquery 2: total scanned pcs per AWB ─────────────────
+#     # ── Subquery 2: scanned pcs per AWB ───────────────────
 #     scanned_subq = (
 #         select(
 #             ExportAwbSkidItemSequence.awb_master_id,
@@ -383,31 +491,34 @@ def _to_float(val):
 #         .subquery()
 #     )
 
-#     # ── Subquery 3: total skids count per AWB ─────────────────
+#     # ── Subquery 3: total distinct skids per AWB ───────────
 #     total_skids_subq = (
 #         select(
 #             ExportAwbSkidMapping.awb_master_id,
-#             func.count(ExportAwbSkidMapping.id).label("total_skids"),
+#             func.count(ExportAwbSkidMapping.skid_id.distinct()).label("total_skids"),
 #         )
 #         .group_by(ExportAwbSkidMapping.awb_master_id)
 #         .subquery()
 #     )
 
-#     # ── Subquery 4: skids that have been located at least once ─
+#     # ── Subquery 4: located skids scoped to same AWB session
 #     ever_located_subq = (
 #         select(
 #             ExportAwbSkidMapping.awb_master_id,
-#             func.count(ExportAwbSkidMapping.id.distinct()).label("ever_located_skids"),
+#             func.count(ExportAwbSkidMapping.skid_id.distinct()).label("ever_located_skids"),
 #         )
 #         .join(
 #             ExportSkidLocationMapping,
-#             ExportSkidLocationMapping.skid_id == ExportAwbSkidMapping.skid_id,
+#             and_(
+#                 ExportSkidLocationMapping.skid_id == ExportAwbSkidMapping.skid_id,
+#                 ExportSkidLocationMapping.awb_master_id == ExportAwbSkidMapping.awb_master_id,  # ✅ scope
+#             ),
 #         )
 #         .group_by(ExportAwbSkidMapping.awb_master_id)
 #         .subquery()
 #     )
 
-#     # ── Main query ─────────────────────────────────────────────
+#     # ── Main query ─────────────────────────────────────────
 #     remaining_pcs_expr = (
 #         ExportCarMessageAwbMaster.pcs
 #         - func.coalesce(booked_subq.c.booked_pcs, 0)
@@ -426,7 +537,6 @@ def _to_float(val):
 #             ExportCarMessageAwbMaster.rcs_datetime,
 #         )
 #         .outerjoin(booked_subq, ExportCarMessageAwbMaster.id == booked_subq.c.awb_master_id)
-#         # ✅ inner joins — AWB must have scans, skids, and located skids
 #         .join(scanned_subq, ExportCarMessageAwbMaster.id == scanned_subq.c.awb_master_id)
 #         .join(total_skids_subq, ExportCarMessageAwbMaster.id == total_skids_subq.c.awb_master_id)
 #         .join(ever_located_subq, ExportCarMessageAwbMaster.id == ever_located_subq.c.awb_master_id)
@@ -434,9 +544,9 @@ def _to_float(val):
 #             ExportCarMessageAwbMaster.status == "RCS",
 #             ExportCarMessageAwbMaster.pcs.isnot(None),
 #             remaining_pcs_expr > 0,
-#             # ✅ NEW: all pcs scanned
+#             # ✅ all pcs scanned
 #             scanned_subq.c.scanned_pcs >= ExportCarMessageAwbMaster.pcs,
-#             # ✅ NEW: all skids located at least once
+#             # ✅ ALL skids located at least once in this AWB session
 #             ever_located_subq.c.ever_located_skids == total_skids_subq.c.total_skids,
 #         )
 #         .order_by(ExportCarMessageAwbMaster.rcs_datetime.desc())
@@ -456,16 +566,17 @@ def _to_float(val):
 
 #     return [AvailableAwbForFlightBookingResponse(**row) for row in rows]
 
+# 🤢
 async def get_available_awbs_for_flight_booking_dropdown(
     db: AsyncSession,
     origin: Optional[str] = None,
     destination: Optional[str] = None,
 ) -> list[AvailableAwbForFlightBookingResponse]:
 
-    # ── Subquery 1: booked pcs ─────────────────────────────
+    # ── Subquery 1: booked pcs per AWB across active flights ───────
     booked_subq = _booked_pcs_subquery()
 
-    # ── Subquery 2: scanned pcs per AWB ───────────────────
+    # ── Subquery 2: scanned pcs per AWB ───────────────────────────
     scanned_subq = (
         select(
             ExportAwbSkidItemSequence.awb_master_id,
@@ -475,37 +586,14 @@ async def get_available_awbs_for_flight_booking_dropdown(
         .subquery()
     )
 
-    # ── Subquery 3: total distinct skids per AWB ───────────
-    total_skids_subq = (
-        select(
-            ExportAwbSkidMapping.awb_master_id,
-            func.count(ExportAwbSkidMapping.skid_id.distinct()).label("total_skids"),
+    # ── remaining — scanned-based for normal, total_pcs-based for ultra-fast ──
+    remaining_pcs_expr = case(
+        (ExportCarMessageAwbMaster.is_ultra_fast == True,
+         ExportCarMessageAwbMaster.pcs - func.coalesce(booked_subq.c.booked_pcs, 0)),
+        else_=(
+            func.coalesce(scanned_subq.c.scanned_pcs, 0)
+            - func.coalesce(booked_subq.c.booked_pcs, 0)
         )
-        .group_by(ExportAwbSkidMapping.awb_master_id)
-        .subquery()
-    )
-
-    # ── Subquery 4: located skids scoped to same AWB session
-    ever_located_subq = (
-        select(
-            ExportAwbSkidMapping.awb_master_id,
-            func.count(ExportAwbSkidMapping.skid_id.distinct()).label("ever_located_skids"),
-        )
-        .join(
-            ExportSkidLocationMapping,
-            and_(
-                ExportSkidLocationMapping.skid_id == ExportAwbSkidMapping.skid_id,
-                ExportSkidLocationMapping.awb_master_id == ExportAwbSkidMapping.awb_master_id,  # ✅ scope
-            ),
-        )
-        .group_by(ExportAwbSkidMapping.awb_master_id)
-        .subquery()
-    )
-
-    # ── Main query ─────────────────────────────────────────
-    remaining_pcs_expr = (
-        ExportCarMessageAwbMaster.pcs
-        - func.coalesce(booked_subq.c.booked_pcs, 0)
     )
 
     stmt = (
@@ -515,25 +603,32 @@ async def get_available_awbs_for_flight_booking_dropdown(
             ExportCarMessageAwbMaster.origin,
             ExportCarMessageAwbMaster.destination,
             ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+            func.coalesce(scanned_subq.c.scanned_pcs, 0).label("scanned_pcs"),   # ✅ expose for frontend
             func.coalesce(booked_subq.c.booked_pcs, 0).label("booked_pcs"),
             remaining_pcs_expr.label("remaining_pcs"),
             ExportCarMessageAwbMaster.agent,
             ExportCarMessageAwbMaster.rcs_datetime,
+            ExportCarMessageAwbMaster.is_ultra_fast,
         )
         .outerjoin(booked_subq, ExportCarMessageAwbMaster.id == booked_subq.c.awb_master_id)
-        .join(scanned_subq, ExportCarMessageAwbMaster.id == scanned_subq.c.awb_master_id)
-        .join(total_skids_subq, ExportCarMessageAwbMaster.id == total_skids_subq.c.awb_master_id)
-        .join(ever_located_subq, ExportCarMessageAwbMaster.id == ever_located_subq.c.awb_master_id)
+        .outerjoin(scanned_subq, ExportCarMessageAwbMaster.id == scanned_subq.c.awb_master_id)  # ✅ outerjoin so AWBs with 0 scanned still appear (filtered below)
         .where(
             ExportCarMessageAwbMaster.status == "RCS",
             ExportCarMessageAwbMaster.pcs.isnot(None),
-            remaining_pcs_expr > 0,
-            # ✅ all pcs scanned
-            scanned_subq.c.scanned_pcs >= ExportCarMessageAwbMaster.pcs,
-            # ✅ ALL skids located at least once in this AWB session
-            ever_located_subq.c.ever_located_skids == total_skids_subq.c.total_skids,
+
+             # ✅ ultra-fast bypasses scanned gate {ULTRA_FAST OR HAVE AT LEAST SCANNED ONE PCS}
+            or_(
+                ExportCarMessageAwbMaster.is_ultra_fast == True,
+                func.coalesce(scanned_subq.c.scanned_pcs, 0) > 0,
+            ),
+            # func.coalesce(scanned_subq.c.scanned_pcs, 0) > 0,   # ✅ must have at least 1 scanned pc
+
+            remaining_pcs_expr > 0,                              # ✅ scanned - booked > 0
         )
-        .order_by(ExportCarMessageAwbMaster.rcs_datetime.desc())
+        .order_by(
+            ExportCarMessageAwbMaster.is_ultra_fast.desc(),
+            ExportCarMessageAwbMaster.rcs_datetime.desc(),
+        )
     )
 
     if origin:
@@ -549,7 +644,6 @@ async def get_available_awbs_for_flight_booking_dropdown(
     rows = result.mappings().all()
 
     return [AvailableAwbForFlightBookingResponse(**row) for row in rows]
-
 
 # ========= ✌️✌️  CREATE new flight booking ──────────────────────────────────────=========
 async def create_flight_booking(
@@ -576,6 +670,14 @@ async def create_flight_booking(
             detail=f"Flight {payload.flight_no} already booked on {payload.flight_date}"
         )
 
+     # ✅ ADD HERE — departure in past check
+    if to_utc(payload.flight_dpt_datetime) <= now:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Flight {payload.flight_no} departure datetime is in the past — cannot create booking",
+        )
+
+
     # ── Check 2: fetch all AWBs in one query ───────────────────
     awb_result = await db.execute(
         select(
@@ -583,6 +685,7 @@ async def create_flight_booking(
             ExportCarMessageAwbMaster.awb_no,
             ExportCarMessageAwbMaster.pcs,
             ExportCarMessageAwbMaster.status,
+            ExportCarMessageAwbMaster.is_ultra_fast,   # ← ADD
         ).where(ExportCarMessageAwbMaster.id.in_(awb_ids))
     )
     awb_map = {row.id: row for row in awb_result.mappings().all()}
@@ -605,6 +708,21 @@ async def create_flight_booking(
     )
     booked_map = {row.awb_master_id: row.booked_pcs for row in booked_result.mappings().all()}
 
+    # ── Fetch scanned pcs for these AWBs ──────────────────────
+    scanned_result = await db.execute(
+        select(
+            ExportAwbSkidItemSequence.awb_master_id,
+            func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+        )
+        .where(ExportAwbSkidItemSequence.awb_master_id.in_(awb_ids))
+        .group_by(ExportAwbSkidItemSequence.awb_master_id)
+    )
+    scanned_map = {
+        row.awb_master_id: row.scanned_pcs
+        for row in scanned_result.mappings().all()
+    }
+    
+
     # ── Check 4: validate each AWB ─────────────────────────────
     errors = []
     for item in payload.awbs:
@@ -618,18 +736,52 @@ async def create_flight_booking(
             errors.append(f"AWB {awb.awb_no} is not in RCS status")
             continue
 
-        already_booked = booked_map.get(item.awb_master_id, 0)
-        remaining = awb.pcs - already_booked
+        # already_booked = booked_map.get(item.awb_master_id, 0)
+        # remaining = awb.pcs - already_booked
 
-        if remaining <= 0:
-            errors.append(f"AWB {awb.awb_no} is fully booked — no pcs remaining")
+        # if remaining <= 0:
+        #     errors.append(f"AWB {awb.awb_no} is fully booked — no pcs remaining")
+        #     continue
+
+        # if item.booked_pcs > remaining:
+        #     errors.append(
+        #         f"AWB {awb.awb_no}: requested {item.booked_pcs} pcs "
+        #         f"but only {remaining} remaining"
+        #     )
+
+        already_booked = booked_map.get(item.awb_master_id, 0)
+        scanned_pcs = scanned_map.get(item.awb_master_id, 0)
+
+        # ✅ available = scanned - already booked elsewhere
+        # available = scanned_pcs - already_booked
+        # 🤮🤮
+        is_ultra_fast = awb.is_ultra_fast  # ← need this in awb_map query
+
+        if is_ultra_fast:
+            # ✅ ultra-fast: use total_pcs instead of scanned_pcs
+            available = (awb.pcs or 0) - already_booked
+        else:
+            available = scanned_pcs - already_booked
+        # ------
+
+        if available <= 0:
+            # errors.append(
+            #     f"AWB {awb.awb_no}: no available scanned pcs "
+            #     f"(scanned={scanned_pcs}, already_booked={already_booked})"
+            # )
+            errors.append(
+                f"AWB {awb.awb_no}: no pcs available "
+                f"({'total' if is_ultra_fast else 'scanned'}={awb.pcs if is_ultra_fast else scanned_pcs}, booked={already_booked})"
+            )
             continue
 
-        if item.booked_pcs > remaining:
+        if item.booked_pcs > available:
             errors.append(
                 f"AWB {awb.awb_no}: requested {item.booked_pcs} pcs "
-                f"but only {remaining} remaining"
+                f"but only {available} available "
+                f"(scanned={scanned_pcs}, already_booked={already_booked})"
             )
+            continue
 
     if errors:
         raise HTTPException(status_code=400, detail=errors)
@@ -742,6 +894,7 @@ async def get_flight_booking_by_flight_no_and_date(
             ExportCarMessageAwbMaster.origin,
             ExportCarMessageAwbMaster.destination,
             ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+             ExportCarMessageAwbMaster.is_ultra_fast,
             ExportCarMessageAwbMaster.agent,
             ExportCarMessageAwbMaster.rcs_datetime,
         )
@@ -761,6 +914,17 @@ async def get_flight_booking_by_flight_no_and_date(
         )
 
     awb_ids = [d.awb_master_id for d in details]
+
+    # ✅🤢 ADD — scanned pcs + is_ultra_fast per AWB
+    scanned_result = await db.execute(
+        select(
+            ExportAwbSkidItemSequence.awb_master_id,
+            func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+        )
+        .where(ExportAwbSkidItemSequence.awb_master_id.in_(awb_ids))
+        .group_by(ExportAwbSkidItemSequence.awb_master_id)
+    )
+    scanned_map = {row.awb_master_id: row.scanned_pcs for row in scanned_result.mappings().all()}
 
     # ── Booked in OTHER flights for these AWBs (single query) ──
     booked_elsewhere_result = await db.execute(
@@ -800,6 +964,8 @@ async def get_flight_booking_by_flight_no_and_date(
                 destination=d.destination,
                 total_pcs=d.total_pcs,
                 booked_pcs=d.booked_pcs,
+                scanned_pcs=scanned_map.get(d.awb_master_id, 0),   # ✅ ADD
+                is_ultra_fast=d.is_ultra_fast,        #✅ ADD
                 booked_in_other_flights=booked_in_others,
                 remaining_pcs=remaining,
                 agent=d.agent,
@@ -926,6 +1092,7 @@ async def edit_flight_booking(
             ExportCarMessageAwbMaster.awb_no,
             ExportCarMessageAwbMaster.pcs,
             ExportCarMessageAwbMaster.status,
+            ExportCarMessageAwbMaster.is_ultra_fast,   # ← need this for validation
         ).where(ExportCarMessageAwbMaster.id.in_(awb_ids))
     )
     awb_map = {row.id: row for row in awb_result.mappings().all()}
@@ -952,6 +1119,20 @@ async def edit_flight_booking(
         for row in booked_elsewhere_result.mappings().all()
     }
 
+    # ── Fetch scanned pcs ──────────────────────────────────────
+    scanned_result = await db.execute(
+        select(
+            ExportAwbSkidItemSequence.awb_master_id,
+            func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+        )
+        .where(ExportAwbSkidItemSequence.awb_master_id.in_(awb_ids))
+        .group_by(ExportAwbSkidItemSequence.awb_master_id)
+    )
+    scanned_map = {
+        row.awb_master_id: row.scanned_pcs
+        for row in scanned_result.mappings().all()
+    }
+
     # ── Validate each AWB ──────────────────────────────────────
     errors = []
     for item in payload.awbs:
@@ -965,14 +1146,50 @@ async def edit_flight_booking(
             errors.append(f"AWB {awb.awb_no} is not in RCS status")
             continue
 
+        # booked_in_others = booked_elsewhere.get(item.awb_master_id, 0)
+        # available = awb.pcs - booked_in_others  # excludes current flight
+
+        # if item.booked_pcs > available:
+        #     errors.append(
+        #         f"AWB {awb.awb_no}: max {available} pcs available "
+        #         f"({awb.pcs} total − {booked_in_others} in other flights)"
+        #     )
+
         booked_in_others = booked_elsewhere.get(item.awb_master_id, 0)
-        available = awb.pcs - booked_in_others  # excludes current flight
+        scanned_pcs = scanned_map.get(item.awb_master_id, 0)
+        # available = scanned_pcs - booked_in_others   # ✅ scanned based cap
+        # 🔥 ADD THIS
+        is_ultra_fast = awb.is_ultra_fast or False
+
+        if is_ultra_fast:
+            available = (awb.pcs or 0) - booked_in_others
+        else:
+            available = scanned_pcs - booked_in_others
+
+        # ✅ NEW (add this)
+        if item.booked_pcs <= 0:
+            errors.append(
+                f"AWB {awb.awb_no}: booked pcs must be greater than 0"
+            )
+            continue
+
+        if available <= 0:
+            errors.append(
+                f"AWB {awb.awb_no}: no available scanned pcs "
+                f"(scanned={scanned_pcs}, booked_elsewhere={booked_in_others})"
+                #  f"AWB {awb.awb_no}: no pcs available for booking"
+            )
+            continue
 
         if item.booked_pcs > available:
             errors.append(
                 f"AWB {awb.awb_no}: max {available} pcs available "
-                f"({awb.pcs} total − {booked_in_others} in other flights)"
+                f"(scanned={scanned_pcs}, booked_elsewhere={booked_in_others})"
+                f"===="
+                 f"AWB {awb.awb_no}: requested {item.booked_pcs} pcs, "
+                f"but only {available} pcs available"
             )
+            continue
 
     if errors:
         raise HTTPException(status_code=400, detail=errors)
@@ -1264,29 +1481,50 @@ async def get_uld_master_list(db: AsyncSession) -> list[UldMasterResponse]:
 
     return [UldMasterResponse(**row) for row in result.mappings().all()]
 
-# ── Get ULD which is assign to a flight and that flight  depart. If flighrt not depart now then those are not include 
-async def get_uld_master_list_eligeble_for_assignment(db: AsyncSession) -> list[UldMasterResponse]:
+# ──🤮🤢 Get ULD which is assign to a flight and that flight  depart. If flighrt not depart now then those are not include 
+# async def get_uld_master_list_eligeble_for_assignment(db: AsyncSession) -> list[UldMasterResponse]:
 
-    now = get_utc_now()
+#     now = get_utc_now()
 
-    # ── Subquery: ULD ids already assigned to non-departed active flights ──
-    assigned_uld_subq = (
-        select(ExportUldAssignmentDetail.uld_id)
-        .join(
-            ExportUldAssignment,
-            ExportUldAssignmentDetail.assignment_id == ExportUldAssignment.id,
-        )
-        .join(
-            ExportFlightBookingHeader,
-            ExportUldAssignment.flight_header_id == ExportFlightBookingHeader.id,
-        )
-        .where(
-            ExportUldAssignment.is_active == True,
-            ExportFlightBookingHeader.is_active == True,
-            ExportFlightBookingHeader.flight_dpt_datetime > now,  # ✅ not yet departed
-        )
-        .subquery()
-    )
+#     # ── Subquery: ULD ids already assigned to non-departed active flights ──
+#     assigned_uld_subq = (
+#         select(ExportUldAssignmentDetail.uld_id)
+#         .join(
+#             ExportUldAssignment,
+#             ExportUldAssignmentDetail.assignment_id == ExportUldAssignment.id,
+#         )
+#         .join(
+#             ExportFlightBookingHeader,
+#             ExportUldAssignment.flight_header_id == ExportFlightBookingHeader.id,
+#         )
+#         .where(
+#             ExportUldAssignment.is_active == True,
+#             ExportFlightBookingHeader.is_active == True,
+#             ExportFlightBookingHeader.flight_dpt_datetime > now,  # ✅ not yet departed
+#         )
+#         .subquery()
+#     )
+
+#     result = await db.execute(
+#         select(
+#             ExportUldMaster.id.label("uld_id"),
+#             ExportUldMaster.uld_no,
+#             ExportUldMaster.carrier,
+#         )
+#         .where(
+#             ExportUldMaster.is_active == True,
+#             ExportUldMaster.id.notin_(select(assigned_uld_subq)),  # ✅ exclude assigned
+#         )
+#         .order_by(ExportUldMaster.uld_no)
+#     )
+#     rows = result.mappings().all()
+#     print(len(rows))
+
+#     return [UldMasterResponse(**row) for row in rows]
+
+async def get_uld_master_list_eligeble_for_assignment(
+    db: AsyncSession,
+) -> list[UldMasterResponse]:
 
     result = await db.execute(
         select(
@@ -1296,14 +1534,16 @@ async def get_uld_master_list_eligeble_for_assignment(db: AsyncSession) -> list[
         )
         .where(
             ExportUldMaster.is_active == True,
-            ExportUldMaster.id.notin_(select(assigned_uld_subq)),  # ✅ exclude assigned
+            ExportUldMaster.is_available == True,   # ✅ ADD THIS
         )
         .order_by(ExportUldMaster.uld_no)
     )
+
     rows = result.mappings().all()
     print(len(rows))
 
     return [UldMasterResponse(**row) for row in rows]
+
 
 # ── GET assignment by flight ───────────────────────────────────
 async def get_uld_assignment_by_flight(
@@ -1343,6 +1583,149 @@ async def get_uld_assignment_by_flight(
 
 
 # ── CREATE assignment ──────────────────────────────────────────
+# async def create_uld_assignment(
+#     db: AsyncSession,
+#     payload: CreateUldAssignmentRequest,
+#     assigned_by: str,
+# ) -> UldAssignmentResponse:
+
+#     now = get_utc_now()
+
+#     # fetch header
+#     header = await db.get(ExportFlightBookingHeader, payload.flight_header_id)
+#     if not header or not header.is_active:
+#         raise HTTPException(status_code=404, detail="Flight booking not found")
+
+#     # departure check
+#     _check_not_departed(header, header.flight_no)
+
+#     # check no existing assignment
+#     existing = await db.execute(
+#         select(ExportUldAssignment.id).where(
+#             ExportUldAssignment.flight_header_id == payload.flight_header_id,
+#             ExportUldAssignment.is_active == True,
+#         )
+#     )
+#     if existing.scalar_one_or_none():
+#         raise HTTPException(
+#             status_code=400,
+#             detail=f"ULD assignment already exists for flight {header.flight_no} — use edit instead",
+#         )
+
+#     # validate ULDs exist and are active — one query
+#     uld_result = await db.execute(
+#         select(ExportUldMaster.id).where(
+#             ExportUldMaster.id.in_(payload.uld_ids),
+#             ExportUldMaster.is_active == True,
+#         )
+#     )
+#     valid_uld_ids = {row.id for row in uld_result.all()}
+#     invalid = set(payload.uld_ids) - valid_uld_ids
+#     if invalid:
+#         raise HTTPException(
+#             status_code=400,
+#             detail=f"ULD ids not found or inactive: {sorted(invalid)}",
+#         )
+    
+#     # ── Check ULDs not active on another non-departed flight ───
+#     conflicts = await _check_ulds_not_active_on_another_flight(
+#         db=db,
+#         uld_ids=payload.uld_ids,
+#     )
+#     if conflicts:
+#         raise HTTPException(status_code=400, detail=conflicts)
+
+#     # insert assignment
+#     assignment = ExportUldAssignment(
+#         flight_header_id=payload.flight_header_id,
+#         assigned_by=assigned_by,
+#         assigned_at=now,
+#         is_active=True,
+#         created_at=now,
+#         updated_at=now,
+#     )
+#     db.add(assignment)
+#     await db.flush()
+
+
+
+#     # insert details
+#     db.add_all([
+#         ExportUldAssignmentDetail(
+#             assignment_id=assignment.id,
+#             uld_id=uld_id,
+#             created_at=now,
+#         )
+#         for uld_id in payload.uld_ids
+#     ])
+
+#     # ✅ fetch ULD info for readable 😎 Log
+#     uld_info_result = await db.execute(
+#         select(
+#             ExportUldMaster.id,
+#             ExportUldMaster.uld_no,
+#             ExportUldMaster.carrier,
+#         ).where(ExportUldMaster.id.in_(payload.uld_ids))
+#     )
+#     uld_info_map = {row.id: row for row in uld_info_result.mappings().all()}
+
+#     # ✅ fetch all AWBs on this flight for per-AWB logging
+#     awb_ids_result = await db.execute(
+#         select(ExportFlightBookingDetail.awb_master_id).where(
+#             ExportFlightBookingDetail.flight_header_id == payload.flight_header_id
+#         )
+#     )
+#     awb_ids_on_flight = [row.awb_master_id for row in awb_ids_result.all()]
+
+#     # ✅ audit log — one entry per AWB
+#     for awb_id in awb_ids_on_flight:
+#         await write_car_message_flow_audit(
+#             db=db,
+#             awb_reference_id=awb_id,
+#             flight_reference_id=payload.flight_header_id,
+#             module=CarMessageFlowModule.ULD_ASSIGNMENT,
+#             flow_step=CarMessageFlowStep.ULD_ASSIGNMENT,
+#             record_id=assignment.id,
+#             action="CREATE",
+#             performed_by=assigned_by,
+#             changes={
+#                 "event": "ULD_ASSIGNMENT_CREATED",
+#                 "flight_no": header.flight_no,
+#                 "flight_date": str(header.flight_date),
+#                 "uld_count": len(payload.uld_ids),
+#                 "ulds": [
+#                     {
+#                         "uld_id": uid,
+#                         "uld_no": uld_info_map[uid].uld_no,
+#                         "carrier": uld_info_map[uid].carrier,
+#                     }
+#                     for uid in payload.uld_ids
+#                     if uid in uld_info_map
+#                 ],
+#                 "summary": (
+#                     f"{len(payload.uld_ids)} ULD(s) assigned to flight "
+#                     f"{header.flight_no} ({header.flight_date}): "
+#                     f"{', '.join(uld_info_map[uid].uld_no for uid in payload.uld_ids if uid in uld_info_map)}"
+#                 ),
+#             },
+#         )
+
+
+# # ------
+#     await db.commit()
+#     await db.refresh(assignment)
+
+#     data = await _build_assignment_response(db, assignment, header)
+#     return UldAssignmentResponse(
+#         success=True,
+#         message=f"ULD assignment created for flight {header.flight_no} — {len(payload.uld_ids)} ULDs assigned",
+#         data=data,
+#     )
+
+# 🤢🤮
+from sqlalchemy import update
+
+# ── CREATE assignment ──────────────────────────────────────────
 async def create_uld_assignment(
     db: AsyncSession,
     payload: CreateUldAssignmentRequest,
@@ -1356,8 +1739,8 @@ async def create_uld_assignment(
     if not header or not header.is_active:
         raise HTTPException(status_code=404, detail="Flight booking not found")
 
-    # departure check
-    _check_not_departed(header, header.flight_no)
+    # ❌ REMOVED departure check
+    # _check_not_departed(header, header.flight_no)
 
     # check no existing assignment
     existing = await db.execute(
@@ -1372,7 +1755,7 @@ async def create_uld_assignment(
             detail=f"ULD assignment already exists for flight {header.flight_no} — use edit instead",
         )
 
-    # validate ULDs exist and are active — one query
+    # validate ULDs exist and are active
     uld_result = await db.execute(
         select(ExportUldMaster.id).where(
             ExportUldMaster.id.in_(payload.uld_ids),
@@ -1386,14 +1769,22 @@ async def create_uld_assignment(
             status_code=400,
             detail=f"ULD ids not found or inactive: {sorted(invalid)}",
         )
-    
-    # ── Check ULDs not active on another non-departed flight ───
-    conflicts = await _check_ulds_not_active_on_another_flight(
-        db=db,
-        uld_ids=payload.uld_ids,
+
+    # ✅ NEW: check availability
+    available_result = await db.execute(
+        select(ExportUldMaster.id).where(
+            ExportUldMaster.id.in_(payload.uld_ids),
+            ExportUldMaster.is_available == True,
+        )
     )
-    if conflicts:
-        raise HTTPException(status_code=400, detail=conflicts)
+    available_ids = {row.id for row in available_result.all()}
+    not_available = set(payload.uld_ids) - available_ids
+
+    if not_available:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ULD not available: {sorted(not_available)}",
+        )
 
     # insert assignment
     assignment = ExportUldAssignment(
@@ -1407,8 +1798,6 @@ async def create_uld_assignment(
     db.add(assignment)
     await db.flush()
 
-
-
     # insert details
     db.add_all([
         ExportUldAssignmentDetail(
@@ -1418,6 +1807,13 @@ async def create_uld_assignment(
         )
         for uld_id in payload.uld_ids
     ])
+
+    # ✅ mark assigned ULDs as unavailable
+    await db.execute(
+        update(ExportUldMaster)
+        .where(ExportUldMaster.id.in_(payload.uld_ids))
+        .values(is_available=False)
+    )
 
     # ✅ fetch ULD info for readable 😎 Log
     uld_info_result = await db.execute(
@@ -1470,12 +1866,11 @@ async def create_uld_assignment(
             },
         )
 
-
-# ------
     await db.commit()
     await db.refresh(assignment)
 
     data = await _build_assignment_response(db, assignment, header)
+
     return UldAssignmentResponse(
         success=True,
         message=f"ULD assignment created for flight {header.flight_no} — {len(payload.uld_ids)} ULDs assigned",
@@ -1484,6 +1879,237 @@ async def create_uld_assignment(
 
 
 # ── EDIT assignment ────────────────────────────────────────────
+# async def edit_uld_assignment(
+#     db: AsyncSession,
+#     assignment_id: int,
+#     payload: EditUldAssignmentRequest,
+#     edited_by: str,
+# ) -> UldAssignmentResponse:
+
+#     now = get_utc_now()
+
+#     # fetch assignment
+#     assignment = await db.get(ExportUldAssignment, assignment_id)
+#     if not assignment or not assignment.is_active:
+#         raise HTTPException(status_code=404, detail="ULD assignment not found")
+
+#     # fetch header for departure check
+#     header = await db.get(ExportFlightBookingHeader, assignment.flight_header_id)
+#     _check_not_departed(header, header.flight_no)
+
+#     # fetch existing details
+#     existing_result = await db.execute(
+#         select(ExportUldAssignmentDetail).where(
+#             ExportUldAssignmentDetail.assignment_id == assignment_id
+#         )
+#     )
+#     existing_details = {d.id: d for d in existing_result.scalars().all()}
+#     existing_uld_ids = {d.uld_id for d in existing_details.values()}
+
+#     errors = []
+
+#     # ✅ ADD HERE — block ULD removal if items already loaded
+#     if payload.uld_detail_ids_to_remove:
+#         loaded_result = await db.execute(
+#             select(
+#                 ExportSequenceItemUldLoading.uld_assignment_detail_id,
+#                 func.count(ExportSequenceItemUldLoading.id).label("loaded_count"),
+#                 ExportUldMaster.uld_no,
+#             )
+#             .join(
+#                 ExportUldAssignmentDetail,
+#                 ExportSequenceItemUldLoading.uld_assignment_detail_id == ExportUldAssignmentDetail.id,
+#             )
+#             .join(
+#                 ExportUldMaster,
+#                 ExportUldAssignmentDetail.uld_id == ExportUldMaster.id,
+#             )
+#             .where(
+#                 ExportSequenceItemUldLoading.uld_assignment_detail_id.in_(
+#                     payload.uld_detail_ids_to_remove
+#                 )
+#             )
+#             .group_by(
+#                 ExportSequenceItemUldLoading.uld_assignment_detail_id,
+#                 ExportUldMaster.uld_no,
+#             )
+#         )
+#         loaded_rows = loaded_result.mappings().all()
+
+#         block_errors = [
+#             f"ULD {row.uld_no} cannot be removed — "
+#             f"{row.loaded_count} item(s) already loaded into it"
+#             for row in loaded_rows
+#             if row.loaded_count > 0
+#         ]
+
+#         if block_errors:
+#             raise HTTPException(status_code=400, detail=block_errors)
+
+#     # ── validate new ULDs to add ───────────────────────────────
+#     if payload.uld_ids_to_add:
+#         # check duplicates against already assigned
+#         already_assigned = set(payload.uld_ids_to_add) & existing_uld_ids
+#         if already_assigned:
+#             # get uld_nos for readable error
+#             dup_result = await db.execute(
+#                 select(ExportUldMaster.uld_no).where(
+#                     ExportUldMaster.id.in_(already_assigned)
+#                 )
+#             )
+#             dup_nos = [r.uld_no for r in dup_result.all()]
+#             errors.append(f"ULDs already assigned to this flight: {', '.join(dup_nos)}")
+
+#         # check active in master
+#         uld_result = await db.execute(
+#             select(ExportUldMaster.id).where(
+#                 ExportUldMaster.id.in_(payload.uld_ids_to_add),
+#                 ExportUldMaster.is_active == True,
+#             )
+#         )
+#         valid_ids = {row.id for row in uld_result.all()}
+#         invalid = set(payload.uld_ids_to_add) - valid_ids
+#         if invalid:
+#             errors.append(f"ULD ids not found or inactive: {sorted(invalid)}")
+
+#         # ✅ only check flight conflicts if ULDs are valid so far
+#         # no point querying flight conflicts for invalid/inactive ULDs
+#         if not errors:
+#             conflicts = await _check_ulds_not_active_on_another_flight(
+#                 db=db,
+#                 uld_ids=payload.uld_ids_to_add,
+#                 exclude_assignment_id=assignment_id,
+#             )
+#             if conflicts:
+#                 errors.extend(conflicts)
+
+
+#     # ── validate remove ids belong to this assignment ──────────
+#     if payload.uld_detail_ids_to_remove:
+#         invalid_removes = set(payload.uld_detail_ids_to_remove) - set(existing_details.keys())
+#         if invalid_removes:
+#             errors.append(f"Detail ids do not belong to this assignment: {sorted(invalid_removes)}")
+
+#         # block if removing all and not adding any
+#         remaining_after_remove = len(existing_details) - len(payload.uld_detail_ids_to_remove)
+#         net_adds = len(payload.uld_ids_to_add)
+#         if remaining_after_remove + net_adds < 1:
+#             errors.append("At least one ULD must remain in the assignment")
+
+#     if errors:
+#         raise HTTPException(status_code=400, detail=errors)
+
+#     # ── delete removed details ─────────────────────────────────
+#     for detail_id in payload.uld_detail_ids_to_remove:
+#         await db.delete(existing_details[detail_id])
+
+#     # ── insert new ULDs ────────────────────────────────────────
+#     db.add_all([
+#         ExportUldAssignmentDetail(
+#             assignment_id=assignment_id,
+#             uld_id=uld_id,
+#             created_at=now,
+#         )
+#         for uld_id in payload.uld_ids_to_add
+#     ])
+
+#     assignment.updated_at = now
+    
+# # ====== Log related used 😎
+#     # ✅ snapshot existing uld_id per detail_id before any delete
+#     existing_uld_id_map = {
+#         d_id: d.uld_id
+#         for d_id, d in existing_details.items()
+#     }
+
+#     # ✅ fetch ULD info for both added and removed ULDs
+#     all_relevant_uld_ids = list(
+#         set(payload.uld_ids_to_add) |
+#         {existing_uld_id_map[did] for did in payload.uld_detail_ids_to_remove if did in existing_uld_id_map}
+#     )
+
+#     uld_info_map = {}
+#     if all_relevant_uld_ids:
+#         uld_info_result = await db.execute(
+#             select(
+#                 ExportUldMaster.id,
+#                 ExportUldMaster.uld_no,
+#                 ExportUldMaster.carrier,
+#             ).where(ExportUldMaster.id.in_(all_relevant_uld_ids))
+#         )
+#         uld_info_map = {row.id: row for row in uld_info_result.mappings().all()}
+
+#     # ✅ fetch AWBs on this flight
+#     awb_ids_result = await db.execute(
+#         select(ExportFlightBookingDetail.awb_master_id).where(
+#             ExportFlightBookingDetail.flight_header_id == assignment.flight_header_id
+#         )
+#     )
+#     awb_ids_on_flight = [row.awb_master_id for row in awb_ids_result.all()]
+
+#     # ✅ build readable added/removed uld lists
+#     added_ulds = [
+#         {
+#             "uld_id": uid,
+#             "uld_no": uld_info_map[uid].uld_no,
+#             "carrier": uld_info_map[uid].carrier,
+#         }
+#         for uid in payload.uld_ids_to_add
+#         if uid in uld_info_map
+#     ]
+
+#     removed_ulds = [
+#         {
+#             "uld_id": existing_uld_id_map[did],
+#             "uld_no": uld_info_map[existing_uld_id_map[did]].uld_no,
+#         }
+#         for did in payload.uld_detail_ids_to_remove
+#         if did in existing_uld_id_map
+#         and existing_uld_id_map[did] in uld_info_map
+#     ]
+
+#     added_uld_nos = [u["uld_no"] for u in added_ulds]
+#     removed_uld_nos = [u["uld_no"] for u in removed_ulds]
+
+#     # ✅ audit log — one entry per AWB
+#     for awb_id in awb_ids_on_flight:
+#         await write_car_message_flow_audit(
+#             db=db,
+#             awb_reference_id=awb_id,
+#             flight_reference_id=assignment.flight_header_id,
+#             module=CarMessageFlowModule.ULD_ASSIGNMENT,
+#             flow_step=CarMessageFlowStep.ULD_ASSIGNMENT,
+#             record_id=assignment_id,
+#             action="UPDATE",
+#             performed_by=edited_by,
+#             changes={
+#                 "event": "ULD_ASSIGNMENT_UPDATED",
+#                 "flight_no": header.flight_no,
+#                 "flight_date": str(header.flight_date),
+#                 "added_ulds": added_ulds,
+#                 "removed_ulds": removed_ulds,
+#                 "summary": (
+#                     f"Flight {header.flight_no} ({header.flight_date}) "
+#                     "ULD assignment updated — "
+#                     + (f"Added: {', '.join(added_uld_nos)}. " if added_uld_nos else "No ULDs added. ")
+#                     + (f"Removed: {', '.join(removed_uld_nos)}." if removed_uld_nos else "No ULDs removed.")
+#                 ),
+#             },
+#         )
+
+#     # --------------
+#     await db.commit()
+#     await db.refresh(assignment)
+
+#     data = await _build_assignment_response(db, assignment, header)
+#     return UldAssignmentResponse(
+#         success=True,
+#         message=f"ULD assignment updated for flight {header.flight_no}",
+#         data=data,
+#     )
+
+
+# 🤢🤮
 async def edit_uld_assignment(
     db: AsyncSession,
     assignment_id: int,
@@ -1500,7 +2126,7 @@ async def edit_uld_assignment(
 
     # fetch header for departure check
     header = await db.get(ExportFlightBookingHeader, assignment.flight_header_id)
-    _check_not_departed(header, header.flight_no)
+    # _check_not_departed(header, header.flight_no)
 
     # fetch existing details
     existing_result = await db.execute(
@@ -1513,7 +2139,7 @@ async def edit_uld_assignment(
 
     errors = []
 
-    # ✅ ADD HERE — block ULD removal if items already loaded
+    # ✅ block ULD removal if items already loaded
     if payload.uld_detail_ids_to_remove:
         loaded_result = await db.execute(
             select(
@@ -1553,10 +2179,8 @@ async def edit_uld_assignment(
 
     # ── validate new ULDs to add ───────────────────────────────
     if payload.uld_ids_to_add:
-        # check duplicates against already assigned
         already_assigned = set(payload.uld_ids_to_add) & existing_uld_ids
         if already_assigned:
-            # get uld_nos for readable error
             dup_result = await db.execute(
                 select(ExportUldMaster.uld_no).where(
                     ExportUldMaster.id.in_(already_assigned)
@@ -1565,7 +2189,6 @@ async def edit_uld_assignment(
             dup_nos = [r.uld_no for r in dup_result.all()]
             errors.append(f"ULDs already assigned to this flight: {', '.join(dup_nos)}")
 
-        # check active in master
         uld_result = await db.execute(
             select(ExportUldMaster.id).where(
                 ExportUldMaster.id.in_(payload.uld_ids_to_add),
@@ -1577,17 +2200,27 @@ async def edit_uld_assignment(
         if invalid:
             errors.append(f"ULD ids not found or inactive: {sorted(invalid)}")
 
-        # ✅ only check flight conflicts if ULDs are valid so far
-        # no point querying flight conflicts for invalid/inactive ULDs
-        if not errors:
-            conflicts = await _check_ulds_not_active_on_another_flight(
-                db=db,
-                uld_ids=payload.uld_ids_to_add,
-                exclude_assignment_id=assignment_id,
-            )
-            if conflicts:
-                errors.extend(conflicts)
+        # if not errors:
+        #     conflicts = await _check_ulds_not_active_on_another_flight(
+        #         db=db,
+        #         uld_ids=payload.uld_ids_to_add,
+        #         exclude_assignment_id=assignment_id,
+        #     )
+        #     if conflicts:
+        #         errors.extend(conflicts)
 
+    available_result = await db.execute(
+    select(ExportUldMaster.id).where(
+        ExportUldMaster.id.in_(payload.uld_ids_to_add),
+        ExportUldMaster.is_available == True,
+    )
+    )
+
+    available_ids = {row.id for row in available_result.all()}
+    not_available = set(payload.uld_ids_to_add) - available_ids
+
+    if not_available:
+        errors.append(f"ULD not available: {sorted(not_available)}")
 
     # ── validate remove ids belong to this assignment ──────────
     if payload.uld_detail_ids_to_remove:
@@ -1595,7 +2228,6 @@ async def edit_uld_assignment(
         if invalid_removes:
             errors.append(f"Detail ids do not belong to this assignment: {sorted(invalid_removes)}")
 
-        # block if removing all and not adding any
         remaining_after_remove = len(existing_details) - len(payload.uld_detail_ids_to_remove)
         net_adds = len(payload.uld_ids_to_add)
         if remaining_after_remove + net_adds < 1:
@@ -1605,8 +2237,11 @@ async def edit_uld_assignment(
         raise HTTPException(status_code=400, detail=errors)
 
     # ── delete removed details ─────────────────────────────────
+    removed_uld_ids = []
     for detail_id in payload.uld_detail_ids_to_remove:
-        await db.delete(existing_details[detail_id])
+        if detail_id in existing_details:
+            removed_uld_ids.append(existing_details[detail_id].uld_id)
+            await db.delete(existing_details[detail_id])
 
     # ── insert new ULDs ────────────────────────────────────────
     db.add_all([
@@ -1618,16 +2253,31 @@ async def edit_uld_assignment(
         for uld_id in payload.uld_ids_to_add
     ])
 
+    # ✅ mark added ULDs as unavailable
+    if payload.uld_ids_to_add:
+        await db.execute(
+            update(ExportUldMaster)
+            .where(ExportUldMaster.id.in_(payload.uld_ids_to_add))
+            .values(is_available=False)
+        )
+
+    # ✅ mark removed ULDs as available (MOVED HERE)
+    if removed_uld_ids:
+        await db.execute(
+            update(ExportUldMaster)
+            .where(ExportUldMaster.id.in_(removed_uld_ids))
+            .values(is_available=True)
+        )
+
     assignment.updated_at = now
-    
-# ====== Log related used 😎
-    # ✅ snapshot existing uld_id per detail_id before any delete
+
+    # ====== (NO CHANGE BELOW — your logs remain same 😎) ======
+
     existing_uld_id_map = {
         d_id: d.uld_id
         for d_id, d in existing_details.items()
     }
 
-    # ✅ fetch ULD info for both added and removed ULDs
     all_relevant_uld_ids = list(
         set(payload.uld_ids_to_add) |
         {existing_uld_id_map[did] for did in payload.uld_detail_ids_to_remove if did in existing_uld_id_map}
@@ -1644,7 +2294,6 @@ async def edit_uld_assignment(
         )
         uld_info_map = {row.id: row for row in uld_info_result.mappings().all()}
 
-    # ✅ fetch AWBs on this flight
     awb_ids_result = await db.execute(
         select(ExportFlightBookingDetail.awb_master_id).where(
             ExportFlightBookingDetail.flight_header_id == assignment.flight_header_id
@@ -1652,7 +2301,6 @@ async def edit_uld_assignment(
     )
     awb_ids_on_flight = [row.awb_master_id for row in awb_ids_result.all()]
 
-    # ✅ build readable added/removed uld lists
     added_ulds = [
         {
             "uld_id": uid,
@@ -1676,7 +2324,6 @@ async def edit_uld_assignment(
     added_uld_nos = [u["uld_no"] for u in added_ulds]
     removed_uld_nos = [u["uld_no"] for u in removed_ulds]
 
-    # ✅ audit log — one entry per AWB
     for awb_id in awb_ids_on_flight:
         await write_car_message_flow_audit(
             db=db,
@@ -1702,17 +2349,16 @@ async def edit_uld_assignment(
             },
         )
 
-    # --------------
     await db.commit()
     await db.refresh(assignment)
 
     data = await _build_assignment_response(db, assignment, header)
+
     return UldAssignmentResponse(
         success=True,
         message=f"ULD assignment updated for flight {header.flight_no}",
         data=data,
     )
-
 # ============ END ULD =========================
 
 
@@ -1793,6 +2439,8 @@ async def get_flight_full_detail(
 
     awb_master_ids = [row.awb_master_id for row in awb_rows]
 
+
+
     # ── Fetch skid mappings for all AWBs in one query ──────────
     skid_result = await db.execute(
         select(
@@ -1865,6 +2513,23 @@ async def get_flight_full_detail(
     ) if any(row.skid_id for row in skid_rows) else None
 
     location_rows = location_result.mappings().all() if location_result else []
+
+     # ──🤢 loaded pcs per AWB for this flight======== ────────────────────
+    loaded_per_awb_result = await db.execute(
+        select(
+            ExportSequenceItemUldLoading.awb_master_id,
+            func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+        )
+        .where(ExportSequenceItemUldLoading.flight_header_id == header_id)
+        .group_by(ExportSequenceItemUldLoading.awb_master_id)
+    ) if mapping_ids else None
+
+    loaded_per_awb: dict[int, int] = {
+        row.awb_master_id: row.loaded_pcs
+        for row in (loaded_per_awb_result.mappings().all() if loaded_per_awb_result else [])
+    }
+    # -------
+
 # =========== activity log releted ---
     # ── Fetch full location history for all skids ──────────────
     location_history_result = await db.execute(
@@ -1909,23 +2574,97 @@ async def get_flight_full_detail(
             ExportSkidBaseMapping.mapping_id,
             ExportSkidBaseMapping.skid_id,
             ExportSkidBaseMapping.dropped_by,
+             ExportSkidBaseMapping.cycle_no,
             ExportSkidBaseMapping.dropped_at,
             ExportBaseMaster.base_name,
             ExportBaseMaster.id.label("base_id"),
         )
         .join(ExportBaseMaster, ExportSkidBaseMapping.base_id == ExportBaseMaster.id)
         .where(ExportSkidBaseMapping.mapping_id.in_(mapping_ids))
+        .order_by(ExportSkidBaseMapping.cycle_no.asc())   # ✅ ADD — chronological
     ) if mapping_ids else None
 
     base_drop_rows = base_drop_result.mappings().all() if base_drop_result else []
 
     # keyed by mapping_id
-    base_drop_by_mapping: dict[int, dict] = {
-        row.mapping_id: dict(row)
-        for row in base_drop_rows
-    }
+    # base_drop_by_mapping: dict[int, dict] = {
+    #     row.mapping_id: dict(row)
+    #     for row in base_drop_rows
+    # }
+
+    # ✅ new — list per mapping_id (keeps all cycles)
+    base_drop_by_mapping: dict[int, list] = {}
+    for row in base_drop_rows:
+        base_drop_by_mapping.setdefault(row.mapping_id, []).append(dict(row))
 # ------------
 
+# ── 🤢 ─────────────────
+    # ── loaded pcs per mapping — GLOBAL (across all flights) ──────
+    # loaded_result = await db.execute(
+    #     select(
+    #         ExportSequenceItemUldLoading.mapping_id,
+    #         func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+    #     )
+    #     .where(ExportSequenceItemUldLoading.mapping_id.in_(mapping_ids))
+    #     .group_by(ExportSequenceItemUldLoading.mapping_id)
+    # ) if mapping_ids else None
+
+    loaded_result = await db.execute(
+    select(
+        ExportAwbSkidItemSequence.mapping_id,
+        func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+    )
+    .join(
+        ExportSequenceItemUldLoading,
+        ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id,
+    )
+    .where(
+        ExportAwbSkidItemSequence.mapping_id.in_(mapping_ids)
+    )
+    .group_by(ExportAwbSkidItemSequence.mapping_id)
+)
+    
+    loaded_by_mapping_global: dict[int, int] = {
+        row.mapping_id: row.loaded_pcs
+        for row in (loaded_result.mappings().all() if loaded_result else [])
+    }
+
+    # ── loaded pcs per mapping — THIS FLIGHT ONLY ─────────────────
+    # loaded_this_flight_result = await db.execute(
+    #     select(
+    #         ExportSequenceItemUldLoading.mapping_id,
+    #         func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+    #     )
+    #     .where(
+    #         ExportSequenceItemUldLoading.flight_header_id == header_id,
+    #         ExportSequenceItemUldLoading.mapping_id.in_(mapping_ids),
+    #     )
+    #     .group_by(ExportSequenceItemUldLoading.mapping_id)
+    # ) if mapping_ids else None
+
+    loaded_this_flight_result = await db.execute(
+    select(
+        ExportAwbSkidItemSequence.mapping_id,
+        func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+    )
+    .join(
+        ExportSequenceItemUldLoading,
+        ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id,
+    )
+    .where(
+        ExportSequenceItemUldLoading.flight_header_id == header_id,
+        ExportAwbSkidItemSequence.mapping_id.in_(mapping_ids),
+    )
+    .group_by(ExportAwbSkidItemSequence.mapping_id)
+)
+    
+    loaded_by_mapping_this_flight: dict[int, int] = {
+        row.mapping_id: row.loaded_pcs
+        for row in (loaded_this_flight_result.mappings().all() if loaded_this_flight_result else [])
+    }
+
+
+# ------->
     # location keyed by skid_id — one current location per skid
     location_by_skid: dict[int, dict] = {
         row.skid_id: {
@@ -1985,6 +2724,11 @@ async def get_flight_full_detail(
 
         location_history = location_history_by_skid.get(skid.skid_id, []) if skid.skid_id else []  # ← ADD
         base_drop = base_drop_by_mapping.get(skid.mapping_id) 
+
+        skid_scanned_pcs = len(seq_by_mapping.get(skid.mapping_id, []))
+        skid_loaded_pcs_global = loaded_by_mapping_global.get(skid.mapping_id, 0)       # ✅ all flights
+        skid_loaded_pcs_this_flight = loaded_by_mapping_this_flight.get(skid.mapping_id, 0)  # ✅ this flight
+        skid_remaining_pcs = skid_scanned_pcs - skid_loaded_pcs_global   
         
         skids_by_awb.setdefault(skid.awb_master_id, []).append({
             "mapping_id": skid.mapping_id,
@@ -1996,6 +2740,18 @@ async def get_flight_full_detail(
             "sequences": seq_by_mapping.get(skid.mapping_id, []),
             "scanned_pcs": len(seq_by_mapping.get(skid.mapping_id, [])),
             "current_location": location_by_skid.get(skid.skid_id),
+
+            # 🤢 clear naming
+            "loaded_pcs_this_flight": skid_loaded_pcs_this_flight,   # how many loaded into THIS flight ULD
+            "loaded_pcs_total": skid_loaded_pcs_global,               # how many loaded across ALL flights
+            "remaining_pcs": skid_remaining_pcs,                      # scanned - total loaded = truly remaining
+            "can_relocate": (
+                not skid.is_skid_used_complete
+                and skid_remaining_pcs > 0
+                and skid_loaded_pcs_global > 0    # ✅ at least something loaded globally
+            ),
+
+
             # ✅ only 3 events now
             "activity_log": _build_skid_activity_log(
                 skid=dict(skid),
@@ -2015,6 +2771,8 @@ async def get_flight_full_detail(
     for awb in awb_rows:
         skids = skids_by_awb.get(awb.awb_master_id, [])
         total_scanned = sum(s["scanned_pcs"] for s in skids)
+        loaded_for_flight = loaded_per_awb.get(awb.awb_master_id, 0)
+        is_awb_fully_loaded_for_flight = loaded_for_flight >= awb.booked_pcs
         awbs.append({
             "detail_id": awb.detail_id,
             "awb_master_id": awb.awb_master_id,
@@ -2031,6 +2789,10 @@ async def get_flight_full_detail(
             "status": awb.status,
             "rcs_datetime": awb.rcs_datetime,
             "total_scanned_pcs": total_scanned,
+
+            "loaded_pcs_this_flight": loaded_for_flight,           # ✅ ADD
+            "is_fully_loaded_for_flight": is_awb_fully_loaded_for_flight,  # ✅ ADD — frontend uses this to hide retrieve button
+
             "skids": skids,
         })
 
@@ -2087,6 +2849,8 @@ async def retrieve_skid_from_location(
         select(ExportSkidLocationMapping)
         .where(
             ExportSkidLocationMapping.skid_id == mapping.skid_id,
+            # 🤢
+                ExportSkidLocationMapping.mapping_id == mapping_id,  # ensure location belongs to this mapping
             ExportSkidLocationMapping.is_current == True,
         )
         .order_by(ExportSkidLocationMapping.assigned_at.desc())
@@ -2226,7 +2990,7 @@ async def verify_uld_for_loading(
     )
 
 
-# ── 2. Scan item into ULD ──────────────────────────────────
+# ── 2. 🤢 Scan item into ULD (comment on 10 APR 6:52) ────────────────────────────────── 
 # async def scan_item_into_uld(
 #     db: AsyncSession,
 #     flight_header_id: int,
@@ -2281,15 +3045,17 @@ async def verify_uld_for_loading(
 #         select(
 #             ExportFlightBookingDetail.awb_master_id,
 #             ExportCarMessageAwbMaster.awb_no,
+#             ExportFlightBookingDetail.booked_pcs,    # ✅ ADD booked_pcs
 #         )
 #         .join(ExportCarMessageAwbMaster,
 #               ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id)
 #         .where(ExportFlightBookingDetail.flight_header_id == flight_header_id)
 #     )
-#     flight_awb_map = {
-#         row.awb_master_id: row.awb_no
-#         for row in flight_awb_result.mappings().all()
-#     }
+#     flight_awb_rows = flight_awb_result.mappings().all()
+#     flight_awb_map = {row.awb_master_id: row.awb_no for row in flight_awb_rows}
+
+#     # ✅ ADD — booked_pcs per AWB for this flight
+#     booked_pcs_map = {row.awb_master_id: row.booked_pcs for row in flight_awb_rows}
 
 #     # ── fetch already loaded sequences in one query ────────
 #     already_loaded_result = await db.execute(
@@ -2311,6 +3077,56 @@ async def verify_uld_for_loading(
 #         row.sequence_id: row.loaded_uld_no
 #         for row in already_loaded_result.mappings().all()
 #     }
+
+#     # ✅ ADD — loaded count per AWB for this flight (for cap check)
+#     loaded_count_result = await db.execute(
+#         select(
+#             ExportSequenceItemUldLoading.awb_master_id,
+#             func.count(ExportSequenceItemUldLoading.id).label("loaded_count"),
+#         )
+#         .where(ExportSequenceItemUldLoading.flight_header_id == flight_header_id)
+#         .group_by(ExportSequenceItemUldLoading.awb_master_id)
+#     )
+#     loaded_count_map = {
+#         row.awb_master_id: row.loaded_count
+#         for row in loaded_count_result.mappings().all()
+#     }
+
+#     # ── fetch base drop status — CHANGED to cycle-aware check ─
+#     mapping_ids_in_seq = list({s.mapping_id for s in seq_map.values()})
+
+#     # ✅ CHANGED — base drop must be AFTER last retrieval (cycle-aware)
+#     base_dropped_mapping_ids: set[int] = set()
+#     if mapping_ids_in_seq:
+#         for mid in mapping_ids_in_seq:
+#             # get last retrieval picked_at for this mapping's skid
+#             last_retrieval_result = await db.execute(
+#                 select(ExportSkidLocationMapping.picked_at)
+#                 .join(
+#                     ExportAwbSkidMapping,
+#                     ExportSkidLocationMapping.skid_id == ExportAwbSkidMapping.skid_id,
+#                 )
+#                 .where(
+#                     ExportAwbSkidMapping.id == mid,
+#                     ExportSkidLocationMapping.picked_at.isnot(None),
+#                 )
+#                 .order_by(ExportSkidLocationMapping.picked_at.desc())
+#                 .limit(1)
+#             )
+#             last_retrieval_at = last_retrieval_result.scalar_one_or_none()
+
+#             if not last_retrieval_at:
+#                 continue  # never retrieved → not at base
+
+#             # check base drop exists AFTER that retrieval
+#             base_check = await db.execute(
+#                 select(ExportSkidBaseMapping.id).where(
+#                     ExportSkidBaseMapping.mapping_id == mid,
+#                     ExportSkidBaseMapping.dropped_at >= last_retrieval_at,
+#                 )
+#             )
+#             if base_check.scalar_one_or_none():
+#                 base_dropped_mapping_ids.add(mid)
 
 #     # ── process each sequence_no ───────────────────────────
 #     to_insert = []
@@ -2340,6 +3156,16 @@ async def verify_uld_for_loading(
 #             ))
 #             continue
 
+#         # ── skid not dropped at base yet (cycle-aware)
+#         if seq.mapping_id not in base_dropped_mapping_ids:
+#             results.append(ScanItemResult(
+#                 sequence_no=seq_no,
+#                 awb_no=awb_no,
+#                 success=False,
+#                 message=f"Item '{seq_no}' cannot be loaded — skid has not been dropped at base yet",
+#             ))
+#             continue
+
 #         # ── already loaded in a ULD
 #         loaded_uld = already_loaded_map.get(seq.sequence_id)
 #         if loaded_uld:
@@ -2348,6 +3174,23 @@ async def verify_uld_for_loading(
 #                 awb_no=awb_no,
 #                 success=False,
 #                 message=f"Already loaded into ULD {loaded_uld}",
+#             ))
+#             continue
+
+#         # ✅ ADD — booked_pcs cap check per AWB per flight
+#         booked_pcs = booked_pcs_map.get(seq.awb_master_id, 0)
+#         already_loaded_count = loaded_count_map.get(seq.awb_master_id, 0)
+
+#         if already_loaded_count >= booked_pcs:
+#             results.append(ScanItemResult(
+#                 sequence_no=seq_no,
+#                 awb_no=awb_no,
+#                 success=False,
+#                 message=(
+#                     f"AWB {awb_no} fully loaded for this flight — "
+#                     f"{already_loaded_count}/{booked_pcs} pcs done. "
+#                     "Remaining pcs go to next flight."
+#                 ),
 #             ))
 #             continue
 
@@ -2370,10 +3213,59 @@ async def verify_uld_for_loading(
 #             success=True,
 #             message=f"Loaded into ULD {uld_detail.uld_no}",
 #         ))
+#         # ✅ ADD — increment in-memory so next seq in same batch is checked correctly
+#         loaded_count_map[seq.awb_master_id] = already_loaded_count + 1
 
 #     # ── bulk insert all valid items ────────────────────────
 #     if to_insert:
 #         db.add_all(to_insert)
+#         await db.flush()
+
+#         # ✅ ADD — auto mark skid complete if all its sequences loaded into any ULD
+#         inserted_mapping_ids = {item.mapping_id for item in to_insert}
+#         for mid in inserted_mapping_ids:
+#             total_seq_result = await db.execute(
+#                 select(func.count(ExportAwbSkidItemSequence.id)).where(
+#                     ExportAwbSkidItemSequence.mapping_id == mid
+#                 )
+#             )
+#             total_seqs = total_seq_result.scalar() or 0
+
+#             loaded_seq_result = await db.execute(
+#                 select(func.count(ExportSequenceItemUldLoading.id))
+#                 .join(
+#                     ExportAwbSkidItemSequence,
+#                     ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id,
+#                 )
+#                 .where(ExportAwbSkidItemSequence.mapping_id == mid)
+#             )
+#             loaded_seqs = loaded_seq_result.scalar() or 0
+
+#             if total_seqs > 0 and loaded_seqs >= total_seqs:
+#                 # all sequences loaded — mark complete and unlock skid
+#                 await db.execute(
+#                     update(ExportAwbSkidMapping)
+#                     .where(ExportAwbSkidMapping.id == mid)
+#                     .values(is_skid_used_complete=True)
+#                 )
+#                 # fetch skid_id for unlock
+#                 skid_id_result = await db.execute(
+#                     select(ExportAwbSkidMapping.skid_id)
+#                     .where(ExportAwbSkidMapping.id == mid)
+#                 )
+#                 skid_id = skid_id_result.scalar_one_or_none()
+#                 if skid_id:
+#                     await db.execute(
+#                         update(ExportSkidMaster)
+#                         .where(ExportSkidMaster.id == skid_id)
+#                         .values(
+#                             is_locked=False,
+#                             locked_at=None,
+#                             locked_by_user_id=None,
+#                             updated_at=now,
+#                         )
+#                     )
+
 #         await db.commit()
 
 #     total_loaded = sum(1 for r in results if r.success)
@@ -2389,6 +3281,8 @@ async def verify_uld_for_loading(
 #         results=results,
 #     )
 
+
+# 🤢🤮New scan_item_into_uld with both handling case narmal and utrafast. (Add on on 10 APR 6:52 by commenting above)
 async def scan_item_into_uld(
     db: AsyncSession,
     flight_header_id: int,
@@ -2402,20 +3296,14 @@ async def scan_item_into_uld(
     flight = await db.get(ExportFlightBookingHeader, flight_header_id)
     if not flight or not flight.is_active:
         raise HTTPException(status_code=404, detail="Flight not found")
-
     if flight.flight_dpt_datetime <= now:
         raise HTTPException(status_code=400, detail="Flight has already departed")
 
-    # ── verify ULD belongs to this flight ─────────────────
+    # ── verify ULD ─────────────────────────────────────────
     uld_detail_result = await db.execute(
-        select(
-            ExportUldAssignmentDetail.id,
-            ExportUldMaster.uld_no,
-        )
-        .join(ExportUldAssignment,
-              ExportUldAssignmentDetail.assignment_id == ExportUldAssignment.id)
-        .join(ExportUldMaster,
-              ExportUldAssignmentDetail.uld_id == ExportUldMaster.id)
+        select(ExportUldAssignmentDetail.id, ExportUldMaster.uld_no)
+        .join(ExportUldAssignment, ExportUldAssignmentDetail.assignment_id == ExportUldAssignment.id)
+        .join(ExportUldMaster, ExportUldAssignmentDetail.uld_id == ExportUldMaster.id)
         .where(
             ExportUldAssignmentDetail.id == payload.uld_assignment_detail_id,
             ExportUldAssignment.flight_header_id == flight_header_id,
@@ -2426,7 +3314,26 @@ async def scan_item_into_uld(
     if not uld_detail:
         raise HTTPException(status_code=400, detail="ULD does not belong to this flight")
 
-    # ── fetch all sequences in one query ───────────────────
+    # ── fetch flight AWBs ──────────────────────────────────
+    flight_awb_result = await db.execute(
+        select(
+            ExportFlightBookingDetail.awb_master_id,
+            ExportFlightBookingDetail.booked_pcs,
+            ExportCarMessageAwbMaster.awb_no,
+            ExportCarMessageAwbMaster.is_ultra_fast,
+        )
+        .join(ExportCarMessageAwbMaster,
+              ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id)
+        .where(ExportFlightBookingDetail.flight_header_id == flight_header_id)
+    )
+    flight_awb_rows = flight_awb_result.mappings().all()
+    flight_awb_map    = {row.awb_master_id: row.awb_no for row in flight_awb_rows}
+    booked_pcs_map    = {row.awb_master_id: row.booked_pcs for row in flight_awb_rows}
+    ultra_fast_map    = {row.awb_master_id: row.is_ultra_fast for row in flight_awb_rows}
+    # ✅ prefix map for ultra-fast barcode AWB detection
+    awb_no_to_id_map  = {row.awb_no: row.awb_master_id for row in flight_awb_rows}
+
+    # ── fetch existing sequences in ONE query ──────────────
     seq_result = await db.execute(
         select(
             ExportAwbSkidItemSequence.id.label("sequence_id"),
@@ -2438,22 +3345,36 @@ async def scan_item_into_uld(
     )
     seq_map = {row.sequence_no: row for row in seq_result.mappings().all()}
 
-    # ── fetch flight AWB ids in one query ──────────────────
-    flight_awb_result = await db.execute(
-        select(
-            ExportFlightBookingDetail.awb_master_id,
-            ExportCarMessageAwbMaster.awb_no,
-        )
-        .join(ExportCarMessageAwbMaster,
-              ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id)
-        .where(ExportFlightBookingDetail.flight_header_id == flight_header_id)
-    )
-    flight_awb_map = {
-        row.awb_master_id: row.awb_no
-        for row in flight_awb_result.mappings().all()
-    }
+    # ── split barcodes: normal vs ultra-fast ──────────────
+    normal_seq_nos: list[str] = []
+    ultra_fast_by_awb: dict[int, list[str]] = {}
 
-    # ── fetch already loaded sequences in one query ────────
+    for seq_no in payload.sequence_nos:
+        if seq_no in seq_map:
+            # normal_seq_nos.append(seq_no)
+            seq = seq_map[seq_no]
+            # ✅ check if this seq belongs to ultra-fast AWB
+            if ultra_fast_map.get(seq.awb_master_id):
+                # already created in previous call — handle in ultra-fast path
+                ultra_fast_by_awb.setdefault(seq.awb_master_id, []).append(seq_no)
+            else:
+                normal_seq_nos.append(seq_no)
+        else:
+            # not in DB — check via AWB prefix
+            awb_prefix = seq_no[:11]
+            uf_awb_id = awb_no_to_id_map.get(awb_prefix)
+            if uf_awb_id and ultra_fast_map.get(uf_awb_id):
+                ultra_fast_by_awb.setdefault(uf_awb_id, []).append(seq_no)
+            else:
+                # unknown barcode — will be caught in normal processing loop
+                normal_seq_nos.append(seq_no)
+
+    # ══════════════════════════════════════════════════════
+    # NORMAL PATH PROCESSING
+    # ══════════════════════════════════════════════════════
+
+    # ── already loaded sequences ───────────────────────────
+    normal_seq_ids = [seq_map[s].sequence_id for s in normal_seq_nos if s in seq_map]
     already_loaded_result = await db.execute(
         select(
             ExportSequenceItemUldLoading.sequence_id,
@@ -2461,109 +3382,326 @@ async def scan_item_into_uld(
         )
         .join(ExportUldAssignmentDetail,
               ExportSequenceItemUldLoading.uld_assignment_detail_id == ExportUldAssignmentDetail.id)
-        .join(ExportUldMaster,
-              ExportUldAssignmentDetail.uld_id == ExportUldMaster.id)
-        .where(
-            ExportSequenceItemUldLoading.sequence_id.in_(
-                [s.sequence_id for s in seq_map.values()]
-            )
-        )
-    )
+        .join(ExportUldMaster, ExportUldAssignmentDetail.uld_id == ExportUldMaster.id)
+        .where(ExportSequenceItemUldLoading.sequence_id.in_(normal_seq_ids))
+    ) if normal_seq_ids else None
     already_loaded_map = {
         row.sequence_id: row.loaded_uld_no
-        for row in already_loaded_result.mappings().all()
+        for row in (already_loaded_result.mappings().all() if already_loaded_result else [])
     }
 
-    # ✅ NEW — fetch base drop status for all mappings in one query
-    mapping_ids_in_seq = list({s.mapping_id for s in seq_map.values()})
-
-    base_drop_result = await db.execute(
-        select(ExportSkidBaseMapping.mapping_id).where(
-            ExportSkidBaseMapping.mapping_id.in_(mapping_ids_in_seq)
+    # ── loaded count per AWB this flight ───────────────────
+    loaded_count_result = await db.execute(
+        select(
+            ExportSequenceItemUldLoading.awb_master_id,
+            func.count(ExportSequenceItemUldLoading.id).label("loaded_count"),
         )
-    ) if mapping_ids_in_seq else None
-
-    base_dropped_mapping_ids = {
-        row.mapping_id
-        for row in (base_drop_result.all() if base_drop_result else [])
+        .where(ExportSequenceItemUldLoading.flight_header_id == flight_header_id)
+        .group_by(ExportSequenceItemUldLoading.awb_master_id)
+    )
+    loaded_count_map = {
+        row.awb_master_id: row.loaded_count
+        for row in loaded_count_result.mappings().all()
     }
 
-    # ── process each sequence_no ───────────────────────────
-    to_insert = []
-    results = []
+    # ── cycle-aware base drop check — ONE batch query ──────
+    # get last picked_at per mapping in ONE query
+    mapping_ids_in_seq = list({seq_map[s].mapping_id for s in normal_seq_nos if s in seq_map})
 
-    for seq_no in payload.sequence_nos:
+    base_dropped_mapping_ids: set[int] = set()
+    if mapping_ids_in_seq:
+        # get last retrieval per mapping in one query using window function
+        last_retrieval_subq = (
+            select(
+                ExportSkidLocationMapping.mapping_id,
+                func.max(ExportSkidLocationMapping.picked_at).label("last_picked_at"),
+            )
+            .where(
+                ExportSkidLocationMapping.mapping_id.in_(mapping_ids_in_seq),
+                ExportSkidLocationMapping.picked_at.isnot(None),
+            )
+            .group_by(ExportSkidLocationMapping.mapping_id)
+            .subquery()
+        )
+
+        # check base drop after last retrieval in ONE query
+        valid_base_result = await db.execute(
+            select(ExportSkidBaseMapping.mapping_id)
+            .join(
+                last_retrieval_subq,
+                and_(
+                    ExportSkidBaseMapping.mapping_id == last_retrieval_subq.c.mapping_id,
+                    ExportSkidBaseMapping.dropped_at >= last_retrieval_subq.c.last_picked_at,
+                )
+            )
+            .where(ExportSkidBaseMapping.mapping_id.in_(mapping_ids_in_seq))
+        )
+        base_dropped_mapping_ids = {row.mapping_id for row in valid_base_result.all()}
+
+    # ── process normal sequences ───────────────────────────
+    to_insert = []
+    results: list[ScanItemResult] = []
+
+    for seq_no in normal_seq_nos:
         seq = seq_map.get(seq_no)
 
-        # ── not found in system
         if not seq:
             results.append(ScanItemResult(
-                sequence_no=seq_no,
-                awb_no="—",
-                success=False,
-                message=f"Item '{seq_no}' not found in system",
+                sequence_no=seq_no, awb_no="—",
+                success=False, message=f"Item '{seq_no}' not found in system",
             ))
             continue
 
-        # ── not part of this flight
         awb_no = flight_awb_map.get(seq.awb_master_id)
         if not awb_no:
             results.append(ScanItemResult(
-                sequence_no=seq_no,
-                awb_no="—",
-                success=False,
-                message=f"Item '{seq_no}' does not belong to any AWB on this flight",
+                sequence_no=seq_no, awb_no="—",
+                success=False, message=f"Item '{seq_no}' does not belong to any AWB on this flight",
             ))
             continue
 
-        # ✅ NEW — skid not dropped at base yet
         if seq.mapping_id not in base_dropped_mapping_ids:
             results.append(ScanItemResult(
-                sequence_no=seq_no,
-                awb_no=awb_no,
-                success=False,
-                message=f"Item '{seq_no}' cannot be loaded — skid has not been dropped at base yet",
+                sequence_no=seq_no, awb_no=awb_no,
+                success=False, message=f"Item '{seq_no}' cannot be loaded — skid not dropped at base yet",
             ))
             continue
 
-        # ── already loaded in a ULD
         loaded_uld = already_loaded_map.get(seq.sequence_id)
         if loaded_uld:
             results.append(ScanItemResult(
-                sequence_no=seq_no,
-                awb_no=awb_no,
-                success=False,
-                message=f"Already loaded into ULD {loaded_uld}",
+                sequence_no=seq_no, awb_no=awb_no,
+                success=False, message=f"Already loaded into ULD {loaded_uld}",
             ))
             continue
 
-        # ── all good — add to insert list
-        to_insert.append(
-            ExportSequenceItemUldLoading(
-                flight_header_id=flight_header_id,
-                uld_assignment_detail_id=payload.uld_assignment_detail_id,
-                sequence_id=seq.sequence_id,
-                awb_master_id=seq.awb_master_id,
-                mapping_id=seq.mapping_id,
-                loaded_by=loaded_by,
-                loaded_at=now,
-                created_at=now,
-            )
-        )
-        results.append(ScanItemResult(
-            sequence_no=seq_no,
-            awb_no=awb_no,
-            success=True,
-            message=f"Loaded into ULD {uld_detail.uld_no}",
-        ))
+        booked_pcs = booked_pcs_map.get(seq.awb_master_id, 0)
+        already_loaded_count = loaded_count_map.get(seq.awb_master_id, 0)
+        if already_loaded_count >= booked_pcs:
+            results.append(ScanItemResult(
+                sequence_no=seq_no, awb_no=awb_no,
+                success=False,
+                message=f"AWB {awb_no} fully loaded — {already_loaded_count}/{booked_pcs} pcs done",
+            ))
+            continue
 
-    # ── bulk insert all valid items ────────────────────────
+        to_insert.append(ExportSequenceItemUldLoading(
+            flight_header_id=flight_header_id,
+            uld_assignment_detail_id=payload.uld_assignment_detail_id,
+            sequence_id=seq.sequence_id,
+            awb_master_id=seq.awb_master_id,
+            mapping_id=seq.mapping_id,
+            loaded_by=loaded_by,
+            loaded_at=now,
+            created_at=now,
+        ))
+        results.append(ScanItemResult(
+            sequence_no=seq_no, awb_no=awb_no,
+            success=True, message=f"Loaded into ULD {uld_detail.uld_no}",
+        ))
+        loaded_count_map[seq.awb_master_id] = already_loaded_count + 1
+
+    # ── bulk insert normal ─────────────────────────────────
     if to_insert:
         db.add_all(to_insert)
-        await db.commit()
+        await db.flush()
+
+        # auto complete check
+        inserted_mapping_ids = {item.mapping_id for item in to_insert}
+        for mid in inserted_mapping_ids:
+            total_seqs = await db.scalar(
+                select(func.count(ExportAwbSkidItemSequence.id)).where(
+                    ExportAwbSkidItemSequence.mapping_id == mid)
+            ) or 0
+            loaded_seqs = await db.scalar(
+                select(func.count(ExportSequenceItemUldLoading.id))
+                .join(ExportAwbSkidItemSequence,
+                      ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id)
+                .where(ExportAwbSkidItemSequence.mapping_id == mid)
+            ) or 0
+            if total_seqs > 0 and loaded_seqs >= total_seqs:
+                await db.execute(
+                    update(ExportAwbSkidMapping)
+                    .where(ExportAwbSkidMapping.id == mid)
+                    .values(is_skid_used_complete=True)
+                )
+                skid_id = await db.scalar(
+                    select(ExportAwbSkidMapping.skid_id)
+                    .where(ExportAwbSkidMapping.id == mid)
+                )
+                if skid_id:
+                    await db.execute(
+                        update(ExportSkidMaster)
+                        .where(ExportSkidMaster.id == skid_id)
+                        .values(is_locked=False, locked_at=None,
+                                locked_by_user_id=None, updated_at=now)
+                    )
+
+    # ══════════════════════════════════════════════════════
+    # ULTRA-FAST PATH — batch per AWB in ONE call each
+    # ══════════════════════════════════════════════════════
+    if ultra_fast_by_awb:
+        # get system skid + base once
+        system_skid_id = await db.scalar(
+            select(ExportSkidMaster.id).where(
+                ExportSkidMaster.skid_no == "ULTRAFAST-SYSTEM-SKID")
+        )
+        system_base_id = await db.scalar(
+            select(ExportBaseMaster.id).where(
+                ExportBaseMaster.base_name == "ULTRAFAST-AUTO-BASE")
+        )
+        if not system_skid_id or not system_base_id:
+            raise HTTPException(status_code=500,
+                detail="Ultra-fast system skid or base not seeded in DB")
+
+        for uf_awb_id, uf_seq_nos in ultra_fast_by_awb.items():
+            awb_no = flight_awb_map.get(uf_awb_id, "—")
+            booked_pcs = booked_pcs_map.get(uf_awb_id, 0)
+
+            # get or create mapping
+            mapping_id = await db.scalar(
+                select(ExportAwbSkidMapping.id).where(
+                    ExportAwbSkidMapping.awb_master_id == uf_awb_id,
+                    ExportAwbSkidMapping.skid_id == system_skid_id,
+                    ExportAwbSkidMapping.is_virtual == True,
+                )
+            )
+            if not mapping_id:
+                new_mapping = ExportAwbSkidMapping(
+                    awb_master_id=uf_awb_id,
+                    skid_id=system_skid_id,
+                    is_virtual=True,
+                    virtual_skid_no="ULTRAFAST",
+                    mapped_by=loaded_by,
+                    mapped_at=now,
+                    created_at=now,
+                )
+                db.add(new_mapping)
+                await db.flush()
+                mapping_id = new_mapping.id
+
+            # get or create base drop
+            has_base = await db.scalar(
+                select(ExportSkidBaseMapping.id).where(
+                    ExportSkidBaseMapping.mapping_id == mapping_id)
+            )
+            if not has_base:
+                db.add(ExportSkidBaseMapping(
+                    mapping_id=mapping_id,
+                    skid_id=system_skid_id,
+                    awb_master_id=uf_awb_id,
+                    base_id=system_base_id,
+                    cycle_no=1,
+                    dropped_by="ULTRAFAST-AUTO",
+                    dropped_at=now,
+                    created_at=now,
+                ))
+                await db.flush()
+
+            # already loaded count for this AWB this flight
+            already_loaded = loaded_count_map.get(uf_awb_id, 0)
+
+            # check existing sequences in batch
+            existing_uf_result = await db.execute(
+                select(
+                    ExportAwbSkidItemSequence.sequence_no,
+                    ExportAwbSkidItemSequence.id.label("sequence_id"),
+                ).where(ExportAwbSkidItemSequence.sequence_no.in_(uf_seq_nos))
+            )
+            existing_uf_map = {
+                row.sequence_no: row.sequence_id
+                for row in existing_uf_result.mappings().all()
+            }
+
+            already_loaded_uf_ids: set[int] = set()
+            if existing_uf_map:
+                loaded_uf_result = await db.execute(
+                    select(ExportSequenceItemUldLoading.sequence_id).where(
+                        ExportSequenceItemUldLoading.sequence_id.in_(
+                            list(existing_uf_map.values()))
+                    )
+                )
+                already_loaded_uf_ids = {row.sequence_id for row in loaded_uf_result.all()}
+
+            uf_to_insert_seqs = []
+            seen: set[str] = set()
+            in_memory = already_loaded
+
+            for seq_no in uf_seq_nos:
+                if seq_no in seen:
+                    results.append(ScanItemResult(
+                        sequence_no=seq_no, awb_no=awb_no,
+                        success=False, message="Duplicate in batch",
+                    ))
+                    continue
+                seen.add(seq_no)
+
+                if seq_no in existing_uf_map:
+                    seq_id = existing_uf_map[seq_no]
+                    msg = "Already loaded into ULD" if seq_id in already_loaded_uf_ids \
+                        else "Sequence already scanned — contact supervisor"
+                    results.append(ScanItemResult(
+                        sequence_no=seq_no, awb_no=awb_no,
+                        success=False, message=msg,
+                    ))
+                    continue
+
+                if in_memory >= booked_pcs:
+                    results.append(ScanItemResult(
+                        sequence_no=seq_no, awb_no=awb_no,
+                        success=False,
+                        message=f"AWB fully loaded — {in_memory}/{booked_pcs} pcs done",
+                    ))
+                    continue
+
+                uf_to_insert_seqs.append(ExportAwbSkidItemSequence(
+                    awb_master_id=uf_awb_id,
+                    mapping_id=mapping_id,
+                    sequence_no=seq_no,
+                    sequence_date_time=now,
+                    scanned_by=loaded_by,
+                    scan_by_device="ULTRAFAST-ULD-GATE",
+                ))
+                results.append(ScanItemResult(
+                    sequence_no=seq_no, awb_no=awb_no,
+                    success=True, message=f"Loaded into ULD {uld_detail.uld_no}",
+                ))
+                in_memory += 1
+
+            if uf_to_insert_seqs:
+                db.add_all(uf_to_insert_seqs)
+                await db.flush()
+
+                db.add_all([
+                    ExportSequenceItemUldLoading(
+                        flight_header_id=flight_header_id,
+                        uld_assignment_detail_id=payload.uld_assignment_detail_id,
+                        sequence_id=s.id,
+                        awb_master_id=uf_awb_id,
+                        mapping_id=mapping_id,
+                        loaded_by=loaded_by,
+                        loaded_at=now,
+                        created_at=now,
+                    )
+                    for s in uf_to_insert_seqs
+                ])
+                await db.flush()
+
+                if in_memory >= booked_pcs:
+                    await db.execute(
+                        update(ExportAwbSkidMapping)
+                        .where(ExportAwbSkidMapping.id == mapping_id)
+                        .values(is_skid_used_complete=True)
+                    )
+
+                # sync loaded_count_map for any subsequent normal seq of same AWB
+                loaded_count_map[uf_awb_id] = in_memory
+
+    # ── single commit ──────────────────────────────────────
+    await db.commit()
 
     total_loaded = sum(1 for r in results if r.success)
-    total_failed = sum(1 for r in results if not r.success)
+    total_failed = len(results) - total_loaded
 
     return ScanItemIntoUldResponse(
         success=True,
@@ -2574,7 +3712,6 @@ async def scan_item_into_uld(
         total_failed=total_failed,
         results=results,
     )
-
 
 # ── 3. Get loading status ──────────────────────────────────
 async def get_flight_uld_loading_status(
@@ -2593,6 +3730,18 @@ async def get_flight_uld_loading_status(
             ExportFlightBookingDetail.awb_master_id,
             ExportFlightBookingDetail.booked_pcs,
             ExportCarMessageAwbMaster.awb_no,
+                # ExportCarMessageAwbMaster.origin,
+                # ExportCarMessageAwbMaster.destination,
+                ExportCarMessageAwbMaster.pcs,
+                # ExportCarMessageAwbMaster.gross_wt,
+                # ExportCarMessageAwbMaster.chg_wt,
+                # ExportCarMessageAwbMaster.nog,
+                # ExportCarMessageAwbMaster.shc,
+                # ExportCarMessageAwbMaster.agent,
+                ExportCarMessageAwbMaster.status,
+                # ExportCarMessageAwbMaster.rcs_datetime,
+                ExportCarMessageAwbMaster.is_manually_created,
+                ExportCarMessageAwbMaster.is_ultra_fast,
         )
         .join(ExportCarMessageAwbMaster,
               ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id)
@@ -2626,6 +3775,22 @@ async def get_flight_uld_loading_status(
     base_dropped_mapping_ids = {
         row.mapping_id
         for row in (base_drop_result.all() if base_drop_result else [])
+    }
+
+    # 🤢🤮
+
+    # ── fetch mappings where skid still at location (not retrieved yet) ──
+    at_location_result = await db.execute(
+        select(ExportSkidLocationMapping.mapping_id).where(
+            ExportSkidLocationMapping.mapping_id.in_(all_mapping_ids),
+            ExportSkidLocationMapping.is_current == True,  # still at location
+            ExportSkidLocationMapping.picked_at == None,   # never retrieved
+        )
+    ) if all_mapping_ids else None
+
+    at_location_mapping_ids = {
+        row.mapping_id
+        for row in (at_location_result.all() if at_location_result else [])
     }
 
     # ── loaded pcs per AWB ─────────────────────────────────
@@ -2757,6 +3922,60 @@ async def get_flight_uld_loading_status(
 
     all_sequences_rows = all_sequences_result.mappings().all() if all_sequences_result else []
 
+    # ======🤢🤮
+    # # ✅ NEW — globally loaded sequence ids
+    # globally_loaded_result = await db.execute(
+    #     select(ExportSequenceItemUldLoading.sequence_id).where(
+    #         ExportSequenceItemUldLoading.sequence_id.in_(
+    #             [row.sequence_id for row in all_sequences_rows]
+    #         )
+    #     )
+    # ) if all_sequences_rows else None
+
+    # globally_loaded_sequence_ids = {
+    #     row.sequence_id
+    #     for row in (globally_loaded_result.all() if globally_loaded_result else [])
+    # }-------------
+
+    # ====== ✅ NEW GLOBAL LOADING MAP (WITH DETAILS)
+    global_loading_result = await db.execute(
+        select(
+            ExportSequenceItemUldLoading.sequence_id,
+            ExportFlightBookingHeader.flight_no,
+            ExportFlightBookingHeader.flight_date,
+            ExportUldMaster.uld_no,
+        )
+        .join(
+            ExportFlightBookingHeader,
+            ExportSequenceItemUldLoading.flight_header_id == ExportFlightBookingHeader.id,
+        )
+        .join(
+            ExportUldAssignmentDetail,
+            ExportSequenceItemUldLoading.uld_assignment_detail_id == ExportUldAssignmentDetail.id,
+        )
+        .join(
+            ExportUldMaster,
+            ExportUldAssignmentDetail.uld_id == ExportUldMaster.id,
+        )
+        .where(
+            ExportSequenceItemUldLoading.sequence_id.in_(
+                [row.sequence_id for row in all_sequences_rows]
+            )
+        )
+    ) if all_sequences_rows else None
+
+
+    global_loading_map = {
+        row.sequence_id: {
+            "flight_no": row.flight_no,
+            "flight_date": row.flight_date,
+            "uld_no": row.uld_no,
+        }
+        for row in (global_loading_result.all() if global_loading_result else [])
+    }
+    # ======
+    # ======🤢🤮
+
     # build flat list with loading status per sequence
     all_sequences = [
         {
@@ -2768,21 +3987,48 @@ async def get_flight_uld_loading_status(
             "sequence_date_time": row.sequence_date_time,
             "scanned_by": row.scanned_by,
             "scan_by_device": row.scan_by_device,
-            "is_loaded": row.loading_id is not None,                          # ← True/False
+            "is_loaded": row.loading_id is not None,   # ← True/False
+
+             "is_loaded_globally": row.sequence_id in global_loading_map, # ✅ ADD
+
             "uld_assignment_detail_id": row.uld_assignment_detail_id,         # ← None if not loaded
             "loaded_by": row.loaded_by,
             "loaded_at": row.loaded_at,
             # ✅ ADD — frontend uses this to block scan attempt
            "is_eligible_to_load": (
     row.loading_id is None
+
+     and row.sequence_id not in global_loading_map   # ✅ FIX
+
+    # 🤢🤮
+    and row.mapping_id not in at_location_mapping_ids
+    
     and row.mapping_id in base_dropped_mapping_ids
 ),
 "ineligible_reason": (
-    "Already loaded into ULD"
+    # "Already loaded into ULD"
+    # if row.loading_id is not None
+    # else "Skid not dropped at base yet"
+    # if row.mapping_id not in base_dropped_mapping_ids
+    # else None    # ← eligible — no reason needed
+     "Already loaded into ULD"
     if row.loading_id is not None
+#     else (
+#     f"Already loaded in Flight {global_loading_map[row.sequence_id]['flight_no']} "
+#     f"({global_loading_map[row.sequence_id]['flight_date']}) "
+#     f"in ULD {global_loading_map[row.sequence_id]['uld_no']}"
+# )
+else (
+        f"Already loaded in Flight {global_loading_map[row.sequence_id]['flight_no']} "
+        f"({global_loading_map[row.sequence_id]['flight_date'].strftime('%d-%b-%Y')}) "
+        f"in ULD {global_loading_map[row.sequence_id]['uld_no']}"
+    )
+if row.sequence_id in global_loading_map
+    else "Skid is still at location — retrieve first"   # ← ADD 🤮🤢
+    if row.mapping_id in at_location_mapping_ids
     else "Skid not dropped at base yet"
     if row.mapping_id not in base_dropped_mapping_ids
-    else None    # ← eligible — no reason needed
+    else None
 ),
         }
         for row in all_sequences_rows
@@ -2796,6 +4042,8 @@ async def get_flight_uld_loading_status(
     awb_status = [
         AwbLoadingStatusItem(
             awb_master_id=r.awb_master_id,
+            is_ultra_fast=r.is_ultra_fast,
+            is_manually_created=r.is_manually_created,
             awb_no=r.awb_no,
             booked_pcs=r.booked_pcs,
             loaded_pcs=loaded_per_awb.get(r.awb_master_id, 0),
@@ -2876,6 +4124,17 @@ async def generate_flight_date_report(
 
     LocMapping = aliased(ExportSkidLocationMapping)
 
+    latest_base_subq = (
+        select(
+            ExportSkidBaseMapping.mapping_id,
+            func.max(ExportSkidBaseMapping.dropped_at).label("max_dropped_at"),
+        )
+        .group_by(ExportSkidBaseMapping.mapping_id)
+        .subquery()
+    )
+
+    BaseDrop = aliased(ExportSkidBaseMapping)   # ← ADD
+
     # ── One big query — sequence level with all joins ──────────
     result = await db.execute(
         select(
@@ -2925,8 +4184,11 @@ async def generate_flight_date_report(
 
             # Base drop info
             ExportBaseMaster.base_name,
-            ExportSkidBaseMapping.dropped_at,
-            ExportSkidBaseMapping.dropped_by,
+            # ExportSkidBaseMapping.dropped_at,
+            # ExportSkidBaseMapping.dropped_by,
+
+            BaseDrop.dropped_at,    # ✅ was ExportSkidBaseMapping.dropped_at
+            BaseDrop.dropped_by,    # ✅ was ExportSkidBaseMapping.dropped_by
 
             # ULD info
             ExportUldMaster.uld_no,
@@ -2942,17 +4204,36 @@ async def generate_flight_date_report(
             ExportCarMessageAwbMaster,
             ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id,
         )
+        # .join(
+        #     ExportAwbSkidMapping,
+        #     # ExportAwbSkidMapping.awb_master_id == ExportCarMessageAwbMaster.id,
+        #     ExportAwbSkidMapping.id == ExportAwbSkidItemSequence.mapping_id,
+
+        # )
+         .join(
+            ExportSequenceItemUldLoading,
+            ExportSequenceItemUldLoading.flight_header_id == ExportFlightBookingHeader.id,
+        )
+
+      
+        # .join(
+        #     ExportAwbSkidItemSequence,
+        #     ExportAwbSkidItemSequence.mapping_id == ExportAwbSkidMapping.id,
+        # )
+       
+
+        .join(
+            ExportAwbSkidItemSequence,
+            ExportAwbSkidItemSequence.id == ExportSequenceItemUldLoading.sequence_id,
+        )
+        # 3. THEN join mapping (now sequence exists ✅)
         .join(
             ExportAwbSkidMapping,
-            ExportAwbSkidMapping.awb_master_id == ExportCarMessageAwbMaster.id,
+            ExportAwbSkidMapping.id == ExportAwbSkidItemSequence.mapping_id,
         )
         .join(
             ExportSkidMaster,
             ExportAwbSkidMapping.skid_id == ExportSkidMaster.id,
-        )
-        .join(
-            ExportAwbSkidItemSequence,
-            ExportAwbSkidItemSequence.mapping_id == ExportAwbSkidMapping.id,
         )
         # ── Location — most recent only via two-step join ──────
         .outerjoin(
@@ -2971,19 +4252,44 @@ async def generate_flight_date_report(
             LocMapping.location_id == ExportLocationsMaster.id,
         )
         # ── Base drop ──────────────────────────────────────────
+        # .outerjoin(
+        #     ExportSkidBaseMapping,
+        #     ExportSkidBaseMapping.mapping_id == ExportAwbSkidMapping.id,
+        # )
+        # .outerjoin(
+        #     ExportBaseMaster,
+        #     ExportSkidBaseMapping.base_id == ExportBaseMaster.id,
+        # )
+
+        # ── Base drop — latest only ────────────────────────────
         .outerjoin(
-            ExportSkidBaseMapping,
-            ExportSkidBaseMapping.mapping_id == ExportAwbSkidMapping.id,
+            latest_base_subq,
+            latest_base_subq.c.mapping_id == ExportAwbSkidMapping.id,
+        )
+        .outerjoin(
+            BaseDrop,
+            and_(
+                BaseDrop.mapping_id == ExportAwbSkidMapping.id,
+                BaseDrop.dropped_at == latest_base_subq.c.max_dropped_at,
+            ),
         )
         .outerjoin(
             ExportBaseMaster,
-            ExportSkidBaseMapping.base_id == ExportBaseMaster.id,
+            BaseDrop.base_id == ExportBaseMaster.id,
         )
+
+
+
         # ── ULD loading ────────────────────────────────────────
-        .outerjoin(
-            ExportSequenceItemUldLoading,
-            ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id,
-        )
+    #     .outerjoin(
+    #         ExportSequenceItemUldLoading,
+    #         # ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id,
+    #          and_(
+    #     ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id,
+    #     ExportSequenceItemUldLoading.flight_header_id == ExportFlightBookingHeader.id,
+    # )
+           
+    #     )
         .outerjoin(
             ExportUldAssignmentDetail,
             ExportSequenceItemUldLoading.uld_assignment_detail_id == ExportUldAssignmentDetail.id,
@@ -2998,8 +4304,19 @@ async def generate_flight_date_report(
             ExportFlightBookingHeader.flight_date <= to_date,
 
             ExportFlightBookingHeader.is_active == True,
+  ExportSequenceItemUldLoading.awb_master_id == ExportFlightBookingDetail.awb_master_id,
+             # 🔥 ADD THIS — restrict sequence to AWB of this flight
+    # ExportFlightBookingDetail.awb_master_id == ExportAwbSkidItemSequence.awb_master_id,
+
+    # 🤢
+    # 🔥 ADD THIS — avoid sequences from other flights
+    # or_(
+    #     ExportSequenceItemUldLoading.flight_header_id == ExportFlightBookingHeader.id,
+    #     ExportSequenceItemUldLoading.id.is_(None)
+    # )
         )
         .order_by(
+            ExportFlightBookingHeader.flight_date.asc(), 
             ExportFlightBookingHeader.flight_no,
             ExportCarMessageAwbMaster.awb_no,
             ExportAwbSkidMapping.id,
@@ -3945,3 +5262,1118 @@ async def get_dashboard_drilldown_detail(
         detail=f"Invalid detail_type '{detail_type}'. "
                "Use: all_awbs | rcs_awbs | non_rcs_awbs | scanned_awbs | used_skids" | "flight_bookings",
     )
+
+# =================================== ✌️flight create by pdf service ======================
+
+
+async def upsert_flight_booking_from_pdf(
+    db: AsyncSession,
+    df,                          # extracted DataFrame
+    # flight_dpt_datetime: datetime,
+    booked_by: str,
+) -> PdfUpsertResponse:
+
+    now = get_utc_now()
+
+    # ── Pull flight info from PDF ───────────────────────────────
+    flight_no   = str(df["FLIGHT_NUM"].iloc[0]).strip().upper()
+    flight_date = df["FLIGHT_DATE"].iloc[0]       # already date object
+
+    # ── Departure check ────────────────────────────────────────
+    # Convert IST departure input to UTC for comparison
+    from zoneinfo import ZoneInfo
+    ist = ZoneInfo("Asia/Kolkata")
+    utc = ZoneInfo("UTC")
+
+
+    # ✅ END OF NEXT DAY (23:59:59 IST)
+    dpt_ist = datetime.combine(
+        flight_date + timedelta(days=1),
+        time(23, 59, 59)
+    ).replace(tzinfo=ist)
+
+    # ✅ Convert to UTC for DB
+    dpt_utc = dpt_ist.astimezone(utc)
+
+    # if flight_dpt_datetime.tzinfo is None:
+    #     # assume IST if no tz given
+    #     dpt_ist = flight_dpt_datetime.replace(tzinfo=ist)
+    # else:
+    #     dpt_ist = flight_dpt_datetime
+
+    # dpt_utc = dpt_ist.astimezone(utc)
+
+    # if dpt_utc <= now:
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail=f"Flight {flight_no} has already departed — upload rejected.",
+    #     )
+    print(f"DEBUG: Flight {flight_no} departure IST: {dpt_ist}, departure UTC: {dpt_utc}, now UTC: {now}")
+  
+    # ── Unique AWB nos from PDF ─────────────────────────────────
+    pdf_awb_nos: list[str] = (
+        df["AWB_NUM"].dropna().drop_duplicates().tolist()
+    )
+
+    # ── NEW🫥: Sum LOC_PCS per AWB from PDF (part-shipment aggregation) ──
+    # pdf_awb_pcs: dict[str, int] = (
+    #     df[df["AWB_NUM"].notna()]
+    #     .groupby("AWB_NUM")["LOC_PCS"]
+    #     .sum()
+    #     .astype(int)
+    #     .to_dict()
+    # )
+
+# 🤢
+    pdf_awb_pcs: dict[str, int] = (
+    df[df["AWB_NUM"].notna()]
+    .groupby("AWB_NUM")["LOC_PCS"]
+    .apply(lambda x: int(x.dropna().sum()))   # ← drop NA before summing
+    .to_dict()
+    )
+
+        # ── Check if flight already exists ─────────────────────────
+    existing_header_result = await db.execute(
+        select(ExportFlightBookingHeader).where(
+            ExportFlightBookingHeader.flight_no == flight_no,
+            ExportFlightBookingHeader.flight_date == flight_date,
+            ExportFlightBookingHeader.is_active == True,
+        )
+    )
+    existing_header = existing_header_result.scalar_one_or_none()
+    is_new_flight = existing_header is None
+
+    # 🚨 NEW CHECK — block updates (EXTING FLIGHT) if flight already departed
+    if existing_header:
+        if existing_header.flight_dpt_datetime <= now:
+            # raise HTTPException(
+            #     status_code=400,
+            #     detail=f"Flight {flight_no} already departed — cannot modify",
+            # )
+            return PdfUpsertResponse(
+            success=False,
+            message=f"Flight {flight_no} already departed — no changes applied.",
+            flight_no=flight_no,
+            flight_date=str(flight_date),
+            is_new_flight=False,
+            total_awbs_in_pdf=len(df),
+
+            added=[],
+            removed=[],
+            updated=[],
+            skipped=[],
+            unchanged=[],
+
+            not_found_in_db=[],
+
+            added_count=0,
+            removed_count=0,
+            updated_count=0,
+            skipped_count=0,
+            unchanged_count=0,
+            not_found_count=0,
+        )
+    else:
+        if dpt_utc <= now:
+            return PdfUpsertResponse(
+                success=False,
+                message=f"Flight {flight_no} has already departed (Have old flight date from current in pdf) — upload rejected.",
+                flight_no=flight_no,
+                flight_date=str(flight_date),
+                is_new_flight=True,
+                total_awbs_in_pdf=len(df),
+
+                added=[],
+                removed=[],
+                updated=[],
+                skipped=[],
+                unchanged=[],
+
+                not_found_in_db=[],
+
+                added_count=0,
+                removed_count=0,
+                updated_count=0,
+                skipped_count=0,
+                unchanged_count=0,
+                not_found_count=0,
+            )
+
+
+
+    # ── Fetch AWB master records for PDF AWBs ──────────────────
+    awb_master_result = await db.execute(
+        select(
+            ExportCarMessageAwbMaster.id,
+            ExportCarMessageAwbMaster.awb_no,
+            ExportCarMessageAwbMaster.pcs,
+            ExportCarMessageAwbMaster.status,   # ← ADD THIS
+            ExportCarMessageAwbMaster.is_ultra_fast,  # ✅ ADD THIS
+        ).where(ExportCarMessageAwbMaster.awb_no.in_(pdf_awb_nos))
+    )
+    db_awb_map = {
+        row.awb_no: row
+        for row in awb_master_result.mappings().all()
+    }
+
+    # AWBs in PDF but not in DB
+    not_found_in_db = [
+        AwbLookupError(awb_no=a, reason="Not found in AWB master")
+        for a in pdf_awb_nos if a not in db_awb_map
+    ]
+
+    # # Valid AWBs from PDF that exist in DB (Not in used in new way)
+    # valid_pdf_awb_ids = {
+    #     db_awb_map[a].id
+    #     for a in pdf_awb_nos
+    #     if a in db_awb_map and db_awb_map[a].pcs
+    # }
+
+    # # ── Check if flight already exists ─────────────────────────
+    # existing_header_result = await db.execute(
+    #     select(ExportFlightBookingHeader).where(
+    #         ExportFlightBookingHeader.flight_no == flight_no,
+    #         ExportFlightBookingHeader.flight_date == flight_date,
+    #         ExportFlightBookingHeader.is_active == True,
+    #     )
+    # )
+    # existing_header = existing_header_result.scalar_one_or_none()
+    # is_new_flight = existing_header is None
+
+    # # 🚨 NEW CHECK — block updates (EXTING FLIGHT) if flight already departed
+    # if existing_header:
+    #     if existing_header.flight_dpt_datetime <= now:
+    #         raise HTTPException(
+    #             status_code=400,
+    #             detail=f"Flight {flight_no} already departed — cannot modify",
+    #         )
+
+    # ══════════════════════════════════════════════════════════
+    # CASE A — NEW FLIGHT → delegate to create service
+    # ══════════════════════════════════════════════════════════
+    if is_new_flight:
+        awb_items = []
+        skipped: list[AwbChangeRecord] = []
+        added: list[AwbChangeRecord] = []
+
+        for awb_no in pdf_awb_nos:
+            row = db_awb_map.get(awb_no)
+            if not row:
+                continue
+
+            # ✅🤢 ADD — skip non-RCS instead of letting create_flight_booking raise
+            if row.status != "RCS":
+                skipped.append(AwbChangeRecord(
+                    awb_no=awb_no,
+                    action="SKIPPED",
+                    reason=f"AWB not in RCS status (current: {row.status})",
+                ))
+                continue
+
+            pdf_pcs = pdf_awb_pcs.get(awb_no, 0)
+            if not pdf_pcs:
+                skipped.append(AwbChangeRecord(
+                    awb_no=awb_no,
+                    action="SKIPPED",
+                    reason="AWB has no pcs pdf",
+                ))
+                continue
+
+            # ✅ ADD THIS BLOCK HERE
+            # scanned_result = await db.execute(
+            #     select(
+            #         func.count(ExportAwbSkidItemSequence.id)
+            #     ).where(ExportAwbSkidItemSequence.awb_master_id == row.id)
+            # )
+            # scanned = scanned_result.scalar() or 0
+
+            # if pdf_pcs > scanned:
+            #     skipped.append(AwbChangeRecord(
+            #         awb_no=awb_no,
+            #         action="SKIPPED",
+            #         reason=f"PDF pcs ({pdf_pcs}) exceeds scanned pcs ({scanned})",
+            #     ))
+            #     continue
+
+            # ✅ NEW LOGIC (correct + ultra-fast support)
+
+            # ── 1🤮. Get booked elsewhere ─────────────────────
+            booked_elsewhere_result = await db.execute(
+                select(
+                    func.coalesce(func.sum(ExportFlightBookingDetail.booked_pcs), 0)
+                ).where(
+                    ExportFlightBookingDetail.awb_master_id == row.id
+                )
+            )
+            booked_elsewhere = booked_elsewhere_result.scalar() or 0
+
+
+            # ── 2. Compute available ────────────────────────
+            if row.is_ultra_fast:
+                available = (row.pcs or 0) - booked_elsewhere
+            else:
+                scanned_result = await db.execute(
+                    select(func.count(ExportAwbSkidItemSequence.id))
+                    .where(ExportAwbSkidItemSequence.awb_master_id == row.id)
+                )
+                scanned = scanned_result.scalar() or 0
+
+                available = scanned - booked_elsewhere
+
+
+            # ── 3. Validate ────────────────────────────────
+            # if available <= 0:
+            #     skipped.append(AwbChangeRecord(
+            #         awb_no=awb_no,
+            #         action="SKIPPED",
+            #         reason=f"No available pcs (available={available})",
+            #     ))
+            #     continue
+
+            if available <= 0:
+                if row.is_ultra_fast:
+                    skipped.append(AwbChangeRecord(
+                        awb_no=awb_no,
+                        action="SKIPPED",
+                        reason=(
+                            f"AWB fully booked: total pcs ({row.pcs or 0}) already allocated to flights"
+                        ),
+                    ))
+                else:
+                    skipped.append(AwbChangeRecord(
+                        awb_no=awb_no,
+                        action="SKIPPED",
+                        reason=(
+                            f"AWB has no scanned pcs available "
+                            f"(scanned={scanned}, booked_elsewhere={booked_elsewhere})"
+                        ),
+                    ))
+                continue
+
+            if pdf_pcs > available:
+                skipped.append(AwbChangeRecord(
+                    awb_no=awb_no,
+                    action="SKIPPED",
+                    reason=f"PDF pcs ({pdf_pcs}) exceeds available ({available})",
+                ))
+                continue
+
+            # ------------
+
+            awb_items.append(FlightBookingAwbItem(
+                awb_master_id=row.id,
+                booked_pcs=pdf_pcs, #🫥
+            ))
+            added.append(AwbChangeRecord(
+                awb_no=awb_no,
+                action="ADDED",
+                reason="New flight created from PDF",
+                new_pcs=pdf_pcs, #🫥
+            ))
+
+        # if not awb_items:
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail="No valid AWBs with pcs found in PDF.",
+        #     )
+        if not awb_items:
+            return PdfUpsertResponse(
+                success=False,
+                # message="No valid AWBs found in PDF",
+                message=(
+    f"Flight {flight_no} not created: "
+    f"{len(pdf_awb_nos)} AWBs in PDF, "
+    f"{len(not_found_in_db)} not found in system"
+),
+                flight_no=flight_no,
+                flight_date=str(flight_date),
+                is_new_flight=True,
+                total_awbs_in_pdf=len(pdf_awb_nos),
+
+                added=[],
+                removed=[],
+                updated=[],
+                skipped=skipped,
+                unchanged=[],
+                not_found_in_db=not_found_in_db,
+
+                added_count=0,
+                removed_count=0,
+                updated_count=0,
+                skipped_count=len(skipped),
+                unchanged_count=0,
+                not_found_count=len(not_found_in_db),
+            )
+
+        booking_request = CreateFlightBookingRequest(
+            flight_no=flight_no,
+            flight_date=flight_date,
+            flight_dpt_datetime=dpt_utc,
+            awbs=awb_items,
+        )
+        await create_flight_booking(
+            db=db,
+            payload=booking_request,
+            booked_by=booked_by,
+        )
+
+        return PdfUpsertResponse(
+            success=True,
+            message=f"New flight {flight_no} created with {len(added)} AWBs.",
+            flight_no=flight_no,
+            flight_date=str(flight_date),
+            is_new_flight=True,
+            total_awbs_in_pdf=len(pdf_awb_nos),
+            added=added,
+            removed=[],
+            updated=[],
+            skipped=skipped,
+            unchanged=[],
+            not_found_in_db=not_found_in_db,
+            added_count=len(added),
+            removed_count=0,
+            updated_count=0,
+            skipped_count=len(skipped),
+            unchanged_count=0,
+            not_found_count=len(not_found_in_db),
+        )
+
+    # ══════════════════════════════════════════════════════════
+    # CASE B — EXISTING FLIGHT → upsert
+    # ══════════════════════════════════════════════════════════
+    header_id = existing_header.id
+
+    # ── Fetch existing booking details ─────────────────────────
+    existing_details_result = await db.execute(
+        select(
+            ExportFlightBookingDetail.id.label("detail_id"),
+            ExportFlightBookingDetail.awb_master_id,
+            ExportFlightBookingDetail.booked_pcs,
+            ExportCarMessageAwbMaster.awb_no,
+            ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+        )
+        .join(
+            ExportCarMessageAwbMaster,
+            ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id,
+        )
+        .where(ExportFlightBookingDetail.flight_header_id == header_id)
+    )
+    existing_details = {
+        row.awb_master_id: row
+        for row in existing_details_result.mappings().all()
+    }
+
+    existing_awb_ids = set(existing_details.keys())
+
+    # ── Check scanning status for existing AWBs ────────────────
+    # scanning_started = skid mapping exists AND has at least 1 sequence
+    scanning_result = await db.execute(
+        select(
+            ExportAwbSkidMapping.awb_master_id,
+            func.count(ExportAwbSkidItemSequence.id).label("seq_count"),
+        )
+        .join(
+            ExportAwbSkidItemSequence,
+            ExportAwbSkidItemSequence.mapping_id == ExportAwbSkidMapping.id,
+        )
+        .where(
+            ExportAwbSkidMapping.awb_master_id.in_(existing_awb_ids),
+        )
+        .group_by(ExportAwbSkidMapping.awb_master_id)
+        .having(func.count(ExportAwbSkidItemSequence.id) > 0)
+    )
+    scanning_started_ids = {
+        row.awb_master_id
+        for row in scanning_result.mappings().all()
+    }
+
+    # ── Fetch scanned pcs for existing AWBs ───────────────────
+        # ── Fetch scanned pcs — ALL AWBs (existing + new from PDF) ─
+    all_awb_ids = existing_awb_ids.union({
+        db_awb_map[a].id for a in pdf_awb_nos if a in db_awb_map
+    })
+
+    scanned_result = await db.execute(
+        select(
+            ExportAwbSkidItemSequence.awb_master_id,
+            func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+        )
+        .where(ExportAwbSkidItemSequence.awb_master_id.in_(all_awb_ids))
+        .group_by(ExportAwbSkidItemSequence.awb_master_id)
+    )
+    scanned_map = {
+        row.awb_master_id: row.scanned_pcs
+        for row in scanned_result.mappings().all()
+    }
+
+    #-----🤢
+    booked_elsewhere_result = await db.execute(
+        select(
+            ExportFlightBookingDetail.awb_master_id,
+            func.coalesce(func.sum(ExportFlightBookingDetail.booked_pcs), 0).label("booked_pcs"),
+        )
+        .join(
+            ExportFlightBookingHeader,
+            and_(
+                ExportFlightBookingDetail.flight_header_id == ExportFlightBookingHeader.id,
+                ExportFlightBookingHeader.is_active == True,
+                ExportFlightBookingHeader.id != header_id,
+            )
+        )
+        .where(ExportFlightBookingDetail.awb_master_id.in_(all_awb_ids))
+        .group_by(ExportFlightBookingDetail.awb_master_id)
+   )
+
+    booked_elsewhere_map = {
+        row.awb_master_id: row.booked_pcs
+        for row in booked_elsewhere_result.mappings().all()
+    }
+
+    # ── Process changes ────────────────────────────────────────
+    added: list[AwbChangeRecord] = []
+    removed: list[AwbChangeRecord] = []
+    updated: list[AwbChangeRecord] = []
+    skipped: list[AwbChangeRecord] = []
+    unchanged: list[AwbChangeRecord] = []
+
+    # ── 1. AWBs in PDF but NOT in existing booking → ADD ───────
+    awbs_to_add: list[FlightBookingAwbItem] = []
+    for awb_no in pdf_awb_nos:
+        row = db_awb_map.get(awb_no)
+        if not row:
+            continue  # already in not_found_in_db
+
+        # ✅ ADD
+        awb_full = db_awb_map.get(awb_no)
+        if awb_full and awb_full.status != "RCS":  # need status in db_awb_map query
+            skipped.append(AwbChangeRecord(
+                awb_no=awb_no,
+                action="SKIPPED",
+                reason="AWB not in RCS status",
+            ))
+            continue
+       
+        # CORRECT ✅ — check PDF pcs first, consistent with Case A
+        pdf_pcs = pdf_awb_pcs.get(awb_no, 0)
+        if not pdf_pcs:
+            skipped.append(AwbChangeRecord(
+                awb_no=awb_no,
+                action="SKIPPED",
+                reason="AWB has no pcs in PDF",
+            ))
+            continue
+        
+        if row.id not in existing_awb_ids:
+            # scanned = scanned_map.get(row.id, 0)
+            # booked_el = booked_elsewhere_map.get(row.id, 0)
+
+            # available = scanned - booked_el
+            booked_el = booked_elsewhere_map.get(row.id, 0)
+            if row.is_ultra_fast:
+                available = (row.pcs or 0) - booked_elsewhere_map.get(row.id, 0)
+            else:
+                scanned = scanned_map.get(row.id, 0)
+                # booked_el = booked_elsewhere_map.get(row.id, 0)
+                available = scanned - booked_el
+
+            if available <= 0:
+                skipped.append(AwbChangeRecord(
+                    awb_no=awb_no,
+                    action="SKIPPED",
+                    # reason=f"No available scanned pcs (scanned={scanned}, booked_elsewhere={booked_el})",
+                    reason=f"No available pcs. (available={available})",
+                    new_pcs=pdf_pcs,
+                ))
+                continue
+
+            if pdf_pcs > available:
+                skipped.append(AwbChangeRecord(
+                    awb_no=awb_no,
+                    action="SKIPPED",
+                    reason=f"PDF pcs ({pdf_pcs}) exceeds available scanned pcs ({available})",
+                    new_pcs=pdf_pcs,
+                ))
+                continue
+
+            awbs_to_add.append(FlightBookingAwbItem(
+                awb_master_id=row.id,
+                booked_pcs=pdf_pcs,
+            ))
+            added.append(AwbChangeRecord(
+                awb_no=awb_no,
+                action="ADDED",
+                reason="AWB present in PDF but not in existing booking",
+                new_pcs=pdf_pcs,
+            ))
+
+    # ── 2. AWBs in existing booking but NOT in PDF ─────────────
+    #       Remove if scanning NOT started, skip if started
+    awb_ids_in_pdf = {
+        db_awb_map[a].id for a in pdf_awb_nos if a in db_awb_map
+    }
+    detail_ids_to_remove: list[int] = []
+
+    for awb_id, detail_row in existing_details.items():
+        if awb_id not in awb_ids_in_pdf:
+            scanning = awb_id in scanning_started_ids
+            if scanning:
+                skipped.append(AwbChangeRecord(
+                    awb_no=detail_row.awb_no,
+                    action="SKIPPED",
+                    reason="AWB missing from new PDF but scanning has started — cannot remove",
+                    old_pcs=detail_row.booked_pcs,
+                    scanning_started=True,
+                ))
+            else:
+                detail_ids_to_remove.append(detail_row.detail_id)
+                removed.append(AwbChangeRecord(
+                    awb_no=detail_row.awb_no,
+                    action="REMOVED",
+                    reason="AWB not present in new PDF and scanning has not started",
+                    old_pcs=detail_row.booked_pcs,
+                    scanning_started=False,
+                ))
+
+    # ── 3. AWBs in both — check pcs change ────────────────────
+    pcs_updates: list[tuple[int, int]] = []  # (detail_id, new_pcs)
+
+    for awb_no in pdf_awb_nos:
+        row = db_awb_map.get(awb_no)
+        if not row or row.id not in existing_awb_ids:
+            continue  # handled above
+
+        detail_row = existing_details[row.id]
+        # db_pcs = row.pcs or 0
+        db_pcs = pdf_awb_pcs.get(awb_no, 0)
+        booked_pcs = detail_row.booked_pcs
+        scanning = row.id in scanning_started_ids
+
+        if db_pcs == booked_pcs:
+            unchanged.append(AwbChangeRecord(
+                awb_no=awb_no,
+                action="UNCHANGED",
+                reason="Pcs unchanged",
+                old_pcs=booked_pcs,
+                new_pcs=db_pcs,
+                scanning_started=scanning,
+            ))
+        elif db_pcs != booked_pcs:
+            # ✅🤢 ADD — check remaining pcs across other flights
+            booked_elsewhere = booked_elsewhere_map.get(row.id, 0)
+            # get scanned pcs first
+            # scanned_pcs = scanned_map.get(row.id, 0)
+            # # ✅ FIX — use scanned pcs (already fetched above)
+            # remaining_for_this_flight = scanned_pcs - booked_elsewhere
+
+            # if db_pcs > remaining_for_this_flight:
+            #     skipped.append(AwbChangeRecord(
+            #         awb_no=awb_no,
+            #         action="SKIPPED",
+            #         reason=(
+            #             f"PDF pcs ({db_pcs}) exceeds available remaining "
+            #             f"({remaining_for_this_flight}) — keeping existing {booked_pcs} pcs"
+            #         ),
+            #         old_pcs=booked_pcs,
+            #         new_pcs=db_pcs,
+            #         scanning_started=scanning,
+            #     ))
+                # continue  # skip the update --------------->
+            # get scanned pcs first 
+            scanned_pcs = scanned_map.get(row.id, 0)
+            booked_elsewhere = booked_elsewhere_map.get(row.id, 0)
+
+            if row.is_ultra_fast:
+                remaining_for_this_flight = (row.pcs or 0) - booked_elsewhere
+            else:
+                if db_pcs > scanned_pcs:
+                    skipped.append(AwbChangeRecord(
+                        awb_no=awb_no,
+                        action="SKIPPED",
+                        reason=f"PDF pcs ({db_pcs}) exceeds scanned pcs ({scanned_pcs})",
+                        old_pcs=booked_pcs,
+                        new_pcs=db_pcs,
+                        scanning_started=scanning,
+                    ))
+                    continue
+
+                remaining_for_this_flight = scanned_pcs - booked_elsewhere
+
+            # ── ❗ CRITICAL CHECK: prevent overbooking ───────────
+            if db_pcs > remaining_for_this_flight:
+                skipped.append(AwbChangeRecord(
+                    awb_no=awb_no,
+                    action="SKIPPED",
+                    reason=(
+                        f"PDF pcs ({db_pcs}) exceeds available remaining "
+                        f"({remaining_for_this_flight})"
+                    ),
+                    old_pcs=booked_pcs,
+                    new_pcs=db_pcs,
+                    scanning_started=scanning,
+                ))
+                continue
+
+            if scanning:
+                # check loaded count — cannot reduce below loaded
+                loaded_result = await db.execute(
+                    select(
+                        func.count(ExportSequenceItemUldLoading.id).label("loaded")
+                    ).where(
+                        ExportSequenceItemUldLoading.flight_header_id == header_id,
+                        ExportSequenceItemUldLoading.awb_master_id == row.id,
+                    )
+                )
+                loaded_count = loaded_result.scalar() or 0
+
+                if db_pcs < loaded_count:
+                    skipped.append(AwbChangeRecord(
+                        awb_no=awb_no,
+                        action="SKIPPED",
+                        reason=f"Cannot reduce pcs to {db_pcs} — {loaded_count} items already loaded into ULD",
+                        old_pcs=booked_pcs,
+                        new_pcs=db_pcs,
+                        scanning_started=True,
+                    ))
+                else:
+                    pcs_updates.append((detail_row.detail_id, db_pcs))
+                    updated.append(AwbChangeRecord(
+                        awb_no=awb_no,
+                        action="PCS_UPDATED",
+                        reason=f"Pcs updated from {booked_pcs} to {db_pcs} (scanning started but update is safe)",
+                        old_pcs=booked_pcs,
+                        new_pcs=db_pcs,
+                        scanning_started=True,
+                    ))
+            else:
+                pcs_updates.append((detail_row.detail_id, db_pcs))
+                updated.append(AwbChangeRecord(
+                    awb_no=awb_no,
+                    action="PCS_UPDATED",
+                    reason=f"Pcs updated from {booked_pcs} to {db_pcs}",
+                    old_pcs=booked_pcs,
+                    new_pcs=db_pcs,
+                    scanning_started=False,
+                ))
+
+    # ── Apply all DB changes ───────────────────────────────────
+
+    # Remove details
+    if detail_ids_to_remove:
+        await db.execute(
+            ExportFlightBookingDetail.__table__.delete().where(
+                ExportFlightBookingDetail.id.in_(detail_ids_to_remove)
+            )
+        )
+
+    # Update pcs
+    for detail_id, new_pcs in pcs_updates:
+        await db.execute(
+            ExportFlightBookingDetail.__table__.update()
+            .where(ExportFlightBookingDetail.id == detail_id)
+            .values(booked_pcs=new_pcs)
+        )
+
+    # Insert new AWBs
+    if awbs_to_add:
+        db.add_all([
+            ExportFlightBookingDetail(
+                flight_header_id=header_id,
+                awb_master_id=item.awb_master_id,
+                booked_pcs=item.booked_pcs,
+            )
+            for item in awbs_to_add
+        ])
+
+    # Update header timestamp
+    existing_header.updated_at = now
+
+    # Write audit logs for all changes
+    all_changes = added + removed + updated
+    for change in all_changes:
+        awb_row = next(
+            (r for r in db_awb_map.values() if r.awb_no == change.awb_no), None
+        )
+        if not awb_row:
+            continue
+        await write_car_message_flow_audit(
+            db=db,
+            awb_reference_id=awb_row.id,
+            flight_reference_id=header_id,
+            module=CarMessageFlowModule.FLIGHT_BOOKING,
+            flow_step=CarMessageFlowStep.FLIGHT_BOOKING,
+            record_id=header_id,
+            action="UPDATE",
+            performed_by=booked_by,
+            changes={
+                "event": f"PDF_UPSERT_{change.action}",
+                "flight_no": flight_no,
+                "flight_date": str(flight_date),
+                "awb_no": change.awb_no,
+                "reason": change.reason,
+                "old_pcs": change.old_pcs,
+                "new_pcs": change.new_pcs,
+                "scanning_started": change.scanning_started,
+            },
+        )
+
+    await db.commit()
+
+    # ── Build summary message ──────────────────────────────────
+    parts = []
+    if added:    parts.append(f"{len(added)} added")
+    if removed:  parts.append(f"{len(removed)} removed")
+    if updated:  parts.append(f"{len(updated)} pcs updated")
+    if skipped:  parts.append(f"{len(skipped)} skipped")
+    if unchanged: parts.append(f"{len(unchanged)} unchanged")
+    summary = f"Flight {flight_no} updated — " + ", ".join(parts) + "."
+
+    return PdfUpsertResponse(
+        success=True,
+        message=summary,
+        flight_no=flight_no,
+        flight_date=str(flight_date),
+        is_new_flight=False,
+        total_awbs_in_pdf=len(pdf_awb_nos),
+        added=added,
+        removed=removed,
+        updated=updated,
+        skipped=skipped,
+        unchanged=unchanged,
+        not_found_in_db=not_found_in_db,
+        added_count=len(added),
+        removed_count=len(removed),
+        updated_count=len(updated),
+        skipped_count=len(skipped),
+        unchanged_count=len(unchanged),
+        not_found_count=len(not_found_in_db),
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+async def mark_awb_ultra_fast(
+    db: AsyncSession,
+    awb_master_id: int,
+    is_ultra_fast: bool,
+    marked_by: str,
+    remarks: str | None = None,
+) -> dict:
+
+    awb = await db.get(ExportCarMessageAwbMaster, awb_master_id)
+    if not awb:
+        raise HTTPException(status_code=404, detail="AWB not found")
+    
+    
+
+    # ── Prevent re-marking or unmarking ─────────────────────
+    if awb.is_ultra_fast and is_ultra_fast:
+        raise HTTPException(
+            status_code=400,
+            detail=f"AWB {awb.awb_no} is already marked ultra-fast — cannot mark again",
+        )
+
+    if awb.is_ultra_fast and not is_ultra_fast:
+        raise HTTPException(
+            status_code=400,
+            detail=f"AWB {awb.awb_no} is already ultra-fast — cannot revert to normal"
+        )
+
+    # ── Block if scanning already started ─────────────────────
+    if is_ultra_fast:
+        scan_check = await db.execute(
+            select(ExportAwbSkidItemSequence.id)
+            .join(
+                ExportAwbSkidMapping,
+                ExportAwbSkidItemSequence.mapping_id == ExportAwbSkidMapping.id,
+            )
+            .where(ExportAwbSkidMapping.awb_master_id == awb_master_id)
+            .limit(1)
+        )
+        if scan_check.scalar_one_or_none():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"AWB {awb.awb_no} already has scanning started — "
+                    "cannot mark as ultra-fast"
+                ),
+            )
+
+    old_value = awb.is_ultra_fast
+    awb.is_ultra_fast = is_ultra_fast
+
+        # ✅ Track who marked and when
+
+    awb.is_ultra_fast_marked_by = marked_by if is_ultra_fast else None
+    awb.is_ultra_fast_marked_at = get_utc_now() if is_ultra_fast else None
+
+    # ✅ Add remarks if provided
+    if remarks:
+        awb.remarks = remarks
+
+    await write_car_message_flow_audit(
+        db=db,
+        awb_reference_id=awb_master_id,
+        flight_reference_id=None,
+        module=CarMessageFlowModule.AWB_MASTER,
+        flow_step=CarMessageFlowStep.AWB_MASTER,
+        record_id=awb_master_id,
+        action="UPDATE",
+        performed_by=marked_by,
+        changes={
+            "event": "ULTRA_FAST_MARKED",
+            "awb_no": awb.awb_no,
+            "is_ultra_fast_before": old_value,
+            "is_ultra_fast_after": is_ultra_fast,
+             "remarks": remarks,
+        },
+    )
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": (
+            f"AWB {awb.awb_no} marked as ultra-fast"
+            if is_ultra_fast
+            else f"AWB {awb.awb_no} ultra-fast mode removed"
+        ),
+        "awb_no": awb.awb_no,
+        "remarks": remarks,
+        "is_ultra_fast": is_ultra_fast,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+# 🤢------- Get All awb of car message table to show in table in frontend with pagination -------------------
+async def get_awb_data_filtered(
+    db: AsyncSession,
+    start_date: str,
+    end_date: str,
+    status: str,
+    page: int,
+    page_size: int,
+):
+    # ============================
+    # Date Parsing
+    # ============================
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0,
+            tzinfo=timezone.utc
+        )
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999,
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date format. Expected YYYY-MM-DD."
+        )
+
+    # ============================
+    # Base Conditions
+    # ============================
+    conditions = [
+        ExportCarMessageAwbMaster.car_message_datetime_combo >= start_dt,
+        ExportCarMessageAwbMaster.car_message_datetime_combo <= end_dt,
+    ]
+
+    # ============================
+    # Status Filter
+    # ============================
+    if status != "all":
+        if status == "rcs":
+            conditions.append(
+                ExportCarMessageAwbMaster.status == "RCS"
+            )
+        elif status == "not_rcs":
+            conditions.append(
+                ExportCarMessageAwbMaster.status != "RCS"
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status '{status}'. Allowed: all | rcs | not_rcs"
+            )
+
+    # ============================
+    # Base Query (selected columns)
+    # ============================
+    base_query = (
+        select(
+            ExportCarMessageAwbMaster.id,
+            ExportCarMessageAwbMaster.awb_no,
+            ExportCarMessageAwbMaster.origin,
+            ExportCarMessageAwbMaster.destination,
+            ExportCarMessageAwbMaster.sb_no,
+            ExportCarMessageAwbMaster.sb_date,
+            ExportCarMessageAwbMaster.pcs,
+            ExportCarMessageAwbMaster.gross_wt,
+            ExportCarMessageAwbMaster.chg_wt,
+            ExportCarMessageAwbMaster.nog,
+            ExportCarMessageAwbMaster.status,
+            ExportCarMessageAwbMaster.car_msg_date,
+            ExportCarMessageAwbMaster.car_msg_time,
+            ExportCarMessageAwbMaster.car_message_datetime_combo,
+            ExportCarMessageAwbMaster.rcs_datetime,
+            ExportCarMessageAwbMaster.is_ultra_fast,
+            ExportCarMessageAwbMaster.created_at,
+            ExportCarMessageAwbMaster.is_manually_created,
+                ExportCarMessageAwbMaster.manual_created_by,
+                ExportCarMessageAwbMaster.manual_creation_remarks,
+                ExportCarMessageAwbMaster.manual_pcs,
+
+        )
+        .where(and_(*conditions))
+    )
+
+    # ============================
+    # Count Query
+    # ============================
+    count_stmt = (
+        select(func.count())
+        .select_from(ExportCarMessageAwbMaster)
+        .where(and_(*conditions))
+    )
+
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
+
+    # ============================
+    # Pagination
+    # ============================
+    offset = (page - 1) * page_size
+
+    data_stmt = (
+        base_query
+        .order_by(ExportCarMessageAwbMaster.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+
+    result = await db.execute(data_stmt)
+    rows = result.mappings().all()
+
+    records = [dict(row) for row in rows]
+
+    return records, total
+
+
+
+
+
+
+
+
+
+
+# 🤢------- Create manual AWB (for cases where PDF upload is not possible in early stage) -------------------
+async def create_manual_awb_service(
+    db: AsyncSession,
+    data: AwbManualCreateRequest,
+    emp_id: str,
+):
+    # ── 1. Check duplicate ─────────────────────
+    result = await db.execute(
+        select(ExportCarMessageAwbMaster).where(
+            ExportCarMessageAwbMaster.awb_no == data.awb_no
+        )
+    )
+    existing = result.scalar_one_or_none()
+
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"AWB '{data.awb_no}' already exists",
+        )
+
+    now = get_utc_now()
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+
+    # ─────────────────────────────────────────────
+    # IST → UTC Builder
+    # ─────────────────────────────────────────────
+    IST = pytz.timezone("Asia/Kolkata")
+    UTC = pytz.utc
+    def build_utc_combo(date_value, time_value):
+        if not date_value:
+            return None
+
+        if not time_value:
+            time_value = "00:00:00"
+
+        try:
+            dt = datetime.combine(
+                date_value,
+                datetime.strptime(time_value, "%H:%M:%S").time()
+            )
+
+            ist_dt = IST.localize(dt)
+            return ist_dt.astimezone(UTC)
+
+        except Exception:
+            return None
+    
+    # ── 2. Create AWB ──────────────────────────
+    new_awb = ExportCarMessageAwbMaster(
+        awb_no=data.awb_no,
+        pcs=data.pcs,
+
+
+        # ✅ manual flags
+        is_manually_created=True,
+        manual_created_by=emp_id,
+        manual_creation_remarks=data.manual_creation_remarks,
+        manual_pcs=data.pcs,
+
+        # Manual also at ultra fast by default, since manual creation is typically for urgent cases without PDF
+        is_ultra_fast=True,
+        is_ultra_fast_marked_by=emp_id,
+        is_ultra_fast_marked_at=now,
+
+        # optional defaults
+        status="RCS",   # if your flow requires
+        # rcs_datetime=now,
+
+        # ✅ car message date time and combo for easier querying and filtering when manual create
+        car_msg_date=now_ist.date(),
+        car_msg_time=now_ist.strftime("%H:%M:%S"),
+        car_message_datetime_combo=build_utc_combo(now_ist.date(), now_ist.strftime("%H:%M:%S")),
+
+        created_at=now,
+        updated_at=now,
+    )
+
+    db.add(new_awb)
+    await db.commit()
+    await db.refresh(new_awb)
+
+    return {
+        "success": True,
+        "message": "AWB created successfully",
+        "awb_id": new_awb.id,
+        "awb_no": new_awb.awb_no,
+        "is_manually_created": new_awb.is_manually_created,
+        "is_ultra_fast" : new_awb.is_ultra_fast,
+        "manual_pcs": new_awb.manual_pcs,
+    }
