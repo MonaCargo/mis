@@ -7,9 +7,10 @@ services/uld_stock_service.py    OR   uld_master_service.py
 """
 
 from datetime import datetime, timezone
+from operator import and_
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
@@ -50,7 +51,8 @@ class UldStockSyncService:
             else:
                 updated += 1
 
-        await self._db.commit()
+        # await self._db.commit()
+        await self._db.flush()  # ✅ changed from commit() — route owns the commit
 
         return UldStockSyncResponse(
             carrier=carrier,
@@ -107,3 +109,59 @@ class UldStockSyncService:
             updated_by  = actor,
         ))
         return "created"
+    
+
+
+
+
+
+
+
+
+    # =============== 🤮🫥SERVICE FOR ULD TO SHOW IN TABLE =====================================
+    @staticmethod
+    async def get_filtered_uld_master(      # ✅ inside class, correct indent
+        db: AsyncSession,
+        carrier: Optional[str],
+        is_available: Optional[bool],
+        is_active: Optional[bool],
+        page: int,
+        page_size: int,
+    ) -> tuple[list[ExportUldMaster], int]:
+
+        query       = select(ExportUldMaster)
+        count_query = select(func.count()).select_from(ExportUldMaster)
+
+        conditions = []
+
+        if carrier and carrier != "all":
+            conditions.append(ExportUldMaster.carrier == carrier.upper())
+
+        if is_available is not None:
+            conditions.append(ExportUldMaster.is_available == is_available)
+
+        if is_active is not None:
+            conditions.append(ExportUldMaster.is_active == is_active)
+
+        # NEW CODE (Fixed)
+        if conditions:
+            query       = query.where(*conditions)
+            count_query = count_query.where(*conditions)
+
+        total_result = await db.execute(count_query)
+        total        = total_result.scalar() or 0
+
+        offset = (page - 1) * page_size
+        query  = query.order_by(ExportUldMaster.updated_at.desc()).offset(offset).limit(page_size)
+
+        result  = await db.execute(query)
+        records = result.scalars().all()
+
+        return list(records), total
+
+    @staticmethod
+    async def get_distinct_carriers(db: AsyncSession) -> list[str]:  # ✅ inside class
+        result = await db.execute(
+            select(ExportUldMaster.carrier).distinct().order_by(ExportUldMaster.carrier)
+        )
+        return [row[0] for row in result.fetchall() if row[0]]
