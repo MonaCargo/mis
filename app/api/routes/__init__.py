@@ -25,6 +25,7 @@ from .exportOperation.export_uld_master import router as export_uld_master_route
 from .exportOperation.export_location_master import router as export_location_master_router
 from .exportOperation.export_carrier_master import router as export_carrier_master_router
 from .exportOperation.export_base_master import router as export_base_master_router
+from .exportOperation.export_fileupload_meta_log import router as export_fileupload_meta_log_router
 
 
 # You can add more routes here as your app grows
@@ -47,6 +48,7 @@ api_v1_router.include_router(export_uld_master_router, prefix="/export/uld", tag
 api_v1_router.include_router(export_location_master_router, prefix="/export/location-master", tags=["Export Locations Master"])
 api_v1_router.include_router(export_base_master_router, prefix="/export/base-master", tags=["Export Base Master"])
 api_v1_router.include_router(export_carrier_master_router, prefix="/export/carrier-master", tags=["Export Carrier Master"])
+api_v1_router.include_router(export_fileupload_meta_log_router, prefix="/export/file-upload-meta/logs", tags=["Export File Upload Meta Logs"])
 
  
 

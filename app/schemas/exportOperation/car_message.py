@@ -169,6 +169,7 @@ class FlightBookingDetailWithAwbResponse(BaseModel):
 
     scanned_pcs: int = 0
     is_ultra_fast: bool = False
+    is_manually_created: bool = False
 
     class Config:
         from_attributes = True   # Pydantic v2
@@ -589,3 +590,10 @@ class UldStockSyncResponse(BaseModel):
     total_created: int
     total_updated: int
     results: list[UldSyncResult]
+
+
+
+class CarMessageExcelExportRequest(BaseModel):
+    startDate: Optional[date]
+    endDate: Optional[date]
+    status: str = "all"
