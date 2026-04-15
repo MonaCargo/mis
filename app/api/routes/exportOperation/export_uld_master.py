@@ -89,18 +89,21 @@
 
 
 import io
+import math
 
 import pandas as pd
 from sqlalchemy import select
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
 from app.core.dependency import verify_token_and_get_user
+from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileUploadMetaLog
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.db.session import get_db
+from app.schemas.domesticOperation.domestic_xray_report import PaginationMetadata
 from app.schemas.exportOperation.car_message import UldStockRecord, UldStockSyncResponse
 from app.schemas.exportOperation.location_master import CreateUldRequest
 from app.services.exportOperation.uld_master_service import MultipleCarriersError, UldStockSyncService
@@ -108,6 +111,7 @@ from app.utils.common.helperFunction import get_utc_now
 from app.utils.exportOperation.export_uld_master_cleaner import parse_uld_excel
 from app.utils.exportOperation.extract_uld_inventry_pdf import extract_uld_stock
 
+from app.db.session import engine
 
 router = APIRouter(prefix="/export-uld", tags=["Export ULD Master"])
 
@@ -209,7 +213,31 @@ async def create_uld(
 
 
 
-    # ======================== 🤢🤮
+# ======================== 🤢🤮
+
+async def _write_uld_failure_log(filename, uploaded_by, now, error_message):
+    try:
+        async with AsyncSession(engine) as log_session:
+            async with log_session.begin():
+                log_session.add(ExportFileUploadMetaLog(
+                    filename=filename,
+                    file_type="pdf",
+                    uploaded_by=uploaded_by,
+                    uploaded_at=now,
+                    file_track_type="ULD_INVENTRY_PDF",
+                    status="FAILED",
+                    upload_meta={
+                        "total_in_pdf": 0,
+                        "inserted": 0,
+                        "updated": 0,
+                    },
+                    error_message=str(error_message)[:500],
+                    created_at=now,
+                ))
+    except Exception as log_err:
+        print(f"⚠️ ULD log write failed: {log_err}")
+
+
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 @router.post(
@@ -235,69 +263,203 @@ async def upload_and_sync_uld_stock(
     file: UploadFile = File(...),
     current_user = Depends(verify_token_and_get_user),
 ) -> UldStockSyncResponse:
-
-    # ── 1. Validate file type ─────────────────────────────────────────────────
-    if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF files are allowed.",
-        )
-
-    # ── 2. Read & validate file size ──────────────────────────────────────────
-    contents = await file.read()
-    if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="File too large. Maximum allowed size is 10 MB.",
-        )
-
-
-    # ── 3. Extract records from PDF ───────────────────────────────────────────
-    try:
-        df = extract_uld_stock(io.BytesIO(contents))
-    except Exception as exc:
-      
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to extract data from the PDF.",
-        ) from exc
-
-    if df.empty:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No valid ULD records found in the uploaded PDF.",
-        )
-
     
+    now = get_utc_now()
+    filename = file.filename or "unknown"
 
-    # ── 4. Convert DataFrame rows → UldStockRecord objects ────────────────────
-    records: list[UldStockRecord] = []
-    for row in df.where(pd.notnull(df), None).to_dict(orient="records"):
-        # Normalize datetime/Timestamp fields to ISO strings for Pydantic
-        normalized = {
-            k: v.isoformat() if hasattr(v, "isoformat") else v
-            for k, v in row.items()
-        }
-        records.append(UldStockRecord(**normalized))
-
-    # ── 5. Sync into DB ───────────────────────────────────────────────────────
-    service = UldStockSyncService(db=db)
-
+    # ✅ Capture primitive immediately — avoids lazy load on expired session
+    emp_id = current_user.emp_id
     try:
-        response = await service.sync(
-            records=records,
-            synced_by= current_user.emp_id,  # pass the employee ID of the authenticated user
+        # ── 1. Validate file type ─────────────────────────────────────────────────
+        if not (file.filename or "").lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only PDF files are allowed.",
+            )
+
+        # ── 2. Read & validate file size ──────────────────────────────────────────
+        contents = await file.read()
+        if len(contents) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="File too large. Maximum allowed size is 10 MB.",
+            )
+
+
+        # ── 3. Extract records from PDF ───────────────────────────────────────────
+        try:
+            df = extract_uld_stock(io.BytesIO(contents))
+        except Exception as exc:
+        
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to extract data from the PDF.",
+            ) from exc
+
+        if df.empty:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid ULD records found in the uploaded PDF.",
+            )
+
+        
+
+        # ── 4. Convert DataFrame rows → UldStockRecord objects ────────────────────
+        records: list[UldStockRecord] = []
+        for row in df.where(pd.notnull(df), None).to_dict(orient="records"):
+            # Normalize datetime/Timestamp fields to ISO strings for Pydantic
+            normalized = {
+                k: v.isoformat() if hasattr(v, "isoformat") else v
+                for k, v in row.items()
+            }
+            records.append(UldStockRecord(**normalized))
+
+        # ── 5. Sync into DB ───────────────────────────────────────────────────────
+        service = UldStockSyncService(db=db)
+
+        try:
+            response = await service.sync(
+                records=records,
+                synced_by= emp_id,  # pass the employee ID of the authenticated user
+            )
+        except MultipleCarriersError as exc:
+        
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        except Exception as exc:
+        
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An unexpected error occurred during ULD stock synchronization.",
+            ) from exc
+        # return response
+        # ── 6. Write success log ──────────────────────────────────────────
+        db.add(ExportFileUploadMetaLog(
+            filename=filename,
+            file_type="pdf",
+            uploaded_by=emp_id,
+            uploaded_at=now,
+            file_track_type="ULD_INVENTRY_PDF",
+            status="SUCCESS",
+            upload_meta={
+                 "carrier":        response.carrier,
+                "total_in_pdf": response.total_received,
+                "inserted":     response.total_created,
+                "updated":      response.total_updated,
+            },
+            error_message=None,
+            created_at=now,
+        ))
+        await db.commit()
+
+        return response
+
+    except HTTPException as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        await _write_uld_failure_log(
+            filename=filename,
+            uploaded_by=emp_id,
+            now=now,
+            error_message=e.detail if isinstance(e.detail, str) else str(e.detail),
         )
-    except MultipleCarriersError as exc:
-       
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
-    except Exception as exc:
-       
+        raise
+
+    except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        await _write_uld_failure_log(
+            filename=filename,
+            uploaded_by=emp_id,
+            now=now,
+            error_message=str(e),
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred during ULD stock synchronization.",
-        ) from exc
-    return response
+            detail=f"Processing failed: {str(e)}",
+        )
+
+
+
+
+# ============== ULD MASTER DATA TO SHOW IN WEB TABLE WITH FILTER AND PAGINATION ==============
+
+
+@router.get("/get-uld-master-list-with-pagination", summary="Get ULD master list with filters and pagination")
+async def get_uld_master_list(
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+
+    # filters
+    carrier:      Optional[str]  = Query(None, description="Carrier code e.g. AI, LH, EK | all"),
+    is_available: Optional[bool] = Query(None, description="true | false"),
+    is_active:    Optional[bool] = Query(None, description="true | false"),
+
+    # pagination
+    page:      int = Query(1,  ge=1,         description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Records per page"),
+):
+    # ✅ call via class
+    records, total = await UldStockSyncService.get_filtered_uld_master(
+        db=db,
+        carrier=carrier,
+        is_available=is_available,
+        is_active=is_active,
+        page=page,
+        page_size=page_size,
+    )
+
+    total_pages = math.ceil(total / page_size) if total > 0 else 1
+
+    pagination = PaginationMetadata(
+        current_page=page,
+        page_size=page_size,
+        total_records=total,
+        total_pages=total_pages,
+        has_previous=page > 1,
+        has_next=page < total_pages,
+        previous_page=page - 1 if page > 1 else None,
+        next_page=page + 1 if page < total_pages else None,
+    )
+
+    data = [
+        {
+            "id":           r.id,
+            "uld_no":       r.uld_no,
+            "uld_type":     r.uld_type,
+            "carrier":      r.carrier,
+            "is_available": r.is_available,
+            "is_active":    r.is_active,
+            "created_by":   r.created_by,
+            "updated_by":   r.updated_by,
+            "created_at":   r.created_at.isoformat() if r.created_at else None,
+            "updated_at":   r.updated_at.isoformat() if r.updated_at else None,
+        }
+        for r in records
+    ]
+
+    return {
+        "success":    True,
+        "message":    "ULD master records fetched successfully",
+        "pagination": pagination,
+        "data":       data,
+    }
+
+
+@router.get("/uld-master/carriers")
+async def get_uld_carriers(
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+):
+    """Returns distinct carrier codes — use this to populate the carrier dropdown."""
+    carriers = await UldStockSyncService.get_distinct_carriers(db)
+    return {
+        "success":  True,
+        "carriers": carriers,
+    }

@@ -25,12 +25,14 @@ from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_carrier_master import ExportCarrierMaster
 
+from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileUploadMetaLog
+
 from app.db.models.domesticOperation.domestic_xray_report import DomesticXray
 
 __all__ = [
     # 'WorkerAssignment',
 
-
+    'ExportFileUploadMetaLog',
 
     'ExportAwbSkidItemSequence',
     'ExportAwbSkidMapping',

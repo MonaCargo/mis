@@ -1,15 +1,18 @@
 # services/export_car_message_awb_service.py
 
 from datetime import date, datetime, time, timedelta, timezone
+import re
 from typing import Optional
 from fastapi import status
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
+import openpyxl
 import pytz
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import and_, case, distinct, func, or_, select, update
+from sqlalchemy import and_, case, distinct, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
+from app.api.routes.domesticOperation.domestic_xray_report import convert_ist_day_to_utc_range
 from app.db.models.exportOperation.car_message import (
     ExportAwbSkidItemSequence,
     ExportAwbSkidMapping,
@@ -23,6 +26,7 @@ from app.db.models.exportOperation.car_message import (
     ExportUldAssignmentDetail
 )
 from app.db.models.exportOperation.export_base_master import ExportBaseMaster
+from app.db.models.exportOperation.export_carrier_master import ExportCarrierMaster
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
@@ -325,19 +329,31 @@ async def save_export_car_message_awbs(db: AsyncSession, df, uploaded_by: str = 
         "updated_at": now,
     },
     where=(ExportCarMessageAwbMaster.is_manually_created == True)
-    )
+    ).returning(
+    text("(xmax = 0) AS is_inserted")   # ✅ True = inserted, False = updated
+)
+
 
     result = await db.execute(stmt)
-    await db.commit()
+    # await db.commit()
+    await db.flush()               # ✅ flush only — gets rowcount without committing
 
-    inserted_count = result.rowcount or 0
+    rows = result.fetchall()
+
+    # inserted_count = result.rowcount or 0
+    # total_received = len(records)
+    # already_present = total_received - inserted_count
+
+    inserted_count = sum(1 for r in rows if r[0] is True)
+    updated_count = sum(1 for r in rows if r[0] is False)
     total_received = len(records)
-    already_present = total_received - inserted_count
+    skipped_count = total_received - len(rows)  # where clause was False → not updated
 
     return {
         "total_received": total_received,
         "inserted": inserted_count,
-        "already_present": already_present,
+        "updated": updated_count,
+        "already_present": skipped_count,
     }
 
 
@@ -404,8 +420,11 @@ async def enrich_awb_from_wh_inventory(db: AsyncSession, df) -> dict:
         master.updated_at = now
         matched.add(master.awb_no)
 
-    # ── 4. Commit ─────────────────────────────────────────────────────────────
-    await db.commit()
+    # # ── 4. Commit ─────────────────────────────────────────────────────────────
+    # await db.commit()
+
+     # ── 4. Flush only — route will commit ──────────────────────────────────
+    await db.flush()   # ✅ replaces await db.commit()
 
     not_found = sorted(pdf_awb_set - matched)
 
@@ -897,6 +916,9 @@ async def get_flight_booking_by_flight_no_and_date(
              ExportCarMessageAwbMaster.is_ultra_fast,
             ExportCarMessageAwbMaster.agent,
             ExportCarMessageAwbMaster.rcs_datetime,
+            ExportCarMessageAwbMaster.is_ultra_fast,
+            ExportCarMessageAwbMaster.is_manually_created,
+            
         )
         .join(
             ExportCarMessageAwbMaster,
@@ -1524,9 +1546,10 @@ async def get_uld_master_list(db: AsyncSession) -> list[UldMasterResponse]:
 
 async def get_uld_master_list_eligeble_for_assignment(
     db: AsyncSession,
+    carriers: list[str] | None = None,   # ✅ ADD
 ) -> list[UldMasterResponse]:
 
-    result = await db.execute(
+    stmt  = (
         select(
             ExportUldMaster.id.label("uld_id"),
             ExportUldMaster.uld_no,
@@ -1538,6 +1561,11 @@ async def get_uld_master_list_eligeble_for_assignment(
         )
         .order_by(ExportUldMaster.uld_no)
     )
+        # ✅ ADD
+    if carriers:
+        stmt = stmt.where(ExportUldMaster.carrier.in_(carriers))
+
+    result = await db.execute(stmt)
 
     rows = result.mappings().all()
     print(len(rows))
@@ -2424,6 +2452,9 @@ async def get_flight_full_detail(
             ExportCarMessageAwbMaster.agent,
             ExportCarMessageAwbMaster.status,
             ExportCarMessageAwbMaster.rcs_datetime,
+            # ✅ Add the ultra-fast flag here
+            ExportCarMessageAwbMaster.is_ultra_fast,
+            ExportCarMessageAwbMaster.is_manually_created,
         )
         .join(
             ExportCarMessageAwbMaster,
@@ -2789,6 +2820,8 @@ async def get_flight_full_detail(
             "status": awb.status,
             "rcs_datetime": awb.rcs_datetime,
             "total_scanned_pcs": total_scanned,
+            "is_ultra_fast": awb.is_ultra_fast,
+            "is_manually_created": awb.is_manually_created,
 
             "loaded_pcs_this_flight": loaded_for_flight,           # ✅ ADD
             "is_fully_loaded_for_flight": is_awb_fully_loaded_for_flight,  # ✅ ADD — frontend uses this to hide retrieve button
@@ -6166,8 +6199,8 @@ async def mark_awb_ultra_fast(
 # 🤢------- Get All awb of car message table to show in table in frontend with pagination -------------------
 async def get_awb_data_filtered(
     db: AsyncSession,
-    start_date: str,
-    end_date: str,
+    start_date: Optional[date],
+    end_date: Optional[date],
     status: str,
     page: int,
     page_size: int,
@@ -6175,40 +6208,68 @@ async def get_awb_data_filtered(
     # ============================
     # Date Parsing
     # ============================
-    try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(
-            hour=0, minute=0, second=0, microsecond=0,
-            tzinfo=timezone.utc
+
+    # ============================
+    # Date Conversion (IST → UTC)
+    # ============================
+    start_dt, _ = convert_ist_day_to_utc_range(start_date)
+    _, end_dt = convert_ist_day_to_utc_range(end_date)
+
+
+    conditions = []
+
+    if start_dt:
+        conditions.append(
+            ExportCarMessageAwbMaster.car_message_datetime_combo >= start_dt
         )
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
-            hour=23, minute=59, second=59, microsecond=999999,
-            tzinfo=timezone.utc
-        )
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid date format. Expected YYYY-MM-DD."
+
+    if end_dt:
+        conditions.append(
+            ExportCarMessageAwbMaster.car_message_datetime_combo <= end_dt
         )
 
     # ============================
     # Base Conditions
     # ============================
-    conditions = [
-        ExportCarMessageAwbMaster.car_message_datetime_combo >= start_dt,
-        ExportCarMessageAwbMaster.car_message_datetime_combo <= end_dt,
-    ]
+    # conditions = [
+    #     ExportCarMessageAwbMaster.car_message_datetime_combo >= start_dt,
+    #     ExportCarMessageAwbMaster.car_message_datetime_combo <= end_dt,
+    # ]
 
     # ============================
     # Status Filter
     # ============================
+    # if status != "all":
+    #     if status == "rcs":
+    #         conditions.append(
+    #             ExportCarMessageAwbMaster.status == "RCS"
+    #         )
+    #     elif status == "not_rcs":
+    #         conditions.append(
+    #             ExportCarMessageAwbMaster.status != "RCS"
+    #         )
+    #     else:
+    #         raise HTTPException(
+    #             status_code=400,
+    #             detail=f"Invalid status '{status}'. Allowed: all | rcs | not_rcs"
+    #         )
+
     if status != "all":
         if status == "rcs":
-            conditions.append(
-                ExportCarMessageAwbMaster.status == "RCS"
-            )
+            # Must have status 'RCS' AND a timestamp
+            conditions.append(ExportCarMessageAwbMaster.status == "RCS")
+            conditions.append(ExportCarMessageAwbMaster.rcs_datetime.isnot(None))
+            
         elif status == "not_rcs":
+            # (Status is not RCS) OR (Status is RCS but timestamp is missing)
             conditions.append(
-                ExportCarMessageAwbMaster.status != "RCS"
+                or_(
+                    ExportCarMessageAwbMaster.status != "RCS",
+                    and_(
+                        ExportCarMessageAwbMaster.status == "RCS",
+                        ExportCarMessageAwbMaster.rcs_datetime.is_(None)
+                    )
+                )
             )
         else:
             raise HTTPException(
@@ -6279,7 +6340,160 @@ async def get_awb_data_filtered(
     return records, total
 
 
+async def get_awb_data_for_export(
+    db: AsyncSession,
+   start_date: Optional[date],
+    end_date: Optional[date],
+    status: str,
+) -> list[dict]:
 
+
+        # ============================
+    # Convert IST → UTC
+    # ============================
+    start_dt, _ = convert_ist_day_to_utc_range(start_date)
+    _, end_dt = convert_ist_day_to_utc_range(end_date)
+
+    # ============================
+    # Conditions
+    # ============================
+    conditions = []
+
+    if start_dt:
+        conditions.append(
+            ExportCarMessageAwbMaster.car_message_datetime_combo >= start_dt
+        )
+
+    if end_dt:
+        conditions.append(
+            ExportCarMessageAwbMaster.car_message_datetime_combo <= end_dt
+        )
+
+    if status != "all":
+        if status == "rcs":
+            conditions.append(ExportCarMessageAwbMaster.status == "RCS")
+            conditions.append(ExportCarMessageAwbMaster.rcs_datetime.isnot(None))
+        elif status == "not_rcs":
+            conditions.append(
+                or_(
+                    ExportCarMessageAwbMaster.status != "RCS",
+                    and_(
+                        ExportCarMessageAwbMaster.status == "RCS",
+                        ExportCarMessageAwbMaster.rcs_datetime.is_(None)
+                    )
+                )
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid status '{status}'.")
+
+    stmt = (
+        select(
+            ExportCarMessageAwbMaster.awb_no,
+            ExportCarMessageAwbMaster.origin,
+            ExportCarMessageAwbMaster.destination,
+            ExportCarMessageAwbMaster.sb_no,
+            ExportCarMessageAwbMaster.sb_date,
+            ExportCarMessageAwbMaster.pcs,
+            ExportCarMessageAwbMaster.gross_wt,
+            ExportCarMessageAwbMaster.chg_wt,
+            ExportCarMessageAwbMaster.nog,
+            ExportCarMessageAwbMaster.status,
+            ExportCarMessageAwbMaster.agent,
+            ExportCarMessageAwbMaster.car_msg_date,
+            ExportCarMessageAwbMaster.car_msg_time,
+            ExportCarMessageAwbMaster.car_message_datetime_combo,
+            ExportCarMessageAwbMaster.rcs_datetime,
+            ExportCarMessageAwbMaster.is_ultra_fast,
+            ExportCarMessageAwbMaster.is_manually_created,
+            ExportCarMessageAwbMaster.manual_pcs,
+            ExportCarMessageAwbMaster.created_at,
+        )
+        .where(and_(*conditions))
+        .order_by(ExportCarMessageAwbMaster.created_at.desc())
+    )
+
+    result = await db.execute(stmt)
+    rows = result.mappings().all()
+    return [dict(row) for row in rows]
+
+
+def build_car_message_excel(records: list[dict]) -> BytesIO:
+    IST = pytz.timezone("Asia/Kolkata")
+
+    def format_status(row: dict) -> str:
+        status = row.get("status")
+        rcs_dt = row.get("rcs_datetime")
+
+        if status == "RCS":
+            return "RCS" if rcs_dt else ""
+        return status or ""
+
+    def to_ist(val):
+        if not val:
+            return ""
+        if isinstance(val, datetime):
+            if val.tzinfo is None:
+                val = val.replace(tzinfo=timezone.utc)
+            return val.astimezone(IST).strftime("%d-%b-%Y %H:%M")
+        return str(val)
+
+    def fmt_date(val):
+        if not val:
+            return ""
+        return val.strftime("%d-%b-%Y") if hasattr(val, "strftime") else str(val)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Car Message AWB"
+
+    headers = [
+        "AWB No", "Origin", "Destination", "SB No", "SB Date",
+        "Pcs", "Gross Wt", "Chg Wt", "NOG", "Status", "Agent",
+         "Car Msg Datetime (IST)",
+        "RCS Datetime (IST)", "Ultra Fast", "Manually Created",
+        "Manual Pcs", "Created At (IST)",
+    ]
+
+    # Header row style
+    header_font = Font(bold=True, color="000000")
+    header_fill = PatternFill("solid", fgColor="FFFFFF")
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, r in enumerate(records, 2):
+        ws.cell(row=row_idx, column=1,  value=r.get("awb_no"))
+        ws.cell(row=row_idx, column=2,  value=r.get("origin"))
+        ws.cell(row=row_idx, column=3,  value=r.get("destination"))
+        ws.cell(row=row_idx, column=4,  value=r.get("sb_no"))
+        ws.cell(row=row_idx, column=5,  value=fmt_date(r.get("sb_date")))
+        ws.cell(row=row_idx, column=6,  value=r.get("pcs"))
+        ws.cell(row=row_idx, column=7,  value=r.get("gross_wt"))
+        ws.cell(row=row_idx, column=8,  value=r.get("chg_wt"))
+        ws.cell(row=row_idx, column=9,  value=r.get("nog"))
+        # ws.cell(row=row_idx, column=10, value=r.get("status"))
+        ws.cell(row=row_idx, column=10, value=format_status(r))
+        ws.cell(row=row_idx, column=11, value=r.get("agent"))
+        # ws.cell(row=row_idx, column=12, value=fmt_date(r.get("car_msg_date")))
+        # ws.cell(row=row_idx, column=13, value=r.get("car_msg_time"))
+        ws.cell(row=row_idx, column=12, value=to_ist(r.get("car_message_datetime_combo")))
+        ws.cell(row=row_idx, column=13, value=to_ist(r.get("rcs_datetime")))
+        ws.cell(row=row_idx, column=14, value="YES" if r.get("is_ultra_fast") else "NO")
+        ws.cell(row=row_idx, column=15, value="YES" if r.get("is_manually_created") else "NO")
+        ws.cell(row=row_idx, column=16, value=r.get("manual_pcs"))
+        ws.cell(row=row_idx, column=17, value=to_ist(r.get("created_at")))
+
+    # Auto column width
+    for col in ws.columns:
+        max_len = max((len(str(c.value)) for c in col if c.value), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 
@@ -6377,3 +6591,67 @@ async def create_manual_awb_service(
         "is_ultra_fast" : new_awb.is_ultra_fast,
         "manual_pcs": new_awb.manual_pcs,
     }
+
+
+
+
+
+
+
+
+
+
+# ==========
+
+async def extract_carrier_for_uld_filter(
+    db: AsyncSession,
+    flight_no: str,
+) -> str | None:
+    """
+    Extracts carrier code from flight_no for ULD filtering.
+    Returns carrier_code string if found, None otherwise.
+    ================
+    Extract carrier code from flight number.
+
+    Logic:
+    1. Validate flight_no format (2 or 3 letters + digits)
+    2. Try to match carrier in DB
+    3. Return carrier if found
+    4. Otherwise return None with debug reason
+    """
+    flight_no = flight_no.strip().upper()
+
+    # ── Try 2-char first, then 3-char ─────────────────────────
+    match2 = re.match(r"^([A-Z0-9]{2})(\d{1,4})$", flight_no)
+    match3 = re.match(r"^([A-Z0-9]{3})(\d{1,4})$", flight_no)
+
+    if not match2 and not match3:
+        print(f"❌ Invalid flight_no format: {flight_no}")
+        return None
+
+    # ── 2-char lookup first ────────────────────────────────────
+    if match2:
+        result = await db.execute(
+            select(ExportCarrierMaster.carrier_code).where(
+                ExportCarrierMaster.carrier_code == match2.group(1),
+                ExportCarrierMaster.is_active == True,
+            )
+        )
+        code = result.scalar_one_or_none()
+        if code:
+            return code
+
+    # ── 3-char lookup fallback ─────────────────────────────────
+    if match3:
+        result = await db.execute(
+            select(ExportCarrierMaster.carrier_code).where(
+                ExportCarrierMaster.carrier_code == match3.group(1),
+                ExportCarrierMaster.is_active == True,
+            )
+        )
+        code = result.scalar_one_or_none()
+        if code:
+            return code
+    # ── Final fallback ─────────────────────────────
+    print(f"❌ Carrier extraction failed for flight_no: {flight_no}")
+    return None

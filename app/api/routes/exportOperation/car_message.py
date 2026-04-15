@@ -2,32 +2,73 @@ from datetime import date, datetime
 from io import BytesIO
 import io
 import math
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Form, HTTPException, Query, UploadFile, File, Depends
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependency import verify_token_and_get_user
 from app.db.models.exportOperation.car_message import ExportAwbSkidItemSequence, ExportAwbSkidMapping, ExportCarMessageAwbMaster, ExportSkidLocationMapping
+from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileUploadMetaLog
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.session import get_db
-from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, AwbLookupError, AwbManualCreateRequest, AwbManualCreateResponse, CreateFlightBookingFromPdfResponse, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse, UltraFastScanRequest
+from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, AwbLookupError, AwbManualCreateRequest, AwbManualCreateResponse, CarMessageExcelExportRequest, CreateFlightBookingFromPdfResponse, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse, UltraFastScanRequest
 from app.schemas.user import UserRead
 from app.services.exportOperation.base_master import ultra_fast_scan_and_load
-from app.services.exportOperation.car_message import create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, upsert_flight_booking_from_pdf, verify_uld_for_loading
+from app.services.exportOperation.car_message import build_car_message_excel, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_awb_data_for_export, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, upsert_flight_booking_from_pdf, verify_uld_for_loading
+from app.services.export_slot_file_upload_service import get_utc_now
 from app.utils.exportOperation.car_message import clean_car_message
 from app.utils.exportOperation.extract_flight_planning_data import extract_flight_planning
 from app.utils.exportOperation.wh_inventry_pdf_data_extract import extract_export_inventory
-
+from app.db.session import engine
 
 router = APIRouter(
     prefix="/car-message-awb",
     tags=[]
 )
 
+async def _write_failure_log(filename, file_type, uploaded_by, now, meta, error_message):
+    try:
+        async with AsyncSession(engine) as log_session:
+            async with log_session.begin():
+                log_session.add(ExportFileUploadMetaLog(
+                    filename=filename,
+                    file_type=file_type,
+                    uploaded_by=uploaded_by,
+                    uploaded_at=now,
+                    file_track_type="CAR_MESSAGE_AWB",
+                    status="FAILED",
+                    upload_meta=meta,
+                    error_message=str(error_message)[:500],
+                    created_at=now,
+                ))
+    except Exception as log_err:
+        print(f"⚠️ Log write failed: {log_err}")
+async def _write_inventory_failure_log(filename, uploaded_by, now, error_message):
+    try:
+        async with AsyncSession(engine) as log_session:
+            async with log_session.begin():
+                log_session.add(ExportFileUploadMetaLog(
+                    filename=filename,
+                    file_type="pdf",
+                    uploaded_by=uploaded_by,
+                    uploaded_at=now,
+                    file_track_type="CAR_WH_INVENTORY_PDF",
+                    status="FAILED",
+                    upload_meta={
+                        "total_in_pdf": 0,
+                        "matched_updated": 0,
+                        "not_found_count": 0,
+                    },
+                    error_message=str(error_message)[:500],
+                    created_at=now,
+                ))
+    except Exception as log_err:
+        print(f"⚠️ Inventory log write failed: {log_err}")
 
 @router.post("/upload")
 async def process_export_car_message_file(
@@ -35,6 +76,11 @@ async def process_export_car_message_file(
     current_user = Depends(verify_token_and_get_user),
     db: AsyncSession = Depends(get_db)
 ):
+    
+    now = get_utc_now()
+    filename = file.filename or "unknown"
+    file_type = "unknown"
+    emp_id = current_user.emp_id
 
     try:
         # ✅ Validate filename
@@ -68,8 +114,30 @@ async def process_export_car_message_file(
         save_result = await save_export_car_message_awbs(
             db,
             cleaned_df,
-            uploaded_by=current_user.emp_id,
+            uploaded_by=emp_id,
         )
+
+        # ✅ write log in SAME transaction
+        db.add(ExportFileUploadMetaLog(
+            filename=filename,
+            file_type=file_type,
+            uploaded_by=emp_id,
+            uploaded_at=now,
+            file_track_type="CAR_MESSAGE_AWB",
+            status="SUCCESS",
+            upload_meta={
+                "total_received": save_result["total_received"],
+                "inserted": save_result["inserted"],
+                "updated": save_result["updated"],
+                "already_present": save_result["already_present"],
+                "faulty_rows": len(faulty_df),
+            },
+            error_message=None,
+            created_at=now,
+        ))
+
+        # ✅ ONE commit — AWBs + log together
+        await db.commit()
 
         return {
             "message": "File processed successfully",
@@ -78,17 +146,39 @@ async def process_export_car_message_file(
             "faulty_rows_count": len(faulty_df),
         }
 
-    except HTTPException:
+    except HTTPException as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        # ✅ CHANGED: use fresh session instead of broken db
+        await _write_failure_log(
+            filename=filename,
+            file_type=file_type,
+            uploaded_by=emp_id,
+            now=now,
+            meta={"total_received": 0, "inserted": 0,
+                  "updated": 0, "already_present": 0, "faulty_rows": 0},
+            error_message=e.detail if isinstance(e.detail, str) else str(e.detail),
+        )
         raise
 
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing failed: {str(e)}"
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        # ✅ CHANGED: use fresh session instead of broken db
+        await _write_failure_log(
+            filename=filename,
+            file_type=file_type,
+            uploaded_by=emp_id,
+            now=now,
+            meta={"total_received": 0, "inserted": 0,
+                  "updated": 0, "already_present": 0, "faulty_rows": 0},
+            error_message=str(e),
         )
-    
-
-
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 # @router.get("/search/by-awb", summary="Search AWB by substring")
 # async def search_awb(
@@ -330,11 +420,13 @@ async def get_all_awb(
 # 🤢 Get all awb of car message based on date filter status feature ....
 @router.get("/awb-data-with-paginatoin", summary="Get AWB master records with filters and pagination")
 async def get_awb_data(
-    startDate: str = Query(..., example="2026-01-24"),
-    endDate: str = Query(..., example="2026-01-24"),
+    # startDate: str = Query(..., example="2026-01-24"),
+    # endDate: str = Query(..., example="2026-01-24"),
+    startDate: Optional[date],
+    endDate: Optional[date],
     status: str = Query("all", example="all"),  # all | rcs | not_rcs
     page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=501),
+    page_size: int = Query(10, ge=1, le=401),
     db: AsyncSession = Depends(get_db),
     current_user=Depends(verify_token_and_get_user),
 ):
@@ -372,6 +464,34 @@ async def get_awb_data(
     }
 
 
+@router.post("/awb-data-export-by-filters")
+async def export_awb_data(
+    payload: CarMessageExcelExportRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+):
+    records = await get_awb_data_for_export(
+        db=db,
+        start_date=payload.startDate,
+        end_date=payload.endDate,
+        status=payload.status,
+    )
+
+    if not records:
+        raise HTTPException(status_code=404, detail="No records found for the selected filters.")
+
+    if len(records) > 50000:
+        raise HTTPException(status_code=400, detail="Too many records. Please narrow your date range.")
+
+    buf = build_car_message_excel(records)
+
+    filename = f"car_message_awb_{payload.startDate}_{payload.endDate}.xlsx"
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 
@@ -384,35 +504,85 @@ async def get_awb_data(
 async def upload_inventory_pdf(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
 ):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+    now = get_utc_now()
+    filename = file.filename or "unknown"
+     # ✅ Capture primitive immediately — avoid lazy load issues in except block
+    emp_id = current_user.emp_id  # ← remove this line if no auth on this route
 
-    contents = await file.read()  # ← read once here
+    try:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files allowed")
 
-    if len(contents) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large (Max 10MB)")
+        contents = await file.read()  # ← read once here
 
-    # ✅ Wrap already-read bytes in BytesIO — do NOT use file.file again
-    import io
-    df = extract_export_inventory(io.BytesIO(contents))
+        if len(contents) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large (Max 10MB)")
 
-    if df.empty:
-        raise HTTPException(status_code=400, detail="No valid records found")
+        # ✅ Wrap already-read bytes in BytesIO — do NOT use file.file again
+        import io
+        df = extract_export_inventory(io.BytesIO(contents))
 
-    print(df.head(3))
+        if df.empty:
+            raise HTTPException(status_code=400, detail="No valid records found in pdf")
 
-    result = await enrich_awb_from_wh_inventory(db, df)
+        print(df.head(3))
+
+        result = await enrich_awb_from_wh_inventory(db, df)
+
+         # ✅ Write success log
+        db.add(ExportFileUploadMetaLog(
+            filename=filename,
+            file_type="pdf",
+            uploaded_by=emp_id,
+            uploaded_at=now,
+            file_track_type="CAR_WH_INVENTORY_PDF",
+            status="SUCCESS",
+            upload_meta={
+                "total_in_pdf":    result["total_in_pdf"],
+                "matched_updated": result["matched"],
+                "not_found_count": result["not_found_count"],
+            },
+            error_message=None,
+            created_at=now,
+        ))
+        await db.commit()
 
 
-    return {
-        "success": True,
-        "message": "PDF processed successfully.",
-        "total_in_pdf":    result["total_in_pdf"],
-        "matched_updated": result["matched"],
-        "not_found_count": result["not_found_count"],
-        "not_found_awbs":  result["not_found"],
-    }
+        return {
+            "success": True,
+            "message": "PDF processed successfully.",
+            "total_in_pdf":    result["total_in_pdf"],
+            "matched_updated": result["matched"],
+            "not_found_count": result["not_found_count"],
+            "not_found_awbs":  result["not_found"],
+        }
+    except HTTPException as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        await _write_inventory_failure_log(
+            filename=filename,
+            uploaded_by=emp_id,
+            now=now,
+            error_message=e.detail if isinstance(e.detail, str) else str(e.detail),
+        )
+        raise
+
+    except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        await _write_inventory_failure_log(
+            filename=filename,
+            uploaded_by=emp_id,
+            now=now,
+            error_message=str(e),
+        )
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 
 
@@ -505,8 +675,21 @@ async def get_uld_master(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/uld-assignment/uld-master/eligible-for-uld-assignment", response_model=list[UldMasterResponse])
-async def get_uld_master(db: AsyncSession = Depends(get_db)):
-    return await get_uld_master_list_eligeble_for_assignment(db=db)
+async def get_uld_master(
+     flight_no: str | None = Query(None),
+    db: AsyncSession = Depends(get_db)
+    ):
+
+
+    carriers = None
+
+    if flight_no:
+        carrier_code = await extract_carrier_for_uld_filter(db=db, flight_no=flight_no)
+        if carrier_code:
+            carriers = [carrier_code]
+    print("FLIGHT NO:", flight_no)
+    print("EXTRACTED CARRIER:", carrier_code)
+    return await get_uld_master_list_eligeble_for_assignment(db=db,carriers=carriers)
 
 
 @router.get("/uld-assignment/by-flight", response_model=UldAssignmentDataResponse | None, description="GET CREATED ULD ASSIGNMENT BY FLIGHT NO. AND FLIGHT DATE")
@@ -969,3 +1152,51 @@ async def create_manual_awb(
         data=payload,
         emp_id=current_user.emp_id,
     )
+
+
+
+
+
+# =============== Search awb across all table FOR web table not mobile app ================
+@router.get(
+    "/car-message/awb-search-for-web",
+    summary="Search AWB by exact match across all records for web table",
+)
+async def search_awb_across_all(
+    db: AsyncSession = Depends(get_db),   # ✅ FIX
+    awb_no: str = Query(...),             # ✅ also better
+):
+
+    awb_no = awb_no.strip()
+
+    if not awb_no:
+        raise HTTPException(status_code=400, detail="AWB number is required.")
+
+    # ── Normalize: strip non-digits, pad to 11 ────────────────────────────────
+    cleaned_awb = awb_no.replace("-", "").replace(" ", "")
+    if len(cleaned_awb) == 10:
+        cleaned_awb = "0" + cleaned_awb
+    if len(cleaned_awb) != 11:
+        raise HTTPException(status_code=400, detail=f"Invalid AWB number: {awb_no}")
+    
+    # 2. Database Query
+    # Since awb_no is indexed and has a UniqueConstraint, this will be very fast.
+    stmt = select(ExportCarMessageAwbMaster).where(
+        ExportCarMessageAwbMaster.awb_no == cleaned_awb
+    )
+    result = await db.execute(stmt)
+    awb_record = result.scalars().first()
+
+    # 3. Return Response
+    if not awb_record:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"AWB {cleaned_awb} not found."
+        )
+
+    return {
+        "status": "success",
+        "data": awb_record
+    }
+
+   
