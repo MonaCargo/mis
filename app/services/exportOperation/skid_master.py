@@ -20,6 +20,10 @@ from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.schemas.exportOperation.skid_master import CreateSkidRequest, ScanSequenceItemInput
 from app.utils.common.helperFunction import get_utc_now
 
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
 # ─────────────────────────────────────────────
 STALE_LOCK_HOURS = 8544 # 365 days
 
@@ -2314,3 +2318,60 @@ async def create_new_skid_in_skid_master(
             "is_active": skid.is_active,
         },
     }
+
+
+
+
+# ==================== EXPORT SKIDS MATSER DATA ===========================
+def _style_header_row(ws, col_count: int):
+    fill = PatternFill("solid", start_color="1F4E79")
+    font = Font(bold=True, color="FFFFFF", size=11)
+    for cell in ws[1]:
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 20
+
+async def export_skid_master_to_excel(db: AsyncSession) -> BytesIO:
+    records = await db.execute(select(ExportSkidMaster))
+    records = records.scalars().all()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Skid Master"
+
+    headers = ["SN.", "Skid No", "Skid Type", "Skid Weight (kg)", "Skid Capacity",
+               "Remarks",
+                #  "Is Active", "Is Locked", "Locked At", "Locked By",
+            #    "Is Virtual Used", "Created At", "Created By", "Updated At"]
+    ]
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    for idx, r in enumerate(records, start=1):
+        ws.append([
+            idx,
+            r.skid_no,
+            r.skid_type,
+            r.skid_wgt,
+            r.skid_capacity,
+            r.remarks,
+            # r.is_active,
+            # r.is_locked,
+            # r.locked_at.strftime("%Y-%m-%d %H:%M") if r.locked_at else None,
+            # r.locked_by_user_id,
+            # r.is_virtual_used,
+            # r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else None,
+            # r.created_by,
+            # r.updated_at.strftime("%Y-%m-%d %H:%M") if r.updated_at else None,
+        ])
+
+    for col in ws.columns:
+        ws.column_dimensions[col[0].column_letter].width = max(
+            len(str(cell.value or "")) for cell in col
+        ) + 4
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf

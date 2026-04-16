@@ -12,6 +12,12 @@ from app.schemas.exportOperation.location_master import CreateLocationRequest, V
 from app.utils.common.helperFunction import get_utc_now
 from app.utils.exportOperation.export_location_master import clean_export_location_master
 
+from fastapi.responses import StreamingResponse
+
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
 router = APIRouter(prefix="/export-location-master", tags=[])
 
 
@@ -227,3 +233,66 @@ async def create_location_route(
             "is_active": location.is_active,
         },
     }
+
+
+
+
+
+
+
+
+
+
+
+# ======================= EXPORT LOCATION MASTER - EXCEL EXPORT UTILS AND SERVICE =======================
+
+def _style_header_row(ws, col_count: int):
+    fill = PatternFill("solid", start_color="1F4E79")
+    font = Font(bold=True, color="FFFFFF", size=11)
+    for cell in ws[1]:
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 20
+
+
+async def export_locations_to_excel(db: AsyncSession) -> BytesIO:
+    records = await db.execute(select(ExportLocationsMaster))
+    records = records.scalars().all()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Locations"
+
+    headers = ["SN.", "Ops Type", "Area Code", "Location"]
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    for idx, r in enumerate(records, start=1):
+        ws.append([
+            idx,
+            r.ops_type,
+            r.area_code,
+            r.loc,
+           
+        ])
+
+    for col in ws.columns:
+        ws.column_dimensions[col[0].column_letter].width = max(
+            len(str(cell.value or "")) for cell in col
+        ) + 4
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@router.get("/locations/download")
+async def download_locations(db: AsyncSession = Depends(get_db)):
+    buf = await export_locations_to_excel(db)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=locations_master.xlsx"},
+    )

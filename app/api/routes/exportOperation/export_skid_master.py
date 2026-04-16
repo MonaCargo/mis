@@ -1,5 +1,6 @@
 
 from fastapi import APIRouter, Body, UploadFile, File, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 from typing import Dict, Any, Optional
@@ -19,6 +20,7 @@ from app.services.exportOperation.skid_master import (
     assign_skid_to_location,
     create_new_skid_in_skid_master,
     delete_sequence_item,
+    export_skid_master_to_excel,
     force_unlock_skid,
     generate_virtual_skid,
     get_skid_by_sequence,
@@ -405,3 +407,16 @@ async def create_skid_route(
 ):
     created_by = current_user.emp_id
     return await create_new_skid_in_skid_master(db=db, payload=payload, created_by=created_by)
+
+
+
+# ====================== export excel for skid master =================
+
+@router.get("/skid-master/download")
+async def download_skid_master(db: AsyncSession = Depends(get_db)):
+    buf = await export_skid_master_to_excel(db)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=skid_master.xlsx"},
+    )

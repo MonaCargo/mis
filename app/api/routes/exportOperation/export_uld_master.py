@@ -112,6 +112,17 @@ from app.utils.exportOperation.export_uld_master_cleaner import parse_uld_excel
 from app.utils.exportOperation.extract_uld_inventry_pdf import extract_uld_stock
 
 from app.db.session import engine
+from fastapi.responses import StreamingResponse
+
+from io             import BytesIO
+from datetime       import datetime, timezone
+from zoneinfo       import ZoneInfo
+ 
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils  import get_column_letter
+ 
+
 
 router = APIRouter(prefix="/export-uld", tags=["Export ULD Master"])
 
@@ -463,3 +474,202 @@ async def get_uld_carriers(
         "success":  True,
         "carriers": carriers,
     }
+
+
+
+@router.get(
+    "/search",
+    summary="Search ULD by exact match"
+)
+async def search_in_uld_master(
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+    uld_no: str = Query(..., description="ULD number"),
+):
+    # ============================
+    # Normalize Input
+    # ============================
+    # cleaned_uld = uld_no.strip().upper().replace(" ", "")
+    cleaned_uld = uld_no.strip().upper()
+
+    if not cleaned_uld:
+        raise HTTPException(status_code=400, detail="ULD number is required")
+
+    # ============================
+    # Query (Exact Match)
+    # ============================
+    stmt = select(ExportUldMaster).where(
+        ExportUldMaster.uld_no == cleaned_uld,
+        ExportUldMaster.is_active == True
+    )
+
+    result = await db.execute(stmt)
+    uld = result.scalars().first()
+
+    # ============================
+    # Response
+    # ============================
+    if not uld:
+        raise HTTPException(
+            status_code=404,
+            detail=f"ULD {cleaned_uld} not found"
+        )
+
+    return {
+        "status": "success",
+        "data": {
+            "id": uld.id,
+            "uld_no": uld.uld_no,
+            "uld_type": uld.uld_type,
+            "carrier": uld.carrier,
+            "is_available": uld.is_available,
+            "is_active": uld.is_active,
+            "created_by": uld.created_by,
+            "updated_by": uld.updated_by,
+            "created_at": uld.created_at,
+            "updated_at": uld.updated_at,
+        }
+    }
+
+# Expoer filterred data
+@router.get(
+    "/export-uld-master-data",
+    summary="Export ULD master list as Excel based on filters",
+    # response_class=StreamingResponse,
+)
+async def export_uld_master(
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+
+    # filters (same as the list endpoint)
+    carrier:      Optional[str]  = Query(None, description="Carrier code e.g. AI, LH, EK | all"),
+    is_available: Optional[bool] = Query(None, description="true | false"),
+    is_active:    Optional[bool] = Query(None, description="true | false"),
+):
+    # Step 1: get total count
+    _, total = await UldStockSyncService.get_filtered_uld_master(
+        db=db,
+        carrier=carrier,
+        is_available=is_available,
+        is_active=is_active,
+        page=1,
+        page_size=1,
+    )
+
+    if total == 0:
+        raise HTTPException(status_code=404, detail="No records found for the given filters.")
+
+    # Step 2: fetch all matching records in one shot
+    records, total = await UldStockSyncService.get_filtered_uld_master(
+        db=db,
+        carrier=carrier,
+        is_available=is_available,
+        is_active=is_active,
+        page=1,
+        page_size=total,
+    )
+
+    # ── Build Excel ──────────────────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "ULD Master"
+
+    # ── Styles ───────────────────────────────────────────────────────────────
+    header_font       = Font(bold=True, color="FFFFFF", size=11)
+    header_fill       = PatternFill("solid", fgColor="1E3A5F")
+    header_alignment  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    center_alignment  = Alignment(horizontal="center", vertical="center")
+    left_alignment    = Alignment(horizontal="left",   vertical="center")
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+    green_fill = PatternFill("solid", fgColor="C6EFCE")   # available
+    red_fill   = PatternFill("solid", fgColor="FFC7CE")   # not available
+    blue_fill  = PatternFill("solid", fgColor="BDD7EE")   # active
+    gray_fill  = PatternFill("solid", fgColor="D9D9D9")   # inactive
+
+    # ── Header row ────────────────────────────────────────────────────────────
+    headers = [
+        "S.No", "ULD No", "ULD Type", "Carrier",
+        "Availability", "Status",
+        # "Created By", "Updated By",
+        "Created At (IST)", 
+        # "Updated At (IST)",
+    ]
+    col_widths = [6, 18, 12, 10, 14, 10, 14, 14, 22, 22]
+
+    ws.row_dimensions[1].height = 30
+    for col_idx, (header, width) in enumerate(zip(headers, col_widths), start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = header_alignment
+        cell.border    = thin_border
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # ── Helper: UTC → IST string ──────────────────────────────────────────────
+    def to_ist(dt) -> str:
+        if not dt:
+            return "-"
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        ist = dt.astimezone(ZoneInfo("Asia/Kolkata"))
+        return ist.strftime("%d-%b-%Y %H:%M")
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    for row_idx, r in enumerate(records, start=2):
+        availability_text = "Available"     if r.is_available else "Not Available"
+        active_text       = "Active"        if r.is_active    else "Inactive"
+        avail_fill        = green_fill       if r.is_available else red_fill
+        active_fill_cell  = blue_fill        if r.is_active    else gray_fill
+
+        row_data = [
+            row_idx - 1,          # S.No
+            r.uld_no,
+            r.uld_type,
+            r.carrier,
+            availability_text,
+            active_text,
+            # r.created_by or "-",
+            # r.updated_by or "-",
+            to_ist(r.created_at),
+            # to_ist(r.updated_at),
+        ]
+
+        for col_idx, value in enumerate(row_data, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.border    = thin_border
+            cell.alignment = center_alignment if col_idx != 2 else left_alignment
+
+            # Colored badge cells
+            if col_idx == 5:   # Availability
+                cell.fill = avail_fill
+            elif col_idx == 6: # Status
+                cell.fill = active_fill_cell
+
+        ws.row_dimensions[row_idx].height = 18
+
+    # ── Freeze header ─────────────────────────────────────────────────────────
+    ws.freeze_panes = "A2"
+
+    # ── Summary row (totals) ──────────────────────────────────────────────────
+    summary_row = ws.max_row + 2
+    ws.cell(row=summary_row, column=1, value="Total Records").font = Font(bold=True)
+    ws.cell(row=summary_row, column=2, value=total).font = Font(bold=True)
+
+    # ── Stream response ───────────────────────────────────────────────────────
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    carrier_label = carrier if carrier and carrier != "all" else "ALL"
+    filename = f"uld_master_{carrier_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
