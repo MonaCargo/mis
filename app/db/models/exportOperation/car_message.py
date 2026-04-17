@@ -371,6 +371,12 @@ class ExportUldAssignmentDetail(Base):
 
     created_at = Column(DateTime(timezone=True), nullable=False)
 
+    # ULD CLOSING FIELDS (ULD CLOSED FOR THAT PARTICULAR FLIGHTS)
+    is_closed = Column(Boolean, default=False, nullable=False)
+    closed_by = Column(String(20), nullable=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+
+
     uld = relationship("ExportUldMaster", backref="assignment_details")
 
 
