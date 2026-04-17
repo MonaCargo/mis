@@ -1,5 +1,6 @@
 # services/export_car_message_awb_service.py
 
+from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 import re
 from typing import Optional
@@ -3334,7 +3335,7 @@ async def scan_item_into_uld(
 
     # ── verify ULD ─────────────────────────────────────────
     uld_detail_result = await db.execute(
-        select(ExportUldAssignmentDetail.id, ExportUldMaster.uld_no)
+        select(ExportUldAssignmentDetail.id, ExportUldMaster.uld_no, ExportUldAssignmentDetail.is_closed, )
         .join(ExportUldAssignment, ExportUldAssignmentDetail.assignment_id == ExportUldAssignment.id)
         .join(ExportUldMaster, ExportUldAssignmentDetail.uld_id == ExportUldMaster.id)
         .where(
@@ -3346,6 +3347,12 @@ async def scan_item_into_uld(
     uld_detail = uld_detail_result.mappings().first()
     if not uld_detail:
         raise HTTPException(status_code=400, detail="ULD does not belong to this flight")
+    
+    if uld_detail.is_closed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ULD {uld_detail.uld_no} is already closed"
+        )
 
     # ── fetch flight AWBs ──────────────────────────────────
     flight_awb_result = await db.execute(
@@ -3847,6 +3854,9 @@ async def get_flight_uld_loading_status(
     uld_result = await db.execute(
         select(
             ExportUldAssignmentDetail.id.label("uld_assignment_detail_id"),
+            ExportUldAssignmentDetail.is_closed,
+            ExportUldAssignmentDetail.closed_at,
+            ExportUldAssignmentDetail.closed_by,
             ExportUldMaster.id.label("uld_id"),
             ExportUldMaster.uld_no,
             ExportUldMaster.carrier,
@@ -4078,6 +4088,7 @@ if row.sequence_id in global_loading_map
             is_ultra_fast=r.is_ultra_fast,
             is_manually_created=r.is_manually_created,
             awb_no=r.awb_no,
+            total_pcs=r.pcs,
             booked_pcs=r.booked_pcs,
             loaded_pcs=loaded_per_awb.get(r.awb_master_id, 0),
             pending_pcs=r.booked_pcs - loaded_per_awb.get(r.awb_master_id, 0),
@@ -4093,6 +4104,10 @@ if row.sequence_id in global_loading_map
             carrier=r.carrier,
             loaded_count=r.loaded_count,
             sequences=sequences_by_uld.get(r.uld_assignment_detail_id, []),  # ← ADD
+             # ✅ ADD THESE
+        is_closed=r.is_closed,
+        closed_by=r.closed_by,
+        closed_at=r.closed_at,
         )
         for r in uld_rows
     ]
@@ -4908,6 +4923,7 @@ async def get_dashboard_drilldown_detail(
 
         result = await db.execute(
             select(
+                ExportCarMessageAwbMaster.id.label("awb_master_id"),
                 ExportCarMessageAwbMaster.awb_no,
                 ExportCarMessageAwbMaster.origin,
                 ExportCarMessageAwbMaster.destination,
@@ -4932,7 +4948,50 @@ async def get_dashboard_drilldown_detail(
             )
             .order_by(ExportCarMessageAwbMaster.awb_no)
         )
+
+        # ── scanner🫥🫥 details per AWB (which persons scanned those awb) ────────────────────────────────
+        scanner_result = await db.execute(
+            select(
+                ExportAwbSkidItemSequence.awb_master_id,
+                ExportAwbSkidItemSequence.mapping_id,
+                ExportAwbSkidItemSequence.scanned_by,
+                ExportAwbSkidItemSequence.scan_by_device,
+                ExportSkidMaster.skid_no,
+                func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+                func.max(ExportAwbSkidItemSequence.sequence_date_time).label("last_scanned_at"),
+            )
+            .join(
+                ExportAwbSkidMapping,
+                ExportAwbSkidItemSequence.mapping_id == ExportAwbSkidMapping.id,
+            )
+            .join(
+                ExportSkidMaster,
+                ExportAwbSkidMapping.skid_id == ExportSkidMaster.id,
+            )
+            .where(ExportAwbSkidItemSequence.awb_master_id.in_(awb_ids))
+            .group_by(
+                ExportAwbSkidItemSequence.awb_master_id,
+                ExportAwbSkidItemSequence.mapping_id,
+                ExportAwbSkidItemSequence.scanned_by,
+                ExportAwbSkidItemSequence.scan_by_device,
+                ExportSkidMaster.skid_no,
+            )
+            .order_by(ExportAwbSkidItemSequence.awb_master_id)
+        )
+        scanner_rows = scanner_result.mappings().all()
+
         rows = result.mappings().all()
+# 🫥🫥
+        scanners_by_awb: dict[int, list] = defaultdict(list) 
+
+        for r in scanner_rows:
+            scanners_by_awb[r.awb_master_id].append({
+                "emp_id": r.scanned_by,
+                "scan_by_device": r.scan_by_device,
+                "skid_no": r.skid_no,
+                "scanned_pcs": r.scanned_pcs,
+                "last_scanned_at": to_ist_str(r.last_scanned_at),
+            })
 
         return {
             "detail_type": detail_type,
@@ -4951,6 +5010,7 @@ async def get_dashboard_drilldown_detail(
                     "scan_pct": round(
                         r.scanned_pcs / r.total_pcs * 100, 1
                     ) if r.total_pcs else 0,
+                     "scanners": scanners_by_awb.get(r.awb_master_id, []),
                 }
                 for r in rows
             ],
@@ -6655,3 +6715,59 @@ async def extract_carrier_for_uld_filter(
     # ── Final fallback ─────────────────────────────
     print(f"❌ Carrier extraction failed for flight_no: {flight_no}")
     return None
+
+
+
+
+
+#  =============== 🫥 INDIVIDUAL ULD CLOSING  PER FLIGHTS PER DATE ====================
+
+async def close_per_uld__per_flight_service(
+    db: AsyncSession,
+    uld_assignment_detail_id: int,
+    closed_by: str,
+):
+    now = get_utc_now()
+
+    # ── get ULD detail ─────────────────────
+    uld = await db.get(ExportUldAssignmentDetail, uld_assignment_detail_id)
+    print(f"Debug: Closing ULD Assignment Detail ID {uld_assignment_detail_id} by {closed_by} : uld- {uld}")
+
+    if not uld:
+        raise HTTPException(404, "ULD not found")
+
+    if uld.is_closed:
+        raise HTTPException(400, "ULD already closed")
+
+    # ── get flight id ──────────────────────
+    assignment = await db.get(ExportUldAssignment, uld.assignment_id)
+    flight_id = assignment.flight_header_id
+
+    # ── get sequences loaded in THIS ULD ───
+    loaded_count = await db.scalar(
+        select(func.count(ExportSequenceItemUldLoading.id))
+        .where(
+            ExportSequenceItemUldLoading.uld_assignment_detail_id == uld_assignment_detail_id
+        )
+    ) or 0
+
+    if loaded_count == 0:
+        raise HTTPException(400, "Cannot close empty ULD")
+
+    # ✅ OPTIONAL VALIDATION
+    # check if any pending sequences still expected in this ULD
+    # (usually not required unless you assign capacity per ULD)
+
+    # ── mark closed ─────────────────────────
+    uld.is_closed = True
+    uld.closed_by = closed_by
+    uld.closed_at = now
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": "ULD closed successfully",
+        "uld_id": uld_assignment_detail_id,
+        "loaded_count": loaded_count,
+    }
