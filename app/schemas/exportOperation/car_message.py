@@ -364,6 +364,9 @@ class UldLoadingStatusItem(BaseModel):
     carrier: str
     loaded_count: int
     sequences: list[LoadedSequenceItem] = []   # ← ADD
+    is_closed: bool = False
+    closed_by: str | None = None
+    closed_at: datetime | None = None
 
 class AwbLoadingStatusItem(BaseModel):
     awb_master_id: int
@@ -371,6 +374,7 @@ class AwbLoadingStatusItem(BaseModel):
     booked_pcs: int
     loaded_pcs: int
     pending_pcs: int
+    total_pcs: Optional[int] = None
     is_manually_created: bool = False   # ← ADD
     is_ultra_fast: bool = False        # ← ADD
 
