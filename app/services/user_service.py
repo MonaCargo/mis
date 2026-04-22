@@ -6,6 +6,7 @@ from sqlalchemy.future import select
 from app.db.models.user import User
 from app.services.audit_log_user_service import log_user_audit
 from app.utils.auth_helper import hash_password
+from fastapi import status
 
 async def get_user_by_emp_id(emp_id: str, db: AsyncSession):
     result = await db.execute(select(User).where(User.emp_id == emp_id))
@@ -301,7 +302,61 @@ async def update_user_password(emp_id: str, new_password: str, db: AsyncSession)
 
     return user
 
+async def update_user_role_service(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    new_role: str,
+    changed_by: str,
+    changed_by_role: str,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+    device_id: str | None = None,
+):
+    # 1️⃣ Fetch user
+    user = await db.get(User, user_id)
 
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    old_role = user.role
+
+    # 2️⃣ If same role → skip
+    if old_role == new_role:
+        return {"message": "Role already same"}
+
+    # 3️⃣ Update role
+    user.role = new_role
+
+    # 4️⃣ Log change
+    await log_user_audit(
+        db,
+        user=user,
+        field_name="role",
+        old_value=old_role,
+        new_value=new_role,
+        changed_by=changed_by,
+        changed_by_role=changed_by_role,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        device_id=device_id,
+        db_action="UPDATE",
+        source_action="update_user_role",
+    )
+
+    # 5️⃣ Commit (IMPORTANT → both save together)
+    await db.commit()
+    await db.refresh(user)
+
+    return {
+        "message": "User role updated successfully",
+        "user_id": user.id,
+        "old_role": old_role,
+        "new_role": new_role,
+    }
 
 
 # =================== bulk upload

@@ -92,3 +92,7 @@ class UserPasswordChange(BaseModel):
 class UserPasswordChangeResponse(APIResponseBase):
     emp_id:str
  
+
+class UpdateUserRoleRequest(BaseModel):
+    user_id: int
+    role: str

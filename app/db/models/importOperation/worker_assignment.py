@@ -232,6 +232,10 @@ class WorkerAssignmentShipment(Base):
         nullable=True
     )
 
+    # 🫥 ✅It is used to track when I get gatepass physically in security center
+    gp_received_datetime= Column(DateTime(timezone=True))
+    gp_received_by = Column(String(30), nullable=True)
+
 
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
