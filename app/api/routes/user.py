@@ -75,7 +75,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependency import require_roles, verify_token_and_get_user
 from app.db.models.user import User
 from app.db.session import get_db
-from app.schemas.user import UserCreate, UserCreateResponse, UserPasswordChange, UserPasswordChangeResponse,UserReadResponse, UserListResponse, UserRead, UserStatusUpdate, UserStatusUpdateResponse
+from app.schemas.user import UpdateUserRoleRequest, UserCreate, UserCreateResponse, UserPasswordChange, UserPasswordChangeResponse,UserReadResponse, UserListResponse, UserRead, UserStatusUpdate, UserStatusUpdateResponse
 from app.services.user_service import (
     bulk_create_users,
     get_active_import_tracer,
@@ -85,6 +85,7 @@ from app.services.user_service import (
     get_user_by_emp_id,
     create_user as create_user_service,
     update_user_password,
+    update_user_role_service,
     update_user_status
 )
 from app.utils.common.clean_bulck_user_excel import parse_user_excel
@@ -355,3 +356,27 @@ async def read_user(emp_id: str, db: AsyncSession = Depends(get_db)):
     ) 
 
 
+@router.put("/update-role")
+async def update_user_role(
+    payload: UpdateUserRoleRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    # Extract meta info
+    ip_address = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    # You can get from auth middleware/token
+    changed_by = current_user.emp_id         # 🔁 replace with real logged-in user
+    changed_by_role = current_user.role         # 🔁 replace dynamically
+
+    return await update_user_role_service(
+        db,
+        user_id=payload.user_id,
+        new_role=payload.role.strip(),
+        changed_by=changed_by,
+        changed_by_role=changed_by_role,
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )

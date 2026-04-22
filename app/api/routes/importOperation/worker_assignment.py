@@ -596,7 +596,9 @@ from app.services.importOperation.worker_assignment_service import (
     add_unloading_from_lift_by_assigned_worker,
     assign_user_to_worker_assignment,
     auto_assign_pom_shipments,
+    confirm_gp_received,
     generate_ageing_report_for_worker_assignment,
+    generate_excel_stream_export_gp_received,
     generate_excel_stream_export_worker_assignment,
     get_all_allowed_users_as_worker,
     get_all_open_damage_shipments,
@@ -608,6 +610,8 @@ from app.services.importOperation.worker_assignment_service import (
     get_data_at_user_based_assigned_not_dropped_at_lift_have_gatepass_no,
     get_full_damage_report_by_id_for_tracer,
     get_full__all_damage_grouped_by_shipment_for_tracer,
+    get_gp_received_sla_summary,
+    get_paginated_gp_received_list,
     get_paginated_worker_assignments_data_list,
     get_paginated_worker_assignments_with_damage_filter,
     get_particular_user_drop_shipments_details,
@@ -616,6 +620,7 @@ from app.services.importOperation.worker_assignment_service import (
     get_shipments_for_final_delivery,
     get_shipments_for_loading_in_lift,
     get_shipments_for_unloading_from_lift,
+    get_sla_dashboard_drilldown_detail,
     get_top_performers,
     get_worker_assignment_lists_by_emp_id,
     get_worker_shipment_details_by_empid_which_assigned_not_dropatlift,
@@ -741,6 +746,10 @@ async def get_paginated_worker_assignments(
      
             "gp_generated", # those who have gatepass no. irrespective of gate pass enddate time present or not
             "gp_delivered", # those who have gatepass end date time
+
+            "sla_0_to_3_5", 
+              "sla_3_5_to_4",
+                "sla_4_above"
 
 
         ]
@@ -2112,3 +2121,235 @@ async def get_top_performer_worker(
         "count": len(data),
         "data": data
     }
+
+
+
+
+
+
+
+
+
+
+# ===================== 🫥✅ GATE PASS PHYSICALLY RECIVED IN SECURITY SERVICE =============================
+
+def _validate_date(date_str: str, field_name: str) -> datetime:
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {field_name}: '{date_str}'. Expected format YYYY-MM-DD.",
+        )
+ 
+
+# ---------------------------------------------------------------------------
+# ENDPOINT 1 – GET paginated GP receipt list
+# ---------------------------------------------------------------------------
+ 
+@router.get(
+    "/gp-received-list",
+    summary="Get paginated GP receipt list",
+    description=(
+        "Retrieve shipments that have a gate pass, with optional filtering by "
+        "receipt status (gp_received / gp_not_received / all) and a date range. "
+        "Date range matches rows where gate_pass_issued_date_time_combo OR "
+        "integrate_date_time falls within the range (IST, YYYY-MM-DD)."
+    ),
+)
+async def get_gp_receipt_list(
+    gp_status: str = Query(
+        default="all",
+        description="Filter by receipt status. Allowed: all | gp_received | gp_not_received",
+    ),
+    startDate: Optional[str] = Query(
+        default=None,
+        regex=r"^\d{4}-\d{2}-\d{2}$",
+        description="Range start — matches gate_pass_issued_date_time_combo OR integrate_date_time (YYYY-MM-DD, IST).",
+    ),
+    endDate: Optional[str] = Query(
+        default=None,
+        regex=r"^\d{4}-\d{2}-\d{2}$",
+        description="Range end (YYYY-MM-DD, IST).",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    # ── Validate status ───────────────────────────────────────────────────
+    allowed_statuses = {"all", "gp_received", "gp_not_received"}
+    if gp_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid gp_status '{gp_status}'. Allowed: {sorted(allowed_statuses)}",
+        )
+ 
+    # ── Validate dates ────────────────────────────────────────────────────
+    if bool(startDate) ^ bool(endDate):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Both startDate and endDate must be provided together.",
+        )
+ 
+    if startDate and endDate:
+        start_dt = _validate_date(startDate, "startDate")
+        end_dt = _validate_date(endDate, "endDate")
+        if start_dt > end_dt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="startDate cannot be after endDate.",
+            )
+ 
+    try:
+        return await get_paginated_gp_received_list(
+            db=db,
+            status=gp_status,
+            startDate=startDate,
+            endDate=endDate,
+            page=page,
+            page_size=page_size,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()  # ← prints full error to console
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),  # ← shows real error in response too
+        )
+    # except Exception as e:
+    #     print(f"[GP RECEIVED API ERROR] get_gp_received_list: {e}")
+    #     raise HTTPException(
+    #         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    #         detail="Unexpected error while fetching GP received list.",
+    #     )
+ 
+
+
+
+ # ---------------------------------------------------------------------------
+
+# ENDPOINT 2 – PATCH confirm GP receipt  (no request body — user from token)
+# ---------------------------------------------------------------------------
+ 
+@router.patch(
+    "/confirm/gp-received/{shipment_id}",
+    summary="Confirm gate pass physically received",
+    description=(
+        "Mark a gate pass as physically received. "
+        "gp_received_by is taken automatically from the authenticated user's token — "
+        "no request body needed. "
+        "gp_received_datetime is set server-side in UTC. "
+        "Idempotent — calling twice returns existing data without overwriting."
+    ),
+)
+async def confirm_receipt(
+    shipment_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),   # ← from token
+):
+    if shipment_id < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="shipment_id must be a positive integer.",
+        )
+ 
+    # Pull the display name / username from the token.
+    # Adjust the attribute to match your CurrentUser model:
+    #   current_user.username  /  current_user.full_name  /  current_user.email
+    received_by: str = current_user.emp_id
+ 
+    try:
+        result = await confirm_gp_received(
+            db=db,
+            shipment_id=shipment_id,
+            received_by=received_by,
+        )
+ 
+        if not result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=result["message"],
+            )
+ 
+        return result
+ 
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[GP RECEIVED API ERROR] confirm_receipt shipment_id={shipment_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unexpected error while confirming GP received.",
+        )
+    
+
+#  ============================= WOKER ASSIGNMENT SLA DASHBOARD API =============================
+
+
+@router.get("/dashboard/gp-received/sla-summary")
+async def gp_received_sla_summary(
+    startDate: date = Query(...),
+    endDate: date = Query(...),
+    db: AsyncSession = Depends(get_db)
+):
+    data = await get_gp_received_sla_summary(
+        db,
+        startDate,
+        endDate
+    )
+
+    return {
+        "message": "SLA summary fetched successfully",
+        "data": data
+
+    }  
+
+
+@router.get(
+    "/gp-received/dashboard/drilldown/detail",
+    summary="Get SLA drilldown detail",
+)
+async def get_sla_dashboard_detail_route(
+    report_date: date = Query(...),
+    detail_type: str = Query(
+        ...,
+        description="gp_no_present_but_not_gp_received | sla_0_3_5 | sla_3_5_4 | sla_above_4"
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await get_sla_dashboard_drilldown_detail(
+        db=db,
+        report_date=report_date,
+        detail_type=detail_type,
+    )
+
+
+@router.get("/gp-received-export")
+async def export_gp_received(
+    gp_status: str = Query(default="all"),
+    startDate: Optional[str] = Query(default=None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    endDate:   Optional[str] = Query(default=None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    db: AsyncSession = Depends(get_db),
+):
+    allowed = {"all", "gp_received", "gp_not_received"}
+    if gp_status not in allowed:
+        raise HTTPException(400, detail=f"Invalid gp_status. Allowed: {sorted(allowed)}")
+
+    if bool(startDate) ^ bool(endDate):
+        raise HTTPException(400, detail="Provide both startDate and endDate together.")
+
+    filename = f"gp_received_{startDate or 'all'}_{endDate or 'all'}.xlsx"
+
+    return StreamingResponse(
+        generate_excel_stream_export_gp_received(
+            db=db,
+            status=gp_status,
+            start_date=startDate,
+            end_date=endDate,
+        ),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )

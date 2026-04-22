@@ -52,7 +52,8 @@ def require_roles(required_roles: List[str]):
         if current_user.role not in required_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Operation requires one of the roles: {', '.join(required_roles)}",
+                # detail=f"Operation requires one of the roles: {', '.join(required_roles)}",
+                detail=f"You are not authorized to perform this operation.",
             )
         return current_user
     return role_checker

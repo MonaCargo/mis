@@ -198,17 +198,17 @@ async def create_location_route(
             detail=f"Location '{payload.loc}' already exists",
         )
 
-    # check duplicate area_code
-    existing_code = await db.execute(
-        select(ExportLocationsMaster.id).where(
-            ExportLocationsMaster.area_code == payload.area_code
-        )
-    )
-    if existing_code.scalar_one_or_none():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Area code '{payload.area_code}' already exists",
-        )
+    # # check duplicate area_code
+    # existing_code = await db.execute(
+    #     select(ExportLocationsMaster.id).where(
+    #         ExportLocationsMaster.area_code == payload.area_code
+    #     )
+    # )
+    # if existing_code.scalar_one_or_none():
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail=f"Area code '{payload.area_code}' already exists",
+    #     )
 
     location = ExportLocationsMaster(
         ops_type="EXPORT",
