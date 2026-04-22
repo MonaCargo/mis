@@ -1611,7 +1611,7 @@
 
 
 
-
+from __future__ import annotations
 from datetime import datetime, time,date , timedelta
 import io
 import json
@@ -1620,12 +1620,15 @@ from typing import Any, Dict, Generator, List, Optional, AsyncGenerator
 from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 from numpy import ceil
+import numpy as np
 import pytz
 from sqlalchemy import JSON, and_, case, cast, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.api.routes.domesticOperation.domestic_xray_report import convert_ist_day_to_utc_range
 from app.db.models.importOperation.damage_report import DamageReason, DamageReport, DamageReportReason
 from app.db.models.user import User
+from app.services.exportOperation.car_message import ist_date_to_utc_range
 from app.services.importOperation.audit_log_worker_assignment import log_worker_assignment_audit
 from app.utils.common.enums import DamageStatusInWorkerAssignmnet, WorkerAssignmentAuditSource
 from app.utils.common.helperFunction import convert_ist_day_to_utc_range_helper, detect_origin_source, get_utc_now
@@ -1697,6 +1700,7 @@ class WorkerAssignmentFilters:
     def apply_status_filter(self, query):
         shipment = self.shipment
         status = self.status
+        SLA_STATUSES = {"sla_0_to_3_5", "sla_3_5_to_4", "sla_4_above"}
 
          # ------------------------------------------------
         # 🔥 NEW: GP GENERATED (ignore everything except date)
@@ -1718,7 +1722,8 @@ class WorkerAssignmentFilters:
         # -----------------------------
         # 2️⃣ EXCLUDE delivered from ALL other statuses
         # -----------------------------
-        if status != "all":
+        # if status != "all":
+        if status != "all" and status not in SLA_STATUSES:   # 🔧✅ guard added
             query = query.where(
                 shipment.gate_pass_end_datetime.is_(None)
             )
@@ -1765,11 +1770,70 @@ class WorkerAssignmentFilters:
             )
         )
 
+    def apply_sla_filter(self, query):
+        shipment = self.shipment
+        status = self.status
+
+        SLA_STATUSES = {"sla_0_to_3_5", "sla_3_5_to_4", "sla_4_above"}
+
+        if status not in SLA_STATUSES:
+            return query  # ← not an SLA request, skip
+
+        # ---------------------------------------------------
+        # Base condition: gp_received_datetime MUST be present
+        # ---------------------------------------------------
+        query = query.where(
+            shipment.gp_received_datetime.isnot(None)
+        )
+
+        # ---------------------------------------------------
+        # Compute diff in hours:
+        #   if final_delivery_datetime present → use it
+        #   else → use NOW (UTC)
+        # ---------------------------------------------------
+        effective_end = case(
+            (shipment.final_delivery_datetime.isnot(None), shipment.final_delivery_datetime),
+            else_=get_utc_now()   # DB-side UTC now
+        )
+
+        # PostgreSQL: EPOCH gives total seconds → divide to get hours
+        diff_seconds = func.extract(
+            "epoch",
+            effective_end - shipment.gp_received_datetime
+        )
+        diff_hours = diff_seconds / 3600.0
+
+        # ---------------------------------------------------
+        # Bucket filters
+        # ---------------------------------------------------
+        if status == "sla_0_to_3_5":
+            return query.where(
+                and_(
+                    diff_hours >= 0,
+                    diff_hours < 3.5
+                )
+            )
+
+        if status == "sla_3_5_to_4":
+            return query.where(
+                and_(
+                    diff_hours >= 3.5,
+                    diff_hours <= 4.0
+                )
+            )
+
+        if status == "sla_4_above":
+            return query.where(
+                diff_hours > 4.0
+            )
+
+        return query  # fallback (should never reach)
 
     def apply_all(self, query):
         query = self.apply_dlv_zone_filter(query)
         query = self.apply_status_filter(query)
         query = self.apply_date_filter(query)
+        query = self.apply_sla_filter(query)   # 🆕
         return query
 
 # ==========================
@@ -4115,7 +4179,11 @@ async def get_paginated_worker_assignments_data_list(
             "damage_resolve_datetime":shipment.damage_resolve_datetime,
             "is_final_delivered":shipment.is_final_delivered,
             "loading_in_lift_zone":shipment.loading_in_lift_zone,
-            "unloading_from_lift_zone":shipment.unloading_from_lift_zone
+            "unloading_from_lift_zone":shipment.unloading_from_lift_zone,
+
+            "gp_received_by":shipment.gp_received_by,
+            "gp_received_datetime":shipment.gp_received_datetime,
+            "final_delivery_datetime":shipment.final_delivery_datetime,
 
 
         })
@@ -4306,7 +4374,7 @@ async def generate_excel_stream_export_worker_assignment(
         'Gate Pass No', 'GP Issue Date', 'GP End Date',
         'Assigned Person', 'Assigned Person Name', 'Assigned DateTime',
         'Drop Delivery Zone', 'Drop DLV DateTime',
-        'From Source', 'Integrate Date', 'Created At'
+        'From Source', 'Integrate Date', 'Created At','GP Received Time', 'Final delivery Time'
     ]
     
     # Write headers
@@ -4342,7 +4410,9 @@ async def generate_excel_stream_export_worker_assignment(
         24: 18, # Drop DLV DateTime
         25: 15, # From Source
         26: 18, # Integrate Date
-        27: 18  # Created At
+        27: 18,  # Created At
+        28: 18,  # GP Received Datetime
+        29: 18  # Final Delivery datetime
     }
     
     for col, width in column_widths.items():
@@ -4555,6 +4625,16 @@ async def generate_excel_stream_export_worker_assignment(
                 worksheet.write_datetime(row_num, 27, to_ist_no_tz(shipment.created_at), date_format)
             else:
                 worksheet.write(row_num, 27, '', text_format)
+            # gp_received_datetime At (from SHIPMENT)
+            if shipment.gp_received_datetime:
+                worksheet.write_datetime(row_num, 28, to_ist_no_tz(shipment.gp_received_datetime), date_format)
+            else:
+                worksheet.write(row_num, 28, '', text_format)
+            # gp_received_datetime At (from SHIPMENT)
+            if shipment.final_delivery_datetime:
+                worksheet.write_datetime(row_num, 29, to_ist_no_tz(shipment.final_delivery_datetime), date_format)
+            else:
+                worksheet.write(row_num, 29, '', text_format)
             
             row_num += 1
         
@@ -7297,6 +7377,8 @@ async def get_shipments_for_final_delivery(
             WorkerAssignmentShipment.chg_wgt_in_kg,
             WorkerAssignmentShipment.weight_in_kgs,
             WorkerAssignmentShipment.integrate_date_time,
+            WorkerAssignmentShipment.gate_pass_end_datetime,
+            WorkerAssignmentShipment.gate_pass_issued_date_time_combo,
 
 
             WorkerAssignmentShipment.drop_dlv_zone,
@@ -7409,6 +7491,9 @@ async def get_shipments_for_final_delivery(
             "final_delivery_by_person": row["final_delivery_by_person"],
             "final_delivery_datetime": row["final_delivery_datetime"],
             "is_final_delivered": row["is_final_delivered"],
+            "gate_pass_end_datetime":row["gate_pass_end_datetime"],
+            "gate_pass_issued_date_time_combo":row["gate_pass_issued_date_time_combo"]
+
         })
 
 
@@ -9329,3 +9414,842 @@ async def get_top_performers(
         })
 
     return performers
+
+
+
+
+
+
+
+
+
+
+
+# ================= 🫥✅ GATE PASS PHYSICALLY RECIVED IN SECURITY SERVICE ==========================================
+
+
+
+
+# ---------------------------------------------------------------------------
+# FILTER CLASS
+# ---------------------------------------------------------------------------
+
+class GpReceivedFilters:
+    """
+    Encapsulates all filter logic for the GP-received list.
+
+    Allowed status values
+    ---------------------
+    gp_not_received  →  gate_pass_no exists  AND  gp_received_datetime IS NULL
+    gp_received      →  gate_pass_no exists  AND  gp_received_datetime IS NOT NULL
+    all              →  gate_pass_no exists  (both received & not-received)
+    """
+
+    ALLOWED_STATUSES = {"all", "gp_received", "gp_not_received"}
+
+    def __init__(
+        self,
+        shipment_model,
+        status: str = "all",
+        startDate: Optional[str] = None,
+        endDate: Optional[str] = None,
+    ):
+        self.shipment = shipment_model
+        self.status = status
+        self.startDate = startDate
+        self.endDate = endDate
+
+    # ------------------------------------------------------------------
+    # INTERNAL: IST date-string → UTC (start-of-day, end-of-day)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ist_to_utc_range(date_str: str):
+        """Convert 'YYYY-MM-DD' (IST) to a UTC (start, end) tuple."""
+        ist = pytz.timezone("Asia/Kolkata")
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        start_ist = ist.localize(d.replace(hour=0, minute=0, second=0, microsecond=0))
+        end_ist = ist.localize(
+            d.replace(hour=23, minute=59, second=59, microsecond=999999)
+        )
+        return start_ist.astimezone(pytz.UTC), end_ist.astimezone(pytz.UTC)
+
+    # ------------------------------------------------------------------
+    # FILTER 1 – Only rows that have a gate pass (mandatory baseline)
+    # ------------------------------------------------------------------
+    def _apply_gp_exists(self, query):
+        """Every row in this view MUST have a gate pass number."""
+        return query.where(
+            and_(
+                self.shipment.gate_pass_no.isnot(None),
+                func.trim(self.shipment.gate_pass_no) != "",
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # FILTER 2 – GP received / not-received / all
+    # ------------------------------------------------------------------
+    def _apply_status_filter(self, query):
+        if self.status == "gp_received":
+            return query.where(
+                self.shipment.gp_received_datetime.isnot(None)
+            )
+
+        if self.status == "gp_not_received":
+            return query.where(
+                self.shipment.gp_received_datetime.is_(None)
+            )
+
+        # "all" → no extra filter beyond gp_exists
+        return query
+
+    # ------------------------------------------------------------------
+    # FILTER 3 – Date range across BOTH datetime columns (OR logic)
+    #
+    # Matches the existing worker-assignment service behaviour:
+    #   a row is included if EITHER
+    #     • gate_pass_issued_date_time_combo falls in the range, OR
+    #     • integrate_date_time falls in the range
+    # ------------------------------------------------------------------
+    def _apply_date_filter(self, query):
+        if not (self.startDate and self.endDate):
+            return query
+
+        utc_start, _ = self._ist_to_utc_range(self.startDate)
+        _, utc_end = self._ist_to_utc_range(self.endDate)
+
+        return query.where(
+            or_(
+                self.shipment.gate_pass_issued_date_time_combo.between(utc_start, utc_end),
+                self.shipment.integrate_date_time.between(utc_start, utc_end),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # PUBLIC: Apply every filter in order
+    # ------------------------------------------------------------------
+    def apply_all(self, query):
+        query = self._apply_gp_exists(query)
+        query = self._apply_status_filter(query)
+        query = self._apply_date_filter(query)
+        return query
+
+
+# ---------------------------------------------------------------------------
+# SERVICE 1 – Paginated GP receipt list
+# ---------------------------------------------------------------------------
+
+async def get_paginated_gp_received_list(
+    db: AsyncSession,
+    status: str = "all",
+    startDate: Optional[str] = None,
+    endDate: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 10,
+) -> Dict[str, Any]:
+    """
+    Returns a paginated list of shipments that have a gate pass,
+    optionally filtered by receipt status and date range.
+
+    Each record includes all fields needed for the confirmation UI,
+    plus the two new receipt fields.
+    """
+
+    header = WorkerAssignmentHeader
+    shipment = WorkerAssignmentShipment
+    UserAlias = aliased(User)
+    # ── Build base query (shipment JOIN header) ──────────────────────────
+    filters = GpReceivedFilters(
+        shipment_model=shipment,
+        status=status,
+        startDate=startDate,
+        endDate=endDate,
+    )
+
+    base_query = (
+        select(shipment, header, UserAlias.name.label("gp_received_by_name"))
+        .join(header, shipment.assignment_header_id == header.id)
+          # 🔥 ADD THIS
+    .outerjoin(
+        UserAlias,
+        UserAlias.emp_id == shipment.gp_received_by
+    )
+    )
+    base_query = filters.apply_all(base_query)
+
+    # ── Total count ───────────────────────────────────────────────────────
+    total_records = (
+        await db.execute(
+            select(func.count()).select_from(base_query.subquery())
+        )
+    ).scalar() or 0
+
+    total_pages = ceil(total_records / page_size) if page_size else 0
+
+    # Clamp page
+    page = max(1, min(page, total_pages) if total_pages else page)
+    offset = (page - 1) * page_size
+
+    # ── Paginated data ────────────────────────────────────────────────────
+    paginated_query = (
+        base_query
+    .order_by(
+    # case(
+    #     (shipment.gp_received_datetime.is_(None), 1),
+    #     else_=0
+    # ).desc(),
+    shipment.gate_pass_no.asc(),
+    header.oc_no.asc(),
+)
+        .offset(offset)
+        .limit(page_size)
+    )
+
+    rows = (await db.execute(paginated_query)).all()
+
+    # ── Serialize ─────────────────────────────────────────────────────────
+    def to_py(value, cast=None):
+        """
+        Convert any DB value (including numpy scalars) to a 
+        plain JSON-serializable Python type.
+        """
+        if value is None:
+            return None
+        # Strip numpy wrapper first
+        if isinstance(value, np.generic):
+            value = value.item()  # .item() always returns native Python scalar
+        # Apply cast if requested
+        if cast is not None:
+            return cast(value)
+        return value
+   
+
+    records = []
+    for s, h, user_name in rows:
+      
+        records.append({
+            # Identity
+            "shipment_id":      to_py(s.id, int),
+            "header_id":        to_py(h.id, int),
+            "oc_no":            to_py(h.oc_no),
+            "awb_no":           to_py(h.awb_no),
+            "hawb":             to_py(h.hawb),
+            "temp_irm_oc_no":   to_py(h.temp_irm_oc_no),
+            "is_temp_irm_oc":   to_py(h.is_temp_irm_oc, bool),
+
+            # Gate pass
+            "gate_pass_no":                    to_py(s.gate_pass_no),
+            "gate_pass_issued_date_time_combo": s.gate_pass_issued_date_time_combo,
+            "gate_pass_end_datetime":           s.gate_pass_end_datetime,
+
+            # GP Receipt
+            "gp_received_datetime": s.gp_received_datetime,
+            "gp_received_by":       to_py(s.gp_received_by),
+            "gp_received_by_name": to_py(user_name),
+
+            # Shipment details
+            "flight_no":            to_py(s.flight_no),
+            "flight_date":          s.flight_date,
+            "no_of_pc":             to_py(s.no_of_pc, int),
+            "weight_in_kgs":        to_py(s.weight_in_kgs, float),
+            "chg_wgt_in_kg":        to_py(s.chg_wgt_in_kg, float),
+            "location":             to_py(s.location),
+            "integrate_date_time":  s.integrate_date_time,
+            "assigned_person":      to_py(s.assigned_person),
+            "drop_dlv_zone":        to_py(s.drop_dlv_zone),
+            "from_irr_table":       to_py(s.from_irr_table, bool),
+            "is_final_delivered":   to_py(s.is_final_delivered, bool),
+            "damage_report_status": to_py(s.damage_report_status),
+
+            # Timestamps
+            "created_at":  s.created_at,
+            "updated_at":  s.updated_at,
+        })
+
+    # ── Summary counts (quick, re-uses same join) ─────────────────────────
+    all_gp_base = (
+        select(func.count())
+        .select_from(
+            select(shipment, header)
+            .join(header, shipment.assignment_header_id == header.id)
+            .where(
+                and_(
+                    shipment.gate_pass_no.isnot(None),
+                    func.trim(shipment.gate_pass_no) != "",
+                )
+            )
+            .subquery()
+        )
+    )
+
+    total_gp_count = (await db.execute(all_gp_base)).scalar() or 0
+
+    received_base = (
+        select(func.count())
+        .select_from(
+            select(shipment)
+            .where(
+                and_(
+                    shipment.gate_pass_no.isnot(None),
+                    func.trim(shipment.gate_pass_no) != "",
+                    shipment.gp_received_datetime.isnot(None),
+                )
+            )
+            .subquery()
+        )
+    )
+    received_count = (await db.execute(received_base)).scalar() or 0
+
+    _page = int(page)
+    _page_size = int(page_size)
+    _total_records = int(total_records)
+    _total_pages = int(total_pages)
+    _total_gp_count = int(total_gp_count)
+    _received_count = int(received_count)
+
+    return {
+        "success": True,
+        "message": "GP receipt list fetched successfully",
+        "data": records,
+      "pagination": {
+        "current_page":  _page,
+        "page_size":     _page_size,
+        "total_records": _total_records,
+        "total_pages":   _total_pages,
+        "has_previous":  bool(_page > 1),               # ← explicit bool()
+        "has_next":      bool(_page < _total_pages),     # ← explicit bool()
+        "previous_page": (_page - 1) if _page > 1 else None,
+        "next_page":     (_page + 1) if _page < _total_pages else None,
+    },
+        "summary": {
+            # Global counts (not filtered by date/status)
+            "total_gp_generated": int(total_gp_count),
+            "total_gp_received": int(received_count),
+            "total_gp_not_received": int(total_gp_count - received_count),
+        },
+        "filters_applied": {
+            "status": status,
+            "start_date": startDate,
+            "end_date": endDate,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# SERVICE 2 – Confirm GP receipt (PATCH)
+# ---------------------------------------------------------------------------
+
+async def confirm_gp_received(
+    db: AsyncSession,
+    shipment_id: int,
+    received_by: str,
+) -> Dict[str, Any]:
+    """
+    Stamps gp_received_datetime (now, UTC) and gp_received_by on the
+    WorkerAssignmentShipment row identified by shipment_id.
+
+    Business rules:
+    - Row must exist.
+    - Row must already have a gate_pass_no (can't receive a GP that was never generated).
+    - If already received → return current values without overwriting
+      (idempotent; front-end can call safely on double-click).
+    """
+
+    shipment = WorkerAssignmentShipment
+
+    result = await db.execute(
+        select(shipment).where(shipment.id == shipment_id)
+    )
+    row: Optional[WorkerAssignmentShipment] = result.scalar_one_or_none()
+
+    if not row:
+        return {
+            "success": False,
+            "message": f"Shipment with id={shipment_id} not found.",
+        }
+
+    if not row.gate_pass_no or not row.gate_pass_no.strip():
+        return {
+            "success": False,
+            "message": "Cannot confirm GP receipt: no gate pass number exists for this shipment.",
+        }
+
+    if row.gp_received_datetime is not None:
+        # Already confirmed — return existing data, do NOT overwrite
+        return {
+            "success": True,
+            "already_received": True,
+            "message": "GP was already marked as received.",
+            "data": {
+                "shipment_id": row.id,
+                "gate_pass_no": row.gate_pass_no,
+                "gp_received_datetime": row.gp_received_datetime,
+                "gp_received_by": row.gp_received_by,
+            },
+        }
+
+    # Stamp now (UTC)
+    now_utc = datetime.now(tz=pytz.UTC)
+    row.gp_received_datetime = now_utc
+    row.gp_received_by = received_by.strip()
+    row.updated_at = now_utc
+
+    await db.commit()
+    await db.refresh(row)
+
+    return {
+        "success": True,
+        "already_received": False,
+        "message": "GP receipt confirmed successfully.",
+        "data": {
+            "shipment_id": row.id,
+            "gate_pass_no": row.gate_pass_no,
+            "gp_received_datetime": row.gp_received_datetime,
+            "gp_received_by": row.gp_received_by,
+        },
+    }
+
+
+
+
+
+# ==========  New dashboard metrics for worker assignment for SLA   ===================== 
+
+
+async def get_gp_received_sla_summary(db, start_date: date, end_date: date):
+
+    now = get_utc_now()
+
+    shipment = WorkerAssignmentShipment
+
+    start_utc,_  = convert_ist_day_to_utc_range(start_date)
+    _, end_utc = convert_ist_day_to_utc_range(end_date)
+
+
+    result = await db.execute(
+        select(
+            shipment.gp_received_datetime,
+            shipment.gate_pass_no
+        ).where(
+            shipment.gate_pass_no.isnot(None),  # 🔥 MUST
+
+            shipment.gate_pass_issued_date_time_combo >= start_utc,
+            shipment.gate_pass_issued_date_time_combo <= end_utc,
+        )
+    )
+
+    rows = result.fetchall()
+
+    count_not_received = 0
+    count_0_to_3_5 = 0
+    count_3_5_to_4 = 0
+    count_above_4 = 0
+
+    for row in rows:
+        received = row.gp_received_datetime
+
+        # 🟡 NOT RECEIVED
+        if received is None:
+            count_not_received += 1
+            continue
+
+        diff_hours = (now - received).total_seconds() / 3600
+
+        if diff_hours < 3.5:
+            count_0_to_3_5 += 1
+
+        elif 3.5 <= diff_hours <= 4:
+            count_3_5_to_4 += 1
+
+        else:
+            count_above_4 += 1  # 🔥 NEW
+
+    return {
+        "gp_no_present_but_not_gp_received": count_not_received,
+        "sla_0_to_3_5_hours": count_0_to_3_5,
+        "sla_3_5_to_4_hours": count_3_5_to_4,
+        "sla_above_4_hours": count_above_4,
+        "total": len(rows)
+    }
+
+
+
+
+async def get_sla_dashboard_drilldown_detail(
+    db: AsyncSession,
+    report_date: date,
+    detail_type: str,
+):
+
+    day_start_utc, day_end_utc = ist_date_to_utc_range(report_date)
+    IST = ZoneInfo("Asia/Kolkata")
+
+
+    shipment = WorkerAssignmentShipment
+    header = WorkerAssignmentHeader
+    now = get_utc_now()
+
+    # ✅ Base Query (same for all)
+    result = await db.execute(
+        select(
+            # shipment.id,
+            # header.awb_no,
+            # shipment.gate_pass_no,
+            # shipment.gp_received_datetime,
+            # shipment.gp_received_by,
+            # shipment.gate_pass_issued_date_time_combo
+            shipment.id,
+
+        # HEADER
+        header.awb_no,
+        header.hawb,
+        header.oc_no,
+
+        # SHIPMENT BASIC
+        shipment.no_of_pc,
+        shipment.weight_in_kgs,
+        shipment.chg_wgt_in_kg,
+
+        # GP
+        shipment.gate_pass_no,
+        shipment.gate_pass_issued_date_time_combo,
+        shipment.gp_received_datetime,
+        shipment.gp_received_by,
+
+        # ASSIGNMENT
+        shipment.assigned_person,
+        shipment.assigned_person_datetime,
+
+        # ZONE
+        shipment.drop_dlv_zone,
+        shipment.drop_dlv_zone_datetime,
+
+        # LIFT
+        shipment.loading_in_lift_zone,
+        shipment.loading_in_lift_zone_datetime,
+        shipment.unloading_from_lift_zone,
+        shipment.unloading_from_lift_zone_datetime,
+
+        # FINAL
+        shipment.final_delivery_datetime,
+        shipment.is_final_delivered,
+
+        )  .join(
+        WorkerAssignmentHeader,
+        WorkerAssignmentHeader.id == shipment.assignment_header_id  # ✅ FIX
+    ).where(
+            shipment.gate_pass_no.isnot(None),
+
+            shipment.gate_pass_issued_date_time_combo >= day_start_utc,
+            shipment.gate_pass_issued_date_time_combo <= day_end_utc,
+        )
+    )
+
+    rows = result.mappings().all()
+
+    items = []
+
+    for r in rows:
+        received = r.gp_received_datetime
+
+        # 🟡 NOT RECEIVED
+        if detail_type == "gp_no_present_but_not_gp_received":
+            if not received:
+                items.append({
+                    # "awb_no": r.awb_no,
+                    # "gate_pass_no": r.gate_pass_no,
+                    # "gp_received_by": r.gp_received_by,
+                    # "gp_received_datetime": None,
+
+                        # 🔹 Identity
+    "shipment_id": r.id,
+    "awb_no": r.awb_no,
+    "hawb": r.hawb,
+    "oc_no": r.oc_no,
+
+    # 🔹 Basic
+    "pcs": r.no_of_pc,
+    "weight": r.weight_in_kgs,
+    "chg_weight": r.chg_wgt_in_kg,
+
+    # 🔹 Gate Pass
+    "gate_pass_no": r.gate_pass_no,
+    "gp_issued_at": r.gate_pass_issued_date_time_combo,
+    "gp_received_datetime": r.gp_received_datetime,
+    "gp_received_by": r.gp_received_by,
+
+    # 🔹 Assignment
+    "assigned_person": r.assigned_person,
+    "assigned_at": r.assigned_person_datetime,
+
+    # 🔹 Zone
+    "drop_zone": r.drop_dlv_zone,
+    "drop_zone_at": r.drop_dlv_zone_datetime,
+
+    # 🔹 Lift
+    "loading_zone": r.loading_in_lift_zone,
+    "loading_at": r.loading_in_lift_zone_datetime,
+    "unloading_zone": r.unloading_from_lift_zone,
+    "unloading_at": r.unloading_from_lift_zone_datetime,
+
+    # 🔹 Final
+    "final_delivery_at": r.final_delivery_datetime,
+    "is_final_delivered": r.is_final_delivered,
+
+    "sla_hours":None
+                })
+            continue
+
+        # skip if no received
+        if not received:
+            continue
+
+        diff_hours = (now - received).total_seconds() / 3600
+
+        if detail_type == "sla_0_3_5" and diff_hours < 3.5:
+            pass
+        elif detail_type == "sla_3_5_4" and 3.5 <= diff_hours <= 4:
+            pass
+        elif detail_type == "sla_above_4" and diff_hours > 4:
+            pass
+        else:
+            continue
+
+        items.append({
+            # "awb_no": r.awb_no,
+            # "gate_pass_no": r.gate_pass_no,
+            # "gp_received_by": r.gp_received_by,
+            # "gp_received_datetime": r.gp_received_datetime,
+
+                # 🔹 Identity
+    "shipment_id": r.id,
+    "awb_no": r.awb_no,
+    "hawb": r.hawb,
+    "oc_no": r.oc_no,
+
+    # 🔹 Basic
+    "pcs": r.no_of_pc,
+    "weight": r.weight_in_kgs,
+    "chg_weight": r.chg_wgt_in_kg,
+
+    # 🔹 Gate Pass
+    "gate_pass_no": r.gate_pass_no,
+    "gp_issued_at": r.gate_pass_issued_date_time_combo,
+    "gp_received_datetime": r.gp_received_datetime,
+    "gp_received_by": r.gp_received_by,
+
+    # 🔹 Assignment
+    "assigned_person": r.assigned_person,
+    "assigned_at": r.assigned_person_datetime,
+
+    # 🔹 Zone
+    "drop_zone": r.drop_dlv_zone,
+    "drop_zone_at": r.drop_dlv_zone_datetime,
+
+    # 🔹 Lift
+    "loading_zone": r.loading_in_lift_zone,
+    "loading_at": r.loading_in_lift_zone_datetime,
+    "unloading_zone": r.unloading_from_lift_zone,
+    "unloading_at": r.unloading_from_lift_zone_datetime,
+
+    # 🔹 Final
+    "final_delivery_at": r.final_delivery_datetime,
+    "is_final_delivered": r.is_final_delivered,
+
+            "sla_hours": round(diff_hours, 2),  # 🔥 IMPORTANT
+        })
+
+    return {
+        "detail_type": detail_type,
+        "report_date": str(report_date),
+        "total": len(items),
+        "items": items,
+    }
+
+
+
+
+
+async def generate_excel_stream_export_gp_received(
+    db: AsyncSession,
+    status: str = "all",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    chunk_size: int = 1000
+) -> AsyncGenerator[bytes, None]:
+    """
+    Streams GP Received list as Excel file.
+    Mirrors generate_excel_stream_export_worker_assignment pattern.
+    """
+    import io
+    import xlsxwriter
+    import numpy as np
+    import pytz
+    from sqlalchemy.orm import aliased
+
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    worksheet = workbook.add_worksheet('GP Received')
+
+    # ── Formats ────────────────────────────────────────────────────────
+    header_format = workbook.add_format({
+        'bold': True, 'border': 1,
+        'align': 'center', 'valign': 'vcenter',
+    })
+    date_format   = workbook.add_format({'num_format': 'dd/mm/yyyy hh:mm', 'align': 'left'})
+    number_format = workbook.add_format({'num_format': '0.00', 'align': 'right'})
+    integer_format= workbook.add_format({'num_format': '0',    'align': 'right'})
+    text_format   = workbook.add_format({'align': 'left',   'valign': 'top', 'text_wrap': True})
+    text_center   = workbook.add_format({'align': 'center', 'valign': 'vcenter'})
+
+    # ── Headers ────────────────────────────────────────────────────────
+    headers = [
+        'S.No',
+        'OC No',          'Temp IRM OC',     'AWB No',          'HAWB',
+        'Flight No',      'Flight Date',
+        'No of Pieces',   'Weight (KG)',      'Chargeable Weight (KG)',
+        'Location',
+        'Gate Pass No',   'GP Issue Date',    'GP End Date',
+        'GP Received DateTime', 'GP Received By (EmpID)', 'GP Received By (Name)',
+        'Assigned Person','Drop DLV Zone',
+        'Integrate Date', 'Created At',
+        'Is Final Delivered',
+    ]
+
+    col_widths = [
+        8,   # S.No
+        15,  # OC No
+        15,  # Temp IRM OC
+        18,  # AWB No
+        18,  # HAWB
+        12,  # Flight No
+        18,  # Flight Date
+        12,  # No of Pieces
+        12,  # Weight
+        20,  # Chargeable Weight
+        25,  # Location
+        18,  # Gate Pass No
+        20,  # GP Issue Date
+        20,  # GP End Date
+        22,  # GP Received DateTime
+        22,  # GP Received By EmpID
+        25,  # GP Received By Name
+        18,  # Assigned Person
+        18,  # Drop DLV Zone
+        20,  # Integrate Date
+        18,  # Created At
+        18,  # Is Final Delivered
+    ]
+
+    for col, (h, w) in enumerate(zip(headers, col_widths)):
+        worksheet.write(0, col, h, header_format)
+        worksheet.set_column(col, col, w)
+
+    worksheet.freeze_panes(1, 0)
+
+    # ── Helpers ────────────────────────────────────────────────────────
+    def to_ist_no_tz(dt):
+        IST = pytz.timezone("Asia/Kolkata")
+        if not dt:
+            return None
+        if dt.tzinfo:
+            dt = dt.astimezone(IST)
+        return dt.replace(tzinfo=None)
+
+    # ── Query (same join pattern as get_paginated_gp_received_list) ────
+    UserAlias = aliased(User)
+
+    filters = GpReceivedFilters(
+        shipment_model=WorkerAssignmentShipment,
+        status=status,
+        startDate=start_date,
+        endDate=end_date,
+    )
+
+    base_query = filters.apply_all(
+        select(WorkerAssignmentShipment, WorkerAssignmentHeader, UserAlias.name.label("gp_received_by_name"))
+        .join(WorkerAssignmentHeader, WorkerAssignmentShipment.assignment_header_id == WorkerAssignmentHeader.id)
+        .outerjoin(UserAlias, UserAlias.emp_id == WorkerAssignmentShipment.gp_received_by)
+    ).order_by(
+        WorkerAssignmentShipment.gate_pass_no.asc(),
+        WorkerAssignmentHeader.oc_no.asc(),
+    )
+
+    # ── Stream in chunks ───────────────────────────────────────────────
+    row_num = 1
+    offset  = 0
+
+    while True:
+        rows = (await db.execute(base_query.offset(offset).limit(chunk_size))).all()
+        if not rows:
+            break
+
+        for s, h, gp_received_by_name in rows:
+            c = 0
+
+            worksheet.write(row_num, c, row_num, text_center);                                         c+=1
+            worksheet.write(row_num, c, h.oc_no or '', text_format);                                   c+=1
+            worksheet.write(row_num, c, h.temp_irm_oc_no or '', text_format);                          c+=1
+            worksheet.write(row_num, c, h.awb_no or '', text_format);                                  c+=1
+            worksheet.write(row_num, c, h.hawb or '', text_format);                                    c+=1
+            worksheet.write(row_num, c, s.flight_no or '', text_format);                               c+=1
+
+            if s.flight_date:
+                worksheet.write_datetime(row_num, c, to_ist_no_tz(s.flight_date), date_format)
+            else:
+                worksheet.write(row_num, c, '', text_format)
+            c+=1
+
+            if s.no_of_pc is not None:
+                worksheet.write_number(row_num, c, s.no_of_pc, integer_format)
+            else:
+                worksheet.write_blank(row_num, c, None)
+            c+=1
+
+            if s.weight_in_kgs is not None:
+                worksheet.write_number(row_num, c, s.weight_in_kgs, number_format)
+            else:
+                worksheet.write_blank(row_num, c, None)
+            c+=1
+
+            if s.chg_wgt_in_kg is not None:
+                worksheet.write_number(row_num, c, s.chg_wgt_in_kg, number_format)
+            else:
+                worksheet.write_blank(row_num, c, None)
+            c+=1
+
+            worksheet.write(row_num, c, s.location or '', text_format);                                c+=1
+            worksheet.write(row_num, c, s.gate_pass_no or '', text_format);                            c+=1
+
+            for dt_field in [s.gate_pass_issued_date_time_combo, s.gate_pass_end_datetime, s.gp_received_datetime]:
+                if dt_field:
+                    worksheet.write_datetime(row_num, c, to_ist_no_tz(dt_field), date_format)
+                else:
+                    worksheet.write(row_num, c, '', text_format)
+                c+=1
+
+            worksheet.write(row_num, c, s.gp_received_by or '', text_format);                         c+=1
+            worksheet.write(row_num, c, gp_received_by_name or '', text_format);                       c+=1
+            worksheet.write(row_num, c, s.assigned_person or '', text_format);                         c+=1
+            worksheet.write(row_num, c, s.drop_dlv_zone or '', text_format);                           c+=1
+
+            if s.integrate_date_time:
+                worksheet.write_datetime(row_num, c, to_ist_no_tz(s.integrate_date_time), date_format)
+            else:
+                worksheet.write(row_num, c, '', text_format)
+            c+=1
+
+            if s.created_at:
+                worksheet.write_datetime(row_num, c, to_ist_no_tz(s.created_at), date_format)
+            else:
+                worksheet.write(row_num, c, '', text_format)
+            c+=1
+
+            worksheet.write(row_num, c, "Yes" if s.is_final_delivered else "No", text_center)
+
+            row_num += 1
+
+        offset += chunk_size
+
+    workbook.close()
+    output.seek(0)
+    yield output.read()
