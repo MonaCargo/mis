@@ -31,6 +31,13 @@ class ExportCarMessageAwbMaster(Base):
         "status",
         postgresql_where=(Column("status") == "RCS")
     ),
+        # ✅ ADD — Partial index for TFD rows
+    Index(
+        "idx_awb_tfd_status",
+        "status",
+        postgresql_where=(Column("status") == "TFD")
+    ),
+    
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -96,6 +103,9 @@ class ExportCarMessageAwbMaster(Base):
     
     created_at = Column(DateTime(timezone=True),nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    xray_type = Column(String(30), nullable=True)
+    source = Column(String(30), nullable=True)
  
 
 

@@ -28,9 +28,11 @@ from app.db.models.exportOperation.export_carrier_master import ExportCarrierMas
 from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileUploadMetaLog
 
 from app.db.models.domesticOperation.domestic_xray_report import DomesticXray
+from app.db.models.exportOperation.export_and_import_tp_xray import ExportTpXray
 
 __all__ = [
     # 'WorkerAssignment',
+    "ExportTpXray",
 
     'ExportFileUploadMetaLog',
 
