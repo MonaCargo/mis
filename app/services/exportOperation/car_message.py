@@ -38,6 +38,9 @@ from app.utils.common.car_message_flow_audit_utils import CarMessageFlowModule, 
 from app.utils.common.helperFunction import get_utc_now
 
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING = {"RCS", "TFD", "RCT"} 
+
 # ── 😎 reusable booked_pcs subquery }───────────────────────────────
 def _booked_pcs_subquery():
     return (
@@ -395,6 +398,9 @@ async def enrich_awb_from_wh_inventory(db: AsyncSession, df) -> dict:
     result  = await db.execute(stmt)
     masters = result.scalars().all()
 
+    # # ── Constants ─────────────────────────────────────────────────────────────────
+    # FINAL_STATUSES = {"RCS", "TFD", "RCT"} 
+
     # ── 3. Update fields ──────────────────────────────────────────────────────
     matched: set[str] = set()
     now = get_utc_now()
@@ -410,7 +416,8 @@ async def enrich_awb_from_wh_inventory(db: AsyncSession, df) -> dict:
             master.agent = _val(row.get("AGENT"))
 
         # If already RCS — final status, don't touch anything else
-        if master.status == "RCS":
+        # if master.status == "RCS":
+        if master.status in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:
             pass
 
         else:
@@ -634,8 +641,8 @@ async def get_available_awbs_for_flight_booking_dropdown(
         .outerjoin(booked_subq, ExportCarMessageAwbMaster.id == booked_subq.c.awb_master_id)
         .outerjoin(scanned_subq, ExportCarMessageAwbMaster.id == scanned_subq.c.awb_master_id)  # ✅ outerjoin so AWBs with 0 scanned still appear (filtered below)
         .where(
-            ExportCarMessageAwbMaster.status == "RCS",
-            ExportCarMessageAwbMaster.pcs.isnot(None),
+            # ExportCarMessageAwbMaster.status == "RCS",
+            ExportCarMessageAwbMaster.status.in_(FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING),            ExportCarMessageAwbMaster.pcs.isnot(None),
 
              # ✅ ultra-fast bypasses scanned gate {ULTRA_FAST OR HAVE AT LEAST SCANNED ONE PCS}
             or_(
@@ -753,8 +760,14 @@ async def create_flight_booking(
             errors.append(f"AWB id {item.awb_master_id} not found")
             continue
 
-        if awb.status != "RCS":
-            errors.append(f"AWB {awb.awb_no} is not in RCS status")
+        # if awb.status != "RCS":
+        #     errors.append(f"AWB {awb.awb_no} is not in RCS status")
+        #     continue
+
+        if awb.status not in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:   # ✅ CHANGE — was != "RCS"
+            errors.append(
+                f"AWB {awb.awb_no} status '{awb.status}' is not eligible for flight booking"
+            )
             continue
 
         # already_booked = booked_map.get(item.awb_master_id, 0)
@@ -1166,8 +1179,13 @@ async def edit_flight_booking(
             errors.append(f"AWB id {item.awb_master_id} not found")
             continue
 
-        if awb.status != "RCS":
-            errors.append(f"AWB {awb.awb_no} is not in RCS status")
+        # if awb.status != "RCS":
+        #     errors.append(f"AWB {awb.awb_no} is not in RCS status")
+
+        if awb.status not in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:   # ✅ CHANGE — was != "RCS"
+            errors.append(
+                f"AWB {awb.awb_no} status '{awb.status}' is not eligible for flight booking"
+            )
             continue
 
         # booked_in_others = booked_elsewhere.get(item.awb_master_id, 0)
@@ -5232,7 +5250,7 @@ async def get_dashboard_drilldown_detail(
             select(
                 ExportAwbSkidItemSequence.mapping_id,
                 ExportAwbSkidItemSequence.scanned_by,
-                ExportAwbSkidItemSequence.sequence_date_time,
+                # ExportAwbSkidItemSequence.sequence_date_time,
                 User.name.label("user_name")   # ✅ NEW
             )
             .join(
@@ -5242,7 +5260,10 @@ async def get_dashboard_drilldown_detail(
             )
             .where(
                 ExportAwbSkidItemSequence.mapping_id.in_(mapping_ids)
-            )
+            ) .distinct(
+        ExportAwbSkidItemSequence.mapping_id,
+        ExportAwbSkidItemSequence.scanned_by
+    )
         )
         scanner_rows = scanner_result.mappings().all()
 
@@ -5255,7 +5276,7 @@ async def get_dashboard_drilldown_detail(
             scanner_map[row.mapping_id].append({
                 "emp_id": row.scanned_by,
                 "name": row.user_name,  # ✅ NEW
-                "scanned_at": to_ist_str(row.sequence_date_time),
+                # "scanned_at": to_ist_str(row.sequence_date_time),
             })
 
         # ── build response ─────────────────────────────────────
@@ -5701,11 +5722,18 @@ async def upsert_flight_booking_from_pdf(
                 continue
 
             # ✅🤢 ADD — skip non-RCS instead of letting create_flight_booking raise
-            if row.status != "RCS":
+            # if row.status != "RCS":
+            #     skipped.append(AwbChangeRecord(
+            #         awb_no=awb_no,
+            #         action="SKIPPED",
+            #         reason=f"AWB not in RCS status (current: {row.status})",
+            #     ))
+
+            if row.status not in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:
                 skipped.append(AwbChangeRecord(
                     awb_no=awb_no,
                     action="SKIPPED",
-                    reason=f"AWB not in RCS status (current: {row.status})",
+                    reason=f"AWB not eligible for booking (current status: {row.status})",
                 ))
                 continue
 
@@ -5984,11 +6012,18 @@ async def upsert_flight_booking_from_pdf(
 
         # ✅ ADD
         awb_full = db_awb_map.get(awb_no)
-        if awb_full and awb_full.status != "RCS":  # need status in db_awb_map query
+        # if awb_full and awb_full.status != "RCS":  # need status in db_awb_map query
+        #     skipped.append(AwbChangeRecord(
+        #         awb_no=awb_no,
+        #         action="SKIPPED",
+        #         reason="AWB not in RCS status",
+        #     ))
+
+        if awb_full and awb_full.status not in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:
             skipped.append(AwbChangeRecord(
                 awb_no=awb_no,
                 action="SKIPPED",
-                reason="AWB not in RCS status",
+                reason=f"AWB not eligible for booking (current status: {awb_full.status})",
             ))
             continue
        
