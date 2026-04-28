@@ -7,6 +7,7 @@ services/uld_stock_service.py    OR   uld_master_service.py
 """
 
 from datetime import datetime, timezone
+from itertools import islice
 from operator import and_
 from typing import Optional
 
@@ -14,16 +15,20 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
-from app.schemas.exportOperation.car_message import UldStockRecord, UldStockSyncResponse, UldSyncResult
+from app.schemas.exportOperation.car_message import UldInventoryRecord, UldStockRecord, UldStockSyncResponse, UldSyncResult
 
 
 # Identifies this automated process as the creator when no user is logged in
 SYSTEM_ACTOR = "stock_sync_by_system"
-
+FETCH_CHUNK_SIZE = 500
 
 class MultipleCarriersError(ValueError):
     """Raised when a single payload contains records for more than one carrier."""
 
+def _chunked(iterable, size: int):
+    it = iter(iterable)
+    while chunk := list(islice(it, size)):
+        yield chunk
 
 class UldStockSyncService:
 
@@ -111,6 +116,66 @@ class UldStockSyncService:
         return "created"
     
 
+    # ── new: all-carrier CSV/Excel inventory sync ─────────────────────────────
+ 
+    async def sync_all_carrier_inventory_file(
+        self,
+        records: list[UldInventoryRecord],
+        synced_by: Optional[str] = None,
+    ) -> UldStockSyncResponse:
+        """
+        Handles all-carrier CSV/Excel inventory file.
+        Multiple carriers in one file is expected and valid.
+        Fetches existing ULDs in chunks of 500 to avoid oversized IN clauses.
+        Existing ULD → is_available = True + refresh fields.
+        New ULD      → INSERT with is_available = True.
+        """
+        actor       = synced_by or SYSTEM_ACTOR
+        now         = datetime.now(tz=timezone.utc)
+        uld_numbers = [r.uld_number for r in records]
+ 
+        # ── chunked fetch ─────────────────────────────────────────────────────
+        existing: dict[str, ExportUldMaster] = {}
+        for chunk in _chunked(uld_numbers, FETCH_CHUNK_SIZE):
+            result = await self._db.execute(
+                select(ExportUldMaster).where(ExportUldMaster.uld_no.in_(chunk))
+            )
+            existing.update({row.uld_no: row for row in result.scalars().all()})
+ 
+        # ── single-pass upsert ────────────────────────────────────────────────
+        created = updated = 0
+ 
+        for rec in records:
+            if rec.uld_number in existing:
+                obj              = existing[rec.uld_number]
+                obj.is_available = True
+                obj.carrier      = rec.carrier_code
+                obj.updated_at   = now
+                obj.updated_by   = actor
+                updated += 1
+            else:
+                self._db.add(ExportUldMaster(
+                    uld_no       = rec.uld_number,
+                    carrier      = rec.carrier_code,
+                    is_active    = True,
+                    is_available = True,
+                    created_at   = now,
+                    created_by   = actor,
+                    updated_at   = now,
+                    updated_by   = actor,
+                ))
+                created += 1
+ 
+        await self._db.flush()
+ 
+        return UldStockSyncResponse(
+            carrier        = "MULTI",
+            total_received = len(records),
+            total_created  = created,
+            total_updated  = updated,
+            results        = [],
+        )
+ 
 
 
 

@@ -32,7 +32,7 @@ async def get_upload_logs(
 
     # filters
     status:          Optional[str]  = Query(None, description="SUCCESS | FAILED | all"),
-    file_track_type: Optional[str]  = Query(None, description="CAR_MESSAGE_AWB | WH_INVENTORY_PDF | ULD_STOCK_PDF | all"),
+    file_track_type: Optional[str]  = Query(None, description="CAR_MESSAGE_AWB | WH_INVENTORY_PDF | ULD_STOCK_PDF |ULD_INVENTRY_ALL_CARRIER | all"),
     start_date:      Optional[date] = Query(None, description="Filter from this date (YYYY-MM-DD)"),
     end_date:        Optional[date] = Query(None, description="Filter to this date (YYYY-MM-DD)"),
 
