@@ -7000,20 +7000,103 @@ async def get_flight_history(db, date):
 
 
 # This give which awb is booked in which flight with how many pcs and how many total pcs in that awb and pending pcs in that awb for a particular flight
+# async def get_flight_awb_breakdown(db: AsyncSession, flight_id: int):
+#     result = await db.execute(
+#         select(
+#             ExportFlightBookingDetail.id,
+#             ExportCarMessageAwbMaster.awb_no,
+#             ExportFlightBookingDetail.booked_pcs,
+#             ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+#         )
+#         .join(
+#             ExportCarMessageAwbMaster,
+#             ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id,
+#         )
+#         .where(
+#             ExportFlightBookingDetail.flight_header_id == flight_id
+#         )
+#     )
+
+#     rows = result.mappings().all()
+
+#     awbs = []
+#     total_booked = 0
+#     total_pcs = 0
+
+#     for r in rows:
+#         total_booked += r.booked_pcs or 0
+#         total_pcs += r.total_pcs or 0
+
+#         awbs.append({
+#             "awb_no": r.awb_no,
+#             "booked_pcs": r.booked_pcs or 0,
+#             "total_pcs": r.total_pcs or 0,
+#             "pending_pcs": (r.total_pcs or 0) - (r.booked_pcs or 0),
+#         })
+
+#     return {
+#         "flight_id": flight_id,
+#         "total_awbs": len(awbs),
+#         "total_booked_pcs": total_booked,
+#         "total_pcs": total_pcs,
+#         "awbs": awbs,
+#     }
+
+
 async def get_flight_awb_breakdown(db: AsyncSession, flight_id: int):
     result = await db.execute(
         select(
             ExportFlightBookingDetail.id,
+            ExportCarMessageAwbMaster.id.label("awb_master_id"),
             ExportCarMessageAwbMaster.awb_no,
             ExportFlightBookingDetail.booked_pcs,
             ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+            func.array_agg(
+                func.distinct(ExportUldMaster.uld_no)
+            ).label("used_uld"),
         )
         .join(
             ExportCarMessageAwbMaster,
-            ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id,
+            ExportFlightBookingDetail.awb_master_id
+            == ExportCarMessageAwbMaster.id,
         )
+
+        # ULD loading join
+        .outerjoin(
+            ExportSequenceItemUldLoading,
+            (
+                ExportSequenceItemUldLoading.awb_master_id
+                == ExportCarMessageAwbMaster.id
+            )
+            &
+            (
+                ExportSequenceItemUldLoading.flight_header_id
+                == flight_id
+            )
+        )
+
+        .outerjoin(
+            ExportUldAssignmentDetail,
+            ExportUldAssignmentDetail.id
+            == ExportSequenceItemUldLoading.uld_assignment_detail_id
+        )
+
+        .outerjoin(
+            ExportUldMaster,
+            ExportUldMaster.id
+            == ExportUldAssignmentDetail.uld_id
+        )
+
         .where(
             ExportFlightBookingDetail.flight_header_id == flight_id
+        )
+
+        .group_by(
+            ExportFlightBookingDetail.id,
+            ExportCarMessageAwbMaster.id,
+            ExportCarMessageAwbMaster.awb_no,
+            ExportFlightBookingDetail.booked_pcs,
+            ExportCarMessageAwbMaster.pcs,
         )
     )
 
@@ -7024,14 +7107,20 @@ async def get_flight_awb_breakdown(db: AsyncSession, flight_id: int):
     total_pcs = 0
 
     for r in rows:
-        total_booked += r.booked_pcs or 0
-        total_pcs += r.total_pcs or 0
+        booked = r.booked_pcs or 0
+        total = r.total_pcs or 0
+
+        total_booked += booked
+        total_pcs += total
 
         awbs.append({
             "awb_no": r.awb_no,
-            "booked_pcs": r.booked_pcs or 0,
-            "total_pcs": r.total_pcs or 0,
-            "pending_pcs": (r.total_pcs or 0) - (r.booked_pcs or 0),
+            "booked_pcs": booked,
+            "total_pcs": total,
+            "pending_pcs": total - booked,
+
+            # NEW FIELD
+            "used_uld": [u for u in (r.used_uld or []) if u],
         })
 
     return {
@@ -7041,8 +7130,6 @@ async def get_flight_awb_breakdown(db: AsyncSession, flight_id: int):
         "total_pcs": total_pcs,
         "awbs": awbs,
     }
-
-
 
 async def get_flight_particular_flight_detail(db, flight_id):
 
@@ -7112,7 +7199,8 @@ async def get_uld_sequences_of_particular_flight(db, flight_id, uld_detail_id):
         select(
             ExportSequenceItemUldLoading,
             ExportAwbSkidItemSequence,
-            ExportCarMessageAwbMaster.awb_no  # ✅ CORRECT SOURCE
+            ExportCarMessageAwbMaster.awb_no , # ✅ CORRECT SOURCE
+             User.name.label("loaded_by_name") 
         )
         .join(
             ExportAwbSkidItemSequence,
@@ -7120,6 +7208,11 @@ async def get_uld_sequences_of_particular_flight(db, flight_id, uld_detail_id):
         ).join(  # ✅ IMPORTANT JOIN
             ExportCarMessageAwbMaster,
             ExportAwbSkidItemSequence.awb_master_id == ExportCarMessageAwbMaster.id
+        )
+        .join(
+            User,
+            User.emp_id == ExportSequenceItemUldLoading.loaded_by,  # ✅ join condition
+            isouter=True  # optional, if some records may not have a matching user
         )
         .where(
             ExportSequenceItemUldLoading.uld_assignment_detail_id == uld_detail_id
@@ -7130,12 +7223,13 @@ async def get_uld_sequences_of_particular_flight(db, flight_id, uld_detail_id):
 
     result = []
 
-    for load, seq, awb_no in rows:
+    for load, seq, awb_no,loaded_by_name  in rows:
         result.append({
             "sequence_no": seq.sequence_no,
             "awb_id": seq.awb_master_id,
             "awb_no": awb_no,
             "loaded_by": load.loaded_by,
+             "loaded_by_name": loaded_by_name,
             "loaded_at": load.loaded_at,
             "scanned_by": seq.scanned_by,
             "scan_time": seq.sequence_date_time,
