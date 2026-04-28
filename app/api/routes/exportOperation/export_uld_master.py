@@ -104,10 +104,11 @@ from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileU
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.db.session import get_db
 from app.schemas.domesticOperation.domestic_xray_report import PaginationMetadata
-from app.schemas.exportOperation.car_message import UldStockRecord, UldStockSyncResponse
+from app.schemas.exportOperation.car_message import UldInventoryRecord, UldStockRecord, UldStockSyncResponse
 from app.schemas.exportOperation.location_master import CreateUldRequest
 from app.services.exportOperation.uld_master_service import MultipleCarriersError, UldStockSyncService
 from app.utils.common.helperFunction import get_utc_now
+from app.utils.exportOperation.export_uld_inventory_all_carrier import SUPPORTED_EXTENSIONS, extract_all_carrier_uld_inventory
 from app.utils.exportOperation.export_uld_master_cleaner import parse_uld_excel
 from app.utils.exportOperation.extract_uld_inventry_pdf import extract_uld_stock
 
@@ -226,7 +227,7 @@ async def create_uld(
 
 # ======================== 🤢🤮
 
-async def _write_uld_failure_log(filename, uploaded_by, now, error_message):
+async def _write_uld_failure_log(filename, file_track_type, uploaded_by, now, error_message):
     try:
         async with AsyncSession(engine) as log_session:
             async with log_session.begin():
@@ -235,7 +236,7 @@ async def _write_uld_failure_log(filename, uploaded_by, now, error_message):
                     file_type="pdf",
                     uploaded_by=uploaded_by,
                     uploaded_at=now,
-                    file_track_type="ULD_INVENTRY_PDF",
+                    file_track_type=file_track_type,
                     status="FAILED",
                     upload_meta={
                         "total_in_pdf": 0,
@@ -374,6 +375,7 @@ async def upload_and_sync_uld_stock(
             pass
         await _write_uld_failure_log(
             filename=filename,
+            file_track_type="ULD_INVENTRY_PDF",
             uploaded_by=emp_id,
             now=now,
             error_message=e.detail if isinstance(e.detail, str) else str(e.detail),
@@ -387,6 +389,7 @@ async def upload_and_sync_uld_stock(
             pass
         await _write_uld_failure_log(
             filename=filename,
+             file_track_type="ULD_INVENTRY_PDF",
             uploaded_by=emp_id,
             now=now,
             error_message=str(e),
@@ -398,6 +401,142 @@ async def upload_and_sync_uld_stock(
 
 
 
+# ========================  ULD iNVENTRU EXCEL UPLOAD FOR ALL INVENTRY =========================== 
+
+@router.post(
+    "/excel-upload-and-sync-uld-inventory-file",
+    response_model=UldStockSyncResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Upload all-carrier ULD inventory CSV/Excel and sync to DB",
+    responses={
+        200: {"description": "File processed and DB synced successfully"},
+        400: {"description": "Invalid file type or no valid records found"},
+        413: {"description": "File exceeds 10 MB limit"},
+        500: {"description": "Unexpected error during extraction or sync"},
+    },
+)
+async def upload_and_sync_uld_inventory(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+) -> UldStockSyncResponse:
+ 
+    now      = get_utc_now()
+    filename = file.filename
+    emp_id   = current_user.emp_id
+ 
+    try:
+        # ── 1. Validate extension ─────────────────────────────────────────────
+        if not any(filename.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported file type. Allowed: {', '.join(sorted(SUPPORTED_EXTENSIONS))}",
+            )
+ 
+        # ── 2. Read & size-check ──────────────────────────────────────────────
+        contents = await file.read()
+        if len(contents) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="File too large. Maximum allowed size is 10 MB.",
+            )
+ 
+        # ── 3. Clean → DataFrame from cleaner ────────────────────────────────
+        try:
+            df = extract_all_carrier_uld_inventory(io.BytesIO(contents), filename)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to extract data from the file: {exc}",
+            ) from exc
+ 
+        if df.empty:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid ULD records found in the uploaded file.",
+            )
+ 
+        
+        # ── 4. DataFrame → Pydantic records ───────────────────────────────────────────
+        records: list[UldInventoryRecord] = []
+        for row in df.where(pd.notnull(df), None).to_dict(orient="records"):
+            normalized = {
+                k: v.isoformat() if hasattr(v, "isoformat") else v
+                for k, v in row.items()
+            }
+            # carrier_code is None for rows like O30321** — skip those rows entirely
+            if not normalized.get("carrier_code"):
+                continue
+            records.append(UldInventoryRecord(**normalized))
+ 
+        # ── 5. Sync via service ───────────────────────────────────────────────
+        service = UldStockSyncService(db=db)
+        try:
+            response = await service.sync_all_carrier_inventory_file(
+                records=records,
+                synced_by=emp_id,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Unexpected error during ULD inventory synchronization.",
+            ) from exc
+ 
+        # ── 6. Audit log ──────────────────────────────────────────────────────
+        db.add(ExportFileUploadMetaLog(
+            filename        = filename,
+            file_type       = filename.rsplit(".", 1)[-1],
+            uploaded_by     = emp_id,
+            uploaded_at     = now,
+            file_track_type = "ULD_INVENTRY_ALL_CARRIER",
+            status          = "SUCCESS",
+            upload_meta     = {
+                "total_in_file": response.total_received,
+                "inserted":      response.total_created,
+                "updated":       response.total_updated,
+            },
+            error_message   = None,
+            created_at      = now,
+        ))
+        await db.commit()
+        return response
+ 
+    except HTTPException as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        await _write_uld_failure_log(
+            filename=filename,
+             file_track_type="ULD_INVENTRY_ALL_CARRIER",
+            uploaded_by=emp_id,
+            now=now,
+            error_message=e.detail if isinstance(e.detail, str) else str(e.detail),
+        )
+        raise
+ 
+    except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        await _write_uld_failure_log(
+            filename=filename,
+             file_track_type="ULD_INVENTRY_ALL_CARRIER",
+            uploaded_by=emp_id,
+            now=now,
+            error_message=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Processing failed: {str(e)}",
+        )
+ 
 
 # ============== ULD MASTER DATA TO SHOW IN WEB TABLE WITH FILTER AND PAGINATION ==============
 

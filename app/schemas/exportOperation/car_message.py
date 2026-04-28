@@ -292,6 +292,13 @@ class UldAssignmentDataResponse(BaseModel):
 
 UldAssignmentResponse.model_rebuild() # forward references
 
+
+
+class UldInventoryRecord(BaseModel):
+    sl_no:        int | None
+    uld_number:   str
+    carrier_code: str 
+    uld_date:     datetime | None
 # === END =========
 
 
