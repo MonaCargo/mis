@@ -18,7 +18,7 @@ class ExportOperationCarMessageFlowAuditLog(Base):
 
     id = Column(Integer, primary_key=True)
 
-    awb_reference_id = Column(Integer, nullable=False)
+    awb_reference_id = Column(Integer, nullable=True)
     flight_reference_id = Column(Integer, nullable=True)
 
     module = Column(String(50), nullable=False)

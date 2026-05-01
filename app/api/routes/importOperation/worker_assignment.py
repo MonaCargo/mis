@@ -1519,7 +1519,8 @@ async def get_for_unloading(
 async def assign_loading_in_lift(
     req: AssignLoadingInLiftRequest,
     fastApiRequest: Request,
-    current_user: User = Depends(require_roles(["imp_sec_ll","super_admin"])),
+    # current_user: User = Depends(require_roles(["imp_sec_ll","super_admin"])),
+    current_user: User = Depends(verify_token_and_get_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -1567,7 +1568,8 @@ async def assign_loading_in_lift(
 async def assign_unloading_from_lift(
     req: AssignUnloadingFromLiftRequest,
     fastApiRequest: Request,
-    current_user: User = Depends(require_roles(["imp_sec_ul","super_admin"])),
+    # current_user: User = Depends(require_roles(["imp_sec_ul","super_admin"])),
+    current_user: User = Depends(verify_token_and_get_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:

@@ -3,7 +3,7 @@
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 import re
-from typing import Optional
+from typing import Literal, Optional
 from fastapi import status
 from zoneinfo import ZoneInfo
 
@@ -6901,7 +6901,7 @@ async def extract_carrier_for_uld_filter(
 
 
 
-#  =============== 🫥 INDIVIDUAL ULD CLOSING  PER FLIGHTS PER DATE ====================
+#  =============== 🫥 INDIVIDUAL ULD CLOSING/ UNCLOSING  PER FLIGHTS PER DATE ====================
 
 async def close_per_uld__per_flight_service(
     db: AsyncSession,
@@ -6944,6 +6944,25 @@ async def close_per_uld__per_flight_service(
     uld.closed_by = closed_by
     uld.closed_at = now
 
+     # ✅ ADD LOG HERE
+    await write_car_message_flow_audit(
+        db=db,
+        awb_reference_id=None,
+        flight_reference_id=flight_id,
+        module=CarMessageFlowModule.ULD_CLOSE_OPEN,
+        flow_step="ULD_CLOSE",
+        record_id=uld.id,
+        action="UPDATE",
+        performed_by=closed_by,
+         changes={
+        "event": "ULD_CLOSE",
+            "is_closed": True,
+            "closed_by": closed_by,
+            "closed_at": str(now)
+    },
+        note=f"ULD {uld.id} closed by {closed_by} with {loaded_count} items",
+    )
+
     await db.commit()
 
     return {
@@ -6954,36 +6973,180 @@ async def close_per_uld__per_flight_service(
     }
 
 
+async def unlock_per_uld_service(
+    db: AsyncSession,
+    uld_assignment_detail_id: int,
+    unlocked_by: str,
+):
+    now = get_utc_now()
+
+    uld = await db.get(ExportUldAssignmentDetail, uld_assignment_detail_id)
+
+    if not uld:
+        raise HTTPException(404, "ULD not found")
+
+    if not uld.is_closed:
+        raise HTTPException(400, "ULD already open")
+    
+    # ── capture previous state (IMPORTANT) ──
+    previous_closed_by = uld.closed_by
+    previous_closed_at = uld.closed_at
+    
+        # ── get flight id ──────────────────────
+    assignment = await db.get(ExportUldAssignment, uld.assignment_id)
+    flight_id = assignment.flight_header_id
+
+    loaded_count = await db.scalar(
+    select(func.count(ExportSequenceItemUldLoading.id))
+    .where(
+        ExportSequenceItemUldLoading.uld_assignment_detail_id == uld_assignment_detail_id
+        )
+    ) or 0
+
+    # ── unlock ─────────────────────────────
+    uld.is_closed = False
+    uld.closed_by = None
+    uld.closed_at = None
+
+    await write_car_message_flow_audit(
+        db=db,
+        awb_reference_id=None,  # if not available
+        flight_reference_id=flight_id,  # or actual flight_id if needed
+         module=CarMessageFlowModule.ULD_CLOSE_OPEN,
+        flow_step="ULD_OPEN",
+        record_id=uld.id,
+        action="UPDATE",
+        performed_by=unlocked_by,
+         changes={
+           "event":"ULD_OPEN",
+            "is_closed": False,
+            "closed_by": "",
+            "closed_at": ""
+        },
+        note=(
+            f"ULD {uld.id} unlocked by {unlocked_by}. "
+            f"Previously locked by {previous_closed_by} at {previous_closed_at} (utc time)."
+            f"Items inside: {loaded_count}"
+        ),
+    )
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": "ULD unlocked successfully",
+        "uld_id": uld_assignment_detail_id,
+    }
 
 
 
 
 # ============================== ✈️✈️FIGHT HISTORY RELATED ROUTES======================
 
+# async def get_flight_history(db, date):
+#     flights = await db.execute(
+#         select(ExportFlightBookingHeader)
+#         .where(
+#             ExportFlightBookingHeader.flight_date == date,
+#             ExportFlightBookingHeader.is_active == True
+#         )
+#     )
+
+#     flights = flights.scalars().all()
+
+#     result = []
+
+#     for f in flights:
+#         # AWB + pcs
+#         details = await db.execute(
+#             select(ExportFlightBookingDetail)
+#             .where(ExportFlightBookingDetail.flight_header_id == f.id)
+#         )
+
+#         details = details.scalars().all()
+
+#         total_awbs = len(details)
+#         total_pcs = sum(d.booked_pcs for d in details)
+
+#         result.append({
+#             "flight_id": f.id,
+#             "flight_no": f.flight_no,
+#             "flight_date": f.flight_date,
+#             "departure": f.flight_dpt_datetime,
+#             "booked_by": f.booked_by,
+#             "booked_at": f.booked_at,
+#             "total_awbs": total_awbs,
+#             "total_pcs": total_pcs,
+#         })
+
+#     return result
+
+
 async def get_flight_history(db, date):
-    flights = await db.execute(
+    flights_result = await db.execute(
         select(ExportFlightBookingHeader)
         .where(
             ExportFlightBookingHeader.flight_date == date,
             ExportFlightBookingHeader.is_active == True
         )
+        .order_by(
+            ExportFlightBookingHeader.flight_dpt_datetime
+        )
     )
 
-    flights = flights.scalars().all()
+    flights = flights_result.scalars().all()
 
     result = []
 
+    total_flights = len(flights)
+    total_departed = 0
+    total_loading_not_started = 0
+
+    now_result = await db.execute(
+        select(func.now())
+    )
+    current_time = now_result.scalar()
+
     for f in flights:
-        # AWB + pcs
-        details = await db.execute(
+        details_result = await db.execute(
             select(ExportFlightBookingDetail)
-            .where(ExportFlightBookingDetail.flight_header_id == f.id)
+            .where(
+                ExportFlightBookingDetail.flight_header_id == f.id
+            )
         )
 
-        details = details.scalars().all()
+        details = details_result.scalars().all()
 
         total_awbs = len(details)
-        total_pcs = sum(d.booked_pcs for d in details)
+        total_pcs = sum(
+            d.booked_pcs or 0
+            for d in details
+        )
+
+        # check if loading started for this flight
+        loading_check = await db.execute(
+            select(ExportSequenceItemUldLoading.id)
+            .where(
+                ExportSequenceItemUldLoading.flight_header_id == f.id
+            )
+            .limit(1)
+        )
+
+        has_loading_started = (
+            loading_check.scalar_one_or_none() is not None
+        )
+
+        if not has_loading_started:
+            total_loading_not_started += 1
+
+        is_departed = (
+            f.flight_dpt_datetime <= current_time
+            if f.flight_dpt_datetime
+            else False
+        )
+
+        if is_departed:
+            total_departed += 1
 
         result.append({
             "flight_id": f.id,
@@ -6992,11 +7155,24 @@ async def get_flight_history(db, date):
             "departure": f.flight_dpt_datetime,
             "booked_by": f.booked_by,
             "booked_at": f.booked_at,
+
             "total_awbs": total_awbs,
             "total_pcs": total_pcs,
+
+            "is_departed": is_departed,
+             "loading_started": has_loading_started,
         })
 
-    return result
+    return {
+        "summary": {
+            "selected_date": str(date),
+            "total_flights": total_flights,
+            "total_departed": total_departed,
+            "total_pending_departure": total_flights - total_departed,
+             "total_loading_not_started": total_loading_not_started,
+        },
+        "flights": result
+    }
 
 
 # This give which awb is booked in which flight with how many pcs and how many total pcs in that awb and pending pcs in that awb for a particular flight
@@ -7236,3 +7412,1029 @@ async def get_uld_sequences_of_particular_flight(db, flight_id, uld_detail_id):
         })
 
     return result
+
+
+
+
+
+# ======================🫥🫥 Car message V2 dashboard =================================
+CategoryLiteral = Literal["all", "car_message", "export_tp", "import_tp", "tp_combine"]
+ 
+# Sentinel meanings used in the map:
+#   False        → no filter (all)
+#   None         → source IS NULL  (car_message AWBs)
+#   str          → source == <str>
+#   list[str]    → source IN [...]  (tp_combine)
+_SOURCE_FILTER_MAP: dict[str, str | None | bool | list[str]] = {
+    "all":        False,
+    "car_message": None,
+    "export_tp":  "EXPORT_TP_XRAY",
+    "import_tp":  "IMPORT_TP_XRAY",
+    "tp_combine": ["EXPORT_TP_XRAY", "IMPORT_TP_XRAY"],
+}
+ 
+# The two TP source values — reused wherever an IN-filter is needed inline
+_TP_SOURCES = ["EXPORT_TP_XRAY", "IMPORT_TP_XRAY"]
+ 
+
+def _apply_source_filter(stmt, category: CategoryLiteral):
+    """
+    Apply source filter on ExportCarMessageAwbMaster.source
+    based on the requested category.
+    """
+    filter_val = _SOURCE_FILTER_MAP[category]
+ 
+    if filter_val is False:
+        # "all" — no source restriction
+        return stmt
+    if filter_val is None:
+        # car_message — source IS NULL
+        return stmt.where(ExportCarMessageAwbMaster.source.is_(None))
+    if isinstance(filter_val, list):
+        # tp_combine — source IN ('EXPORT_TP_XRAY', 'IMPORT_TP_XRAY')
+        return stmt.where(ExportCarMessageAwbMaster.source.in_(filter_val))
+    # export_tp / import_tp — exact match
+    return stmt.where(ExportCarMessageAwbMaster.source == filter_val)
+ 
+ 
+async def get_dashboard_stats_v2(
+    db: AsyncSession,
+    report_date: date,
+    category: CategoryLiteral,
+) -> dict:
+ 
+    # ── Convert IST date to UTC range ──────────────────────────────────────
+    day_start_utc, day_end_utc = ist_date_to_utc_range(report_date)
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 1 — AWB MASTER STATS
+    # ══════════════════════════════════════════════════════════════════════
+ 
+    awb_stats_stmt = _apply_source_filter(
+        select(
+            func.count(ExportCarMessageAwbMaster.id).label("total_awb"),
+            func.count(ExportCarMessageAwbMaster.id)
+            .filter(ExportCarMessageAwbMaster.status == "RCS")
+            .label("total_rcs"),
+            func.count(ExportCarMessageAwbMaster.id)
+            .filter(
+                ExportCarMessageAwbMaster.status != "RCS",
+                ExportCarMessageAwbMaster.status.isnot(None),
+            )
+            .label("total_non_rcs"),
+            func.count(ExportCarMessageAwbMaster.id)
+            .filter(ExportCarMessageAwbMaster.status.is_(None))
+            .label("total_no_status"),
+            func.coalesce(func.sum(ExportCarMessageAwbMaster.pcs), 0).label(
+                "total_pcs"
+            ),
+        ).where(
+            ExportCarMessageAwbMaster.car_message_datetime_combo >= day_start_utc,
+            ExportCarMessageAwbMaster.car_message_datetime_combo <= day_end_utc,
+        ),
+        category,
+    )
+ 
+    awb_stats_result = await db.execute(awb_stats_stmt)
+    awb_row = awb_stats_result.mappings().one()
+ 
+    # ── AWB ids + pcs map for this date+category ──────────────────────────
+    awb_ids_stmt = _apply_source_filter(
+        select(
+            ExportCarMessageAwbMaster.id,
+            ExportCarMessageAwbMaster.pcs,
+        ).where(
+            ExportCarMessageAwbMaster.car_message_datetime_combo >= day_start_utc,
+            ExportCarMessageAwbMaster.car_message_datetime_combo <= day_end_utc,
+        ),
+        category,
+    )
+ 
+    awb_ids_result = await db.execute(awb_ids_stmt)
+    awb_rows = awb_ids_result.mappings().all()
+    awb_ids = [r.id for r in awb_rows]
+    awb_pcs_map = {r.id: (r.pcs or 0) for r in awb_rows}
+    total_awb_pcs = sum(awb_pcs_map.values())
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 2 — SCANNING STATS
+    # ══════════════════════════════════════════════════════════════════════
+ 
+    if awb_ids:
+        # ── Scanned sequences for date+category AWBs ──────────────────────
+        scanning_result = await db.execute(
+            select(
+                ExportAwbSkidItemSequence.awb_master_id,
+                func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+            )
+            .where(ExportAwbSkidItemSequence.awb_master_id.in_(awb_ids))
+            .group_by(ExportAwbSkidItemSequence.awb_master_id)
+        )
+        scanned_by_awb = {
+            r.awb_master_id: r.scanned_pcs
+            for r in scanning_result.mappings().all()
+        }
+ 
+        scanned_awbs = len(scanned_by_awb)
+        total_scanned_for_date_awbs = sum(scanned_by_awb.values())
+        total_pending_pcs = max(0, total_awb_pcs - total_scanned_for_date_awbs)
+        scan_pct = (
+            round((total_scanned_for_date_awbs / total_awb_pcs * 100), 1)
+            if total_awb_pcs > 0
+            else 0
+        )
+ 
+        # ── "Others" — scanned today but AWB belongs to a different date ──
+        # Source filter applied via join to ExportCarMessageAwbMaster
+        others_base_stmt = (
+            select(
+                func.count(ExportAwbSkidItemSequence.id).label(
+                    "others_scanned_pcs"
+                ),
+                func.count(
+                    distinct(ExportAwbSkidItemSequence.awb_master_id)
+                ).label("others_awb_count"),
+            )
+            .join(
+                ExportCarMessageAwbMaster,
+                ExportAwbSkidItemSequence.awb_master_id
+                == ExportCarMessageAwbMaster.id,
+            )
+            .where(
+                # scanned on the selected IST date
+                ExportAwbSkidItemSequence.sequence_date_time >= day_start_utc,
+                ExportAwbSkidItemSequence.sequence_date_time <= day_end_utc,
+                # AWB does NOT belong to this date
+                ExportCarMessageAwbMaster.id.notin_(awb_ids),
+            )
+        )
+ 
+        # Apply source filter on the joined ExportCarMessageAwbMaster
+        filter_val = _SOURCE_FILTER_MAP[category]
+        if filter_val is not False:
+            if filter_val is None:
+                others_base_stmt = others_base_stmt.where(
+                    ExportCarMessageAwbMaster.source.is_(None)
+                )
+            elif isinstance(filter_val, list):
+                # tp_combine — source IN ('EXPORT_TP_XRAY', 'IMPORT_TP_XRAY')
+                others_base_stmt = others_base_stmt.where(
+                    ExportCarMessageAwbMaster.source.in_(filter_val)
+                )
+            else:
+                others_base_stmt = others_base_stmt.where(
+                    ExportCarMessageAwbMaster.source == filter_val
+                )
+ 
+        others_result = await db.execute(others_base_stmt)
+        others_row = others_result.mappings().one()
+ 
+        # ── Other AWBs total pcs ──────────────────────────────────────────
+        other_awb_totals_stmt = (
+            select(
+                ExportCarMessageAwbMaster.id,
+                ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+            )
+            .join(
+                ExportAwbSkidItemSequence,
+                ExportAwbSkidItemSequence.awb_master_id
+                == ExportCarMessageAwbMaster.id,
+            )
+            .where(
+                ExportAwbSkidItemSequence.sequence_date_time >= day_start_utc,
+                ExportAwbSkidItemSequence.sequence_date_time <= day_end_utc,
+                ExportCarMessageAwbMaster.id.notin_(awb_ids),
+            )
+            .group_by(
+                ExportCarMessageAwbMaster.id,
+                ExportCarMessageAwbMaster.pcs,
+            )
+        )
+ 
+        # Apply source filter
+        if filter_val is not False:
+            if filter_val is None:
+                other_awb_totals_stmt = other_awb_totals_stmt.where(
+                    ExportCarMessageAwbMaster.source.is_(None)
+                )
+            elif isinstance(filter_val, list):
+                # tp_combine — source IN ('EXPORT_TP_XRAY', 'IMPORT_TP_XRAY')
+                other_awb_totals_stmt = other_awb_totals_stmt.where(
+                    ExportCarMessageAwbMaster.source.in_(filter_val)
+                )
+            else:
+                other_awb_totals_stmt = other_awb_totals_stmt.where(
+                    ExportCarMessageAwbMaster.source == filter_val
+                )
+ 
+        other_awb_rows = (await db.execute(other_awb_totals_stmt)).mappings().all()
+        other_awb_ids = [r.id for r in other_awb_rows]
+        other_awb_total_pcs = sum(r.total_pcs or 0 for r in other_awb_rows)
+ 
+        # ── Ever-scanned totals for other AWBs ───────────────────────────
+        if other_awb_ids:
+            other_scanned_ever_result = await db.execute(
+                select(
+                    ExportAwbSkidItemSequence.awb_master_id,
+                    func.count(ExportAwbSkidItemSequence.id).label("scanned_ever"),
+                )
+                .where(
+                    ExportAwbSkidItemSequence.awb_master_id.in_(other_awb_ids)
+                )
+                .group_by(ExportAwbSkidItemSequence.awb_master_id)
+            )
+            other_scanned_ever_map = {
+                r.awb_master_id: r.scanned_ever
+                for r in other_scanned_ever_result.mappings().all()
+            }
+        else:
+            other_scanned_ever_map = {}
+ 
+        other_awbs_scanned_ever = sum(other_scanned_ever_map.values())
+        other_awbs_pending = max(0, other_awb_total_pcs - other_awbs_scanned_ever)
+ 
+        others_scanned_today = others_row.get("others_scanned_pcs") or 0
+        other_date_pct = (
+            round((others_scanned_today / other_awb_total_pcs * 100), 1)
+            if other_awb_total_pcs > 0
+            else 0
+        )
+ 
+        merged_scanned = total_scanned_for_date_awbs + others_scanned_today
+        merged_total_pcs = total_awb_pcs + other_awb_total_pcs
+        merged_pct = (
+            round((merged_scanned / merged_total_pcs * 100), 1)
+            if merged_total_pcs > 0
+            else 0
+        )
+ 
+    else:
+        total_scanned_for_date_awbs = 0
+        total_pending_pcs = 0
+        scanned_awbs = 0
+        scan_pct = 0
+        others_row = {"others_scanned_pcs": 0, "others_awb_count": 0}
+        other_awb_total_pcs = 0
+        other_awbs_pending = 0
+        other_date_pct = 0
+        merged_scanned = 0
+        merged_total_pcs = 0
+        merged_pct = 0
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 3 — SKID & LOCATION STATS (date+category AWBs only)
+    # ══════════════════════════════════════════════════════════════════════
+ 
+    if awb_ids:
+        mapping_result = await db.execute(
+            select(
+                ExportAwbSkidMapping.id.label("mapping_id"),
+                ExportAwbSkidMapping.skid_id,
+                ExportAwbSkidMapping.is_skid_used_complete,
+            ).where(ExportAwbSkidMapping.awb_master_id.in_(awb_ids))
+        )
+        mapping_rows = mapping_result.mappings().all()
+        mapping_ids = [r.mapping_id for r in mapping_rows]
+        total_skids_used = len({r.skid_id for r in mapping_rows if r.skid_id})
+        total_skids_complete = sum(
+            1 for r in mapping_rows if r.is_skid_used_complete
+        )
+ 
+        if mapping_ids:
+            # Latest location row per skid (subquery)
+            latest_loc_subq = (
+                select(
+                    ExportSkidLocationMapping.skid_id,
+                    func.max(ExportSkidLocationMapping.id).label("latest_id"),
+                )
+                .where(ExportSkidLocationMapping.mapping_id.in_(mapping_ids))
+                .group_by(ExportSkidLocationMapping.skid_id)
+                .subquery()
+            )
+ 
+            loc_result = await db.execute(
+                select(
+                    func.count(
+                        distinct(ExportSkidLocationMapping.skid_id)
+                    ).label("total_ever_located"),
+                    func.count(distinct(ExportSkidLocationMapping.skid_id))
+                    .filter(ExportSkidLocationMapping.is_current == True)
+                    .label("skids_at_location"),
+                    func.count(distinct(ExportSkidLocationMapping.skid_id))
+                    .filter(
+                        ExportSkidLocationMapping.is_current == False,
+                        ExportSkidLocationMapping.picked_at.isnot(None),
+                    )
+                    .label("skids_retrieved"),
+                )
+                .join(
+                    latest_loc_subq,
+                    ExportSkidLocationMapping.id == latest_loc_subq.c.latest_id,
+                )
+                .where(ExportSkidLocationMapping.mapping_id.in_(mapping_ids))
+            )
+            loc_row = loc_result.mappings().one()
+            total_ever_located = loc_row.total_ever_located or 0
+            skids_at_location = loc_row.skids_at_location or 0
+            skids_retrieved = loc_row.skids_retrieved or 0
+        else:
+            total_ever_located = skids_at_location = skids_retrieved = 0
+ 
+        skids_not_located = max(0, total_skids_used - total_ever_located)
+ 
+    else:
+        total_skids_used = total_skids_complete = 0
+        total_ever_located = skids_at_location = skids_retrieved = skids_not_located = 0
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 4 — FLIGHT BOOKING STATS (same across all categories)
+    # ══════════════════════════════════════════════════════════════════════
+ 
+    flight_stats_result = await db.execute(
+        select(
+            func.count(ExportFlightBookingHeader.id).label("total_flights"),
+            func.count(ExportFlightBookingHeader.id)
+            .filter(
+                ExportFlightBookingHeader.flight_dpt_datetime <= day_end_utc,
+                ExportFlightBookingHeader.flight_dpt_datetime >= day_start_utc,
+            )
+            .label("departing_today"),
+        ).where(
+            ExportFlightBookingHeader.flight_date == report_date,
+            ExportFlightBookingHeader.is_active == True,
+        )
+    )
+    flight_row = flight_stats_result.mappings().one()
+ 
+    # ── Build response ─────────────────────────────────────────────────────
+    return {
+        "report_date": str(report_date),
+        "category": category,
+ 
+        # ── Section 1: AWB Master ─────────────────────────────────────────
+        "awb": {
+            "total_awb": awb_row.total_awb or 0,
+            "total_rcs": awb_row.total_rcs or 0,
+            "total_non_rcs": awb_row.total_non_rcs or 0,
+            "total_no_status": awb_row.total_no_status or 0,
+            "total_pcs": total_awb_pcs,
+        },
+ 
+        # ── Section 2: Scanning ───────────────────────────────────────────
+        "scanning": {
+            "total_awb_pcs": total_awb_pcs,
+            "scanned_awbs": scanned_awbs,
+            "scanned_pcs": total_scanned_for_date_awbs,
+            "pending_pcs": total_pending_pcs,
+            "scan_completion_pct": scan_pct,
+            "others": {
+                "others_scanned_pcs": others_row.get("others_scanned_pcs") or 0,
+                "others_awb_count": others_row.get("others_awb_count") or 0,
+                "note": "Scanning done on this date for AWBs from other car message dates",
+                "other_awb_total_pcs": other_awb_total_pcs,
+                "other_awbs_pending": other_awbs_pending,
+                "other_date_pct": other_date_pct,
+            },
+            "merged": {
+                "merged_scanned_pcs": merged_scanned,
+                "merged_total_pcs": merged_total_pcs,
+                "merged_pct": merged_pct,
+            },
+            "total_scanned_pcs_on_this_date": (
+                total_scanned_for_date_awbs
+                + (others_row.get("others_scanned_pcs") or 0)
+            ),
+        },
+ 
+        # ── Section 3: Skid & Location ────────────────────────────────────
+        "skid_and_location": {
+            "total_skids_used": total_skids_used,
+            "total_skids_complete": total_skids_complete,
+            "total_skids_incomplete": max(0, total_skids_used - total_skids_complete),
+            "total_ever_located": total_ever_located,
+            "skids_at_location": skids_at_location,
+            "skids_retrieved": skids_retrieved,
+            "skids_not_located_yet": skids_not_located,
+        },
+ 
+        # ── Section 4: Flight (same across all categories) ────────────────
+        "flight": {
+            "total_flights": flight_row.total_flights or 0,
+            "departing_today": flight_row.departing_today or 0,
+        },
+    }
+
+
+
+
+
+# -------=====  🫥🫥 Drill down car message dashboard V2 ================= -----------------------
+
+def _apply_source_filter_on_stmt(stmt, category: CategoryLiteral):
+    """
+    Apply source filter directly on a stmt that already selects/joins
+    ExportCarMessageAwbMaster (i.e. the table is already in scope).
+    Mirrors the logic in dashboard_v2_service._apply_source_filter.
+    """
+    filter_val = _SOURCE_FILTER_MAP[category]
+ 
+    if filter_val is False:
+        return stmt
+    if filter_val is None:
+        return stmt.where(ExportCarMessageAwbMaster.source.is_(None))
+    if isinstance(filter_val, list):
+        return stmt.where(ExportCarMessageAwbMaster.source.in_(filter_val))
+    return stmt.where(ExportCarMessageAwbMaster.source == filter_val)
+ 
+_IST = ZoneInfo("Asia/Kolkata")
+ 
+ 
+def _to_ist_str(dt) -> str | None:
+    if dt is None:
+        return None
+    return dt.astimezone(_IST).strftime("%d-%m-%Y %H:%M")
+ 
+ 
+
+async def get_dashboard_drilldown_detail_v2(
+    db: AsyncSession,
+    report_date: date,
+    detail_type: str,   # "all_awbs" | "scanned_awbs" | "used_skids" | "flight_bookings"
+    category: CategoryLiteral,
+) -> dict:
+ 
+    day_start_utc, day_end_utc = ist_date_to_utc_range(report_date)
+ 
+    # ── Base AWB ids for this date+category ───────────────────────────────
+    awb_ids_stmt = _apply_source_filter_on_stmt(
+        select(ExportCarMessageAwbMaster.id).where(
+            ExportCarMessageAwbMaster.car_message_datetime_combo >= day_start_utc,
+            ExportCarMessageAwbMaster.car_message_datetime_combo <= day_end_utc,
+        ),
+        category,
+    )
+    awb_ids_result = await db.execute(awb_ids_stmt)
+    awb_ids = [r.id for r in awb_ids_result.all()]
+ 
+    # ═════════════════════════════════════════════════════════════════════
+    # ALL AWBs
+    # ═════════════════════════════════════════════════════════════════════
+    if detail_type == "all_awbs":
+ 
+        stmt = _apply_source_filter_on_stmt(
+            select(
+                ExportCarMessageAwbMaster.awb_no,
+                ExportCarMessageAwbMaster.origin,
+                ExportCarMessageAwbMaster.destination,
+                ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+                ExportCarMessageAwbMaster.status,
+                ExportCarMessageAwbMaster.agent,
+                ExportCarMessageAwbMaster.source,
+                ExportCarMessageAwbMaster.rcs_datetime,
+                ExportCarMessageAwbMaster.car_message_datetime_combo,
+
+                 ExportCarMessageAwbMaster.is_ultra_fast,
+                ExportCarMessageAwbMaster.is_manually_created,
+            ).where(
+                ExportCarMessageAwbMaster.car_message_datetime_combo >= day_start_utc,
+                ExportCarMessageAwbMaster.car_message_datetime_combo <= day_end_utc,
+            ).order_by(ExportCarMessageAwbMaster.awb_no),
+            category,
+        )
+ 
+        result = await db.execute(stmt)
+        rows = result.mappings().all()
+ 
+        return {
+            "detail_type": detail_type,
+            "category": category,
+            "report_date": str(report_date),
+            "total": len(rows),
+            "items": [
+                {
+                    "awb_no": r.awb_no,
+                    "origin": r.origin,
+                    "destination": r.destination,
+                    "total_pcs": r.total_pcs,
+                    "status": r.status or "—",
+                    "agent": r.agent or "—",
+                    "source": r.source or "CAR_MESSAGE",
+
+                      "is_ultra_fast": bool(r.is_ultra_fast),
+                        "is_manually_created": bool(r.is_manually_created),
+
+                    "rcs_datetime": _to_ist_str(r.rcs_datetime),
+                    "car_message_datetime": _to_ist_str(r.car_message_datetime_combo),
+                }
+                for r in rows
+            ],
+        }
+ 
+    # ═════════════════════════════════════════════════════════════════════
+    # SCANNED AWBs
+    # ═════════════════════════════════════════════════════════════════════
+    elif detail_type == "scanned_awbs":
+ 
+        if not awb_ids:
+            return {
+                "detail_type": detail_type,
+                "category": category,
+                "report_date": str(report_date),
+                "total": 0,
+                "items": [],
+            }
+ 
+        # ── AWB level scanned pcs ─────────────────────────────────────────
+        result = await db.execute(
+            select(
+                ExportCarMessageAwbMaster.id.label("awb_master_id"),
+                ExportCarMessageAwbMaster.awb_no,
+                ExportCarMessageAwbMaster.origin,
+                ExportCarMessageAwbMaster.destination,
+                ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+                ExportCarMessageAwbMaster.status,
+                ExportCarMessageAwbMaster.agent,
+                ExportCarMessageAwbMaster.source,
+
+                ExportCarMessageAwbMaster.is_ultra_fast,
+    ExportCarMessageAwbMaster.is_manually_created,
+
+                func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+            )
+            .join(
+                ExportAwbSkidItemSequence,
+                ExportAwbSkidItemSequence.awb_master_id == ExportCarMessageAwbMaster.id,
+            )
+            .where(ExportCarMessageAwbMaster.id.in_(awb_ids))
+            .group_by(
+                ExportCarMessageAwbMaster.id,
+                ExportCarMessageAwbMaster.awb_no,
+                ExportCarMessageAwbMaster.origin,
+                ExportCarMessageAwbMaster.destination,
+                ExportCarMessageAwbMaster.pcs,
+                ExportCarMessageAwbMaster.status,
+                ExportCarMessageAwbMaster.agent,
+                ExportCarMessageAwbMaster.source,
+
+                  ExportCarMessageAwbMaster.is_ultra_fast,
+    ExportCarMessageAwbMaster.is_manually_created,
+            )
+            .order_by(ExportCarMessageAwbMaster.awb_no)
+        )
+        rows = result.mappings().all()
+ 
+        # ── Scanner details per AWB ───────────────────────────────────────
+        scanner_result = await db.execute(
+            select(
+                ExportAwbSkidItemSequence.awb_master_id,
+                ExportAwbSkidItemSequence.mapping_id,
+                ExportAwbSkidItemSequence.scanned_by,
+                User.name.label("scanned_by_name"),
+                ExportAwbSkidItemSequence.scan_by_device,
+                ExportSkidMaster.skid_no,
+                func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+                func.max(ExportAwbSkidItemSequence.sequence_date_time).label("last_scanned_at"),
+            )
+            .join(
+                ExportAwbSkidMapping,
+                ExportAwbSkidItemSequence.mapping_id == ExportAwbSkidMapping.id,
+            )
+            .join(
+                ExportSkidMaster,
+                ExportAwbSkidMapping.skid_id == ExportSkidMaster.id,
+            )
+            .join(
+                User,
+                User.emp_id == ExportAwbSkidItemSequence.scanned_by,
+                isouter=True,
+            )
+            .where(ExportAwbSkidItemSequence.awb_master_id.in_(awb_ids))
+            .group_by(
+                ExportAwbSkidItemSequence.awb_master_id,
+                ExportAwbSkidItemSequence.mapping_id,
+                ExportAwbSkidItemSequence.scanned_by,
+                User.name,
+                ExportAwbSkidItemSequence.scan_by_device,
+                ExportSkidMaster.skid_no,
+            )
+            .order_by(ExportAwbSkidItemSequence.awb_master_id)
+        )
+        scanner_rows = scanner_result.mappings().all()
+ 
+        scanners_by_awb: dict[int, list] = defaultdict(list)
+        for r in scanner_rows:
+            scanners_by_awb[r.awb_master_id].append({
+                "emp_id": r.scanned_by,
+                "name": r.scanned_by_name or "",
+                "scan_by_device": r.scan_by_device,
+                "skid_no": r.skid_no,
+                "scanned_pcs": r.scanned_pcs,
+                "last_scanned_at": _to_ist_str(r.last_scanned_at),
+            })
+ 
+        return {
+            "detail_type": detail_type,
+            "category": category,
+            "report_date": str(report_date),
+            "total": len(rows),
+            "items": [
+                {
+                    "awb_no": r.awb_no,
+                    "origin": r.origin,
+                    "destination": r.destination,
+                    "total_pcs": r.total_pcs or 0,
+                    "scanned_pcs": r.scanned_pcs,
+                    "pending_pcs": max(0, (r.total_pcs or 0) - r.scanned_pcs),
+
+                     "is_ultra_fast": bool(r.is_ultra_fast),
+                    "is_manually_created": bool(r.is_manually_created),
+
+                    "status": r.status or "—",
+                    "agent": r.agent or "—",
+                    "source": r.source or "CAR_MESSAGE",
+                    "scan_pct": round(
+                        r.scanned_pcs / r.total_pcs * 100, 1
+                    ) if r.total_pcs else 0,
+                    "scanners": scanners_by_awb.get(r.awb_master_id, []),
+                }
+                for r in rows
+            ],
+        }
+ 
+    # ═════════════════════════════════════════════════════════════════════
+    # USED SKIDS
+    # ═════════════════════════════════════════════════════════════════════
+    elif detail_type == "used_skids":
+ 
+        if not awb_ids:
+            return {
+                "detail_type": detail_type,
+                "category": category,
+                "report_date": str(report_date),
+                "total": 0,
+                "items": [],
+            }
+ 
+        # ── Mappings for date+category AWBs ──────────────────────────────
+        mapping_result = await db.execute(
+            select(
+                ExportAwbSkidMapping.id.label("mapping_id"),
+                ExportAwbSkidMapping.skid_id,
+                ExportAwbSkidMapping.awb_master_id,
+                ExportAwbSkidMapping.is_skid_used_complete,
+                ExportSkidMaster.skid_no,
+                ExportSkidMaster.skid_type,
+                ExportCarMessageAwbMaster.awb_no,
+                ExportCarMessageAwbMaster.source,
+            )
+            .join(ExportSkidMaster,
+                  ExportAwbSkidMapping.skid_id == ExportSkidMaster.id)
+            .join(ExportCarMessageAwbMaster,
+                  ExportAwbSkidMapping.awb_master_id == ExportCarMessageAwbMaster.id)
+            .where(ExportAwbSkidMapping.awb_master_id.in_(awb_ids))
+            .order_by(ExportSkidMaster.skid_no)
+        )
+        mapping_rows = mapping_result.mappings().all()
+ 
+        if not mapping_rows:
+            return {
+                "detail_type": detail_type,
+                "category": category,
+                "report_date": str(report_date),
+                "total": 0,
+                "items": [],
+            }
+ 
+        mapping_ids = [r.mapping_id for r in mapping_rows]
+ 
+        # ── Scanned pcs per mapping ───────────────────────────────────────
+        seq_count_result = await db.execute(
+            select(
+                ExportAwbSkidItemSequence.mapping_id,
+                func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+            )
+            .where(ExportAwbSkidItemSequence.mapping_id.in_(mapping_ids))
+            .group_by(ExportAwbSkidItemSequence.mapping_id)
+        )
+        seq_count_map = {
+            r.mapping_id: r.scanned_pcs
+            for r in seq_count_result.mappings().all()
+        }
+ 
+        # ── Latest location per mapping ───────────────────────────────────
+        loc_result = await db.execute(
+            select(
+                ExportSkidLocationMapping.mapping_id,
+                ExportLocationsMaster.loc.label("location_name"),
+                ExportLocationsMaster.area_code,
+                ExportSkidLocationMapping.is_current,
+                ExportSkidLocationMapping.picked_at,
+            )
+            .join(ExportLocationsMaster,
+                  ExportSkidLocationMapping.location_id == ExportLocationsMaster.id)
+            .where(ExportSkidLocationMapping.mapping_id.in_(mapping_ids))
+            .order_by(ExportSkidLocationMapping.assigned_at.desc())
+        )
+        loc_rows = loc_result.mappings().all()
+ 
+        loc_map: dict[int, dict] = {}
+        for row in loc_rows:
+            if row.mapping_id not in loc_map:   # first row = latest
+                loc_map[row.mapping_id] = {
+                    "location_name": row.location_name,
+                    "area_code": row.area_code,
+                    "is_current": row.is_current,
+                    "is_retrieved": row.picked_at is not None,
+                    "picked_at": _to_ist_str(row.picked_at),
+                }
+ 
+        # ── Base drop per mapping ─────────────────────────────────────────
+        base_result = await db.execute(
+            select(
+                ExportSkidBaseMapping.mapping_id,
+                ExportBaseMaster.base_name,
+                ExportSkidBaseMapping.dropped_at,
+            )
+            .join(ExportBaseMaster,
+                  ExportSkidBaseMapping.base_id == ExportBaseMaster.id)
+            .where(ExportSkidBaseMapping.mapping_id.in_(mapping_ids))
+        )
+        base_map = {
+            r.mapping_id: {
+                "base_name": r.base_name,
+                "dropped_at": _to_ist_str(r.dropped_at),
+            }
+            for r in base_result.mappings().all()
+        }
+ 
+        # ── Scanners per mapping ──────────────────────────────────────────
+        scanner_result = await db.execute(
+            select(
+                ExportAwbSkidItemSequence.mapping_id,
+                ExportAwbSkidItemSequence.scanned_by,
+                User.name.label("user_name"),
+            )
+            .join(
+                User,
+                ExportAwbSkidItemSequence.scanned_by == User.emp_id,
+                isouter=True,
+            )
+            .where(ExportAwbSkidItemSequence.mapping_id.in_(mapping_ids))
+            .distinct(
+                ExportAwbSkidItemSequence.mapping_id,
+                ExportAwbSkidItemSequence.scanned_by,
+            )
+        )
+        scanner_rows = scanner_result.mappings().all()
+ 
+        scanner_map: dict[int, list] = {}
+        for row in scanner_rows:
+            if row.mapping_id not in scanner_map:
+                scanner_map[row.mapping_id] = []
+            scanner_map[row.mapping_id].append({
+                "emp_id": row.scanned_by,
+                "name": row.user_name,
+            })
+ 
+        # ── Build response ────────────────────────────────────────────────
+        items = []
+        for r in mapping_rows:
+            loc = loc_map.get(r.mapping_id)
+            base = base_map.get(r.mapping_id)
+            scanned_pcs = seq_count_map.get(r.mapping_id, 0)
+ 
+            items.append({
+                "skid_no": r.skid_no,
+                "skid_type": r.skid_type,
+                "awb_no": r.awb_no,
+                "source": r.source or "CAR_MESSAGE",
+                "scan_complete": r.is_skid_used_complete,
+                "scanned_pcs": scanned_pcs,
+                "scanners": scanner_map.get(r.mapping_id, []),
+                # location
+                "location_name": loc["location_name"] if loc else None,
+                "area_code": loc["area_code"] if loc else None,
+                "is_at_location": loc["is_current"] if loc else False,
+                "is_retrieved": loc["is_retrieved"] if loc else False,
+                "retrieved_at": loc["picked_at"] if loc else None,
+                "ever_located": loc is not None,
+                # base drop
+                "base_dropped": base is not None,
+                "base_name": base["base_name"] if base else None,
+                "base_dropped_at": base["dropped_at"] if base else None,
+            })
+ 
+        return {
+            "detail_type": detail_type,
+            "category": category,
+            "report_date": str(report_date),
+            "total": len(items),
+            "items": items,
+        }
+ 
+    # ═════════════════════════════════════════════════════════════════════
+    # FLIGHT BOOKINGS — no source filter (same across all categories)
+    # ═════════════════════════════════════════════════════════════════════
+    elif detail_type == "flight_bookings":
+ 
+        flights_result = await db.execute(
+            select(
+                ExportFlightBookingHeader.id.label("header_id"),
+                ExportFlightBookingHeader.flight_no,
+                ExportFlightBookingHeader.flight_date,
+                ExportFlightBookingHeader.flight_dpt_datetime,
+                ExportFlightBookingHeader.booked_by,
+                ExportFlightBookingHeader.booked_at,
+            )
+            .where(
+                ExportFlightBookingHeader.flight_date == report_date,
+                ExportFlightBookingHeader.is_active == True,
+            )
+            .order_by(ExportFlightBookingHeader.flight_dpt_datetime)
+        )
+        flight_rows = flights_result.mappings().all()
+ 
+        if not flight_rows:
+            return {
+                "detail_type": detail_type,
+                "category": category,
+                "report_date": str(report_date),
+                "total": 0,
+                "items": [],
+            }
+ 
+        flight_header_ids = [r.header_id for r in flight_rows]
+ 
+        # ── AWBs per flight ───────────────────────────────────────────────
+        awb_detail_result = await db.execute(
+            select(
+                ExportFlightBookingDetail.flight_header_id,
+                ExportFlightBookingDetail.booked_pcs,
+                ExportCarMessageAwbMaster.awb_no,
+                ExportCarMessageAwbMaster.origin,
+                ExportCarMessageAwbMaster.destination,
+                ExportCarMessageAwbMaster.id.label("awb_master_id"),
+            )
+            .join(
+                ExportCarMessageAwbMaster,
+                ExportFlightBookingDetail.awb_master_id == ExportCarMessageAwbMaster.id,
+            )
+            .where(
+                ExportFlightBookingDetail.flight_header_id.in_(flight_header_ids)
+            )
+        )
+        awb_detail_rows = awb_detail_result.mappings().all()
+ 
+        awbs_by_flight: dict[int, list] = {}
+        for r in awb_detail_rows:
+            awbs_by_flight.setdefault(r.flight_header_id, []).append({
+                "awb_no": r.awb_no,
+                "origin": r.origin,
+                "destination": r.destination,
+                "booked_pcs": r.booked_pcs,
+                "awb_master_id": r.awb_master_id,
+            })
+ 
+        # ── Skids per flight ──────────────────────────────────────────────
+        skid_result = await db.execute(
+            select(
+                ExportSequenceItemUldLoading.flight_header_id,
+                ExportAwbSkidMapping.skid_id,
+                ExportSkidMaster.skid_no,
+                ExportSkidMaster.skid_type,
+                ExportCarMessageAwbMaster.awb_no,
+                func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+            )
+            .join(
+                ExportAwbSkidItemSequence,
+                ExportSequenceItemUldLoading.sequence_id == ExportAwbSkidItemSequence.id,
+            )
+            .join(
+                ExportAwbSkidMapping,
+                ExportAwbSkidItemSequence.mapping_id == ExportAwbSkidMapping.id,
+            )
+            .join(
+                ExportSkidMaster,
+                ExportAwbSkidMapping.skid_id == ExportSkidMaster.id,
+            )
+            .join(
+                ExportCarMessageAwbMaster,
+                ExportSequenceItemUldLoading.awb_master_id == ExportCarMessageAwbMaster.id,
+            )
+            .where(
+                ExportSequenceItemUldLoading.flight_header_id.in_(flight_header_ids)
+            )
+            .group_by(
+                ExportSequenceItemUldLoading.flight_header_id,
+                ExportAwbSkidMapping.skid_id,
+                ExportSkidMaster.skid_no,
+                ExportSkidMaster.skid_type,
+                ExportCarMessageAwbMaster.awb_no,
+            )
+        )
+        skid_rows = skid_result.mappings().all()
+ 
+        skids_by_flight: dict[int, list] = {}
+        for r in skid_rows:
+            skids_by_flight.setdefault(r.flight_header_id, []).append({
+                "skid_no": r.skid_no,
+                "skid_type": r.skid_type,
+                "awb_no": r.awb_no,
+                "loaded_pcs": r.loaded_pcs,
+            })
+ 
+        # ── ULDs per flight ───────────────────────────────────────────────
+        uld_result = await db.execute(
+            select(
+                ExportUldAssignment.flight_header_id,
+                ExportUldMaster.uld_no,
+                ExportUldMaster.carrier,
+                func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+            )
+            .join(
+                ExportUldAssignmentDetail,
+                ExportUldAssignmentDetail.assignment_id == ExportUldAssignment.id,
+            )
+            .join(
+                ExportUldMaster,
+                ExportUldAssignmentDetail.uld_id == ExportUldMaster.id,
+            )
+            .outerjoin(
+                ExportSequenceItemUldLoading,
+                ExportSequenceItemUldLoading.uld_assignment_detail_id
+                == ExportUldAssignmentDetail.id,
+            )
+            .where(
+                ExportUldAssignment.flight_header_id.in_(flight_header_ids),
+                ExportUldAssignment.is_active == True,
+            )
+            .group_by(
+                ExportUldAssignment.flight_header_id,
+                ExportUldMaster.uld_no,
+                ExportUldMaster.carrier,
+            )
+        )
+        uld_rows = uld_result.mappings().all()
+ 
+        ulds_by_flight: dict[int, list] = {}
+        for r in uld_rows:
+            ulds_by_flight.setdefault(r.flight_header_id, []).append({
+                "uld_no": r.uld_no,
+                "carrier": r.carrier,
+                "loaded_pcs": r.loaded_pcs,
+            })
+ 
+        # ── Loaded pcs per flight ─────────────────────────────────────────
+        loaded_result = await db.execute(
+            select(
+                ExportSequenceItemUldLoading.flight_header_id,
+                func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+            )
+            .where(
+                ExportSequenceItemUldLoading.flight_header_id.in_(flight_header_ids)
+            )
+            .group_by(ExportSequenceItemUldLoading.flight_header_id)
+        )
+        loaded_by_flight = {
+            r.flight_header_id: r.loaded_pcs
+            for r in loaded_result.mappings().all()
+        }
+ 
+        items = []
+        for f in flight_rows:
+            fid = f.header_id
+            total_booked = sum(
+                a["booked_pcs"] for a in awbs_by_flight.get(fid, [])
+            )
+            loaded_pcs = loaded_by_flight.get(fid, 0)
+ 
+            items.append({
+                "flight_no": f.flight_no,
+                "flight_date": str(f.flight_date),
+                "flight_dpt_datetime": _to_ist_str(f.flight_dpt_datetime),
+                "booked_by": f.booked_by,
+                "booked_at": _to_ist_str(f.booked_at),
+                "total_booked_pcs": total_booked,
+                "total_loaded_pcs": loaded_pcs,
+                "pending_pcs": max(0, total_booked - loaded_pcs),
+                "awbs": awbs_by_flight.get(fid, []),
+                "skids": skids_by_flight.get(fid, []),
+                "ulds": ulds_by_flight.get(fid, []),
+            })
+ 
+        return {
+            "detail_type": detail_type,
+            "category": category,
+            "report_date": str(report_date),
+            "total": len(items),
+            "items": items,
+        }
+ 
+    # ── Unknown detail_type ───────────────────────────────────────────────
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Invalid detail_type '{detail_type}'. "
+            "Use: all_awbs | scanned_awbs | used_skids | flight_bookings"
+        ),
+    )
