@@ -1810,14 +1810,16 @@ class WorkerAssignmentFilters:
             return query.where(
                 and_(
                     diff_hours >= 0,
-                    diff_hours < 3.5
+                    diff_hours < 3.0
+                    # diff_hours < 3.5
                 )
             )
 
         if status == "sla_3_5_to_4":
             return query.where(
                 and_(
-                    diff_hours >= 3.5,
+                     # diff_hours >= 3.5,
+                    diff_hours >= 3.0,
                     diff_hours <= 4.0
                 )
             )

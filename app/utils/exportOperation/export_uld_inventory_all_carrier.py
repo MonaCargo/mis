@@ -62,14 +62,37 @@ def _detect_extension(filename: str) -> str:
     )
 
 
-def _read_raw(source: io.BytesIO, ext: str) -> pd.DataFrame:
-    """Read the raw file, skipping the 2 junk header rows."""
-    shared_kwargs = dict(skiprows=2, header=0, dtype=str, keep_default_na=False)
+# def _read_raw(source: io.BytesIO, ext: str) -> pd.DataFrame:
+#     """Read the raw file, skipping the 2 junk header rows."""
+#     shared_kwargs = dict(skiprows=2, header=0, dtype=str, keep_default_na=False)
 
+#     if ext == ".csv":
+#         return pd.read_csv(source, **shared_kwargs)
+#     else:  # .xlsx / .xls
+#         return pd.read_excel(source, **shared_kwargs)
+
+def _find_header_row(raw: pd.DataFrame) -> int:
+    """Scan rows until we find the one containing 'ULD NUMBER'."""
+    for i, row in raw.iterrows():
+        if any("ULD NUMBER" in str(cell).upper() for cell in row.values):
+            return i
+    raise ValueError(
+        "Could not find header row in file. "
+        "Expected a row containing 'ULD NUMBER'."
+    )
+
+def _read_raw(source: io.BytesIO, ext: str) -> pd.DataFrame:
+    """Auto-detect the real header row for both CSV and Excel."""
     if ext == ".csv":
-        return pd.read_csv(source, **shared_kwargs)
-    else:  # .xlsx / .xls
-        return pd.read_excel(source, **shared_kwargs)
+        raw = pd.read_csv(source, header=None, dtype=str, keep_default_na=False)
+        header_row = _find_header_row(raw)
+        source.seek(0)
+        return pd.read_csv(source, skiprows=header_row, header=0, dtype=str, keep_default_na=False)
+    else:
+        raw = pd.read_excel(source, header=None, dtype=str, keep_default_na=False)
+        header_row = _find_header_row(raw)
+        source.seek(0)
+        return pd.read_excel(source, skiprows=header_row, header=0, dtype=str, keep_default_na=False)
 
 
 def _clean(df: pd.DataFrame) -> pd.DataFrame:

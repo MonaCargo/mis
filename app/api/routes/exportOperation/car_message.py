@@ -19,7 +19,7 @@ from app.db.session import get_db
 from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, AwbLookupError, AwbManualCreateRequest, AwbManualCreateResponse, CarMessageExcelExportRequest, CreateFlightBookingFromPdfResponse, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse, UltraFastScanRequest
 from app.schemas.user import UserRead
 from app.services.exportOperation.base_master import ultra_fast_scan_and_load
-from app.services.exportOperation.car_message import build_car_message_excel, close_per_uld__per_flight_service, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_awb_data_for_export, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_flight_awb_breakdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_history, get_flight_particular_flight_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, get_uld_sequences_of_particular_flight, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, upsert_flight_booking_from_pdf, verify_uld_for_loading
+from app.services.exportOperation.car_message import CategoryLiteral, build_car_message_excel, close_per_uld__per_flight_service, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_awb_data_for_export, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_dashboard_drilldown_detail_v2, get_dashboard_stats_v2, get_flight_awb_breakdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_history, get_flight_particular_flight_detail, get_flight_uld_loading_status, get_flights_by_date, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, get_uld_sequences_of_particular_flight, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, unlock_per_uld_service, upsert_flight_booking_from_pdf, verify_uld_for_loading
 from app.services.export_slot_file_upload_service import get_utc_now
 from app.utils.exportOperation.car_message import clean_car_message
 from app.utils.exportOperation.extract_flight_planning_data import extract_flight_planning
@@ -865,7 +865,34 @@ async def get_dashboard_stats_route(
 ):
     return await get_car_message_dashboard_stats(db=db, report_date=report_date)
 
-
+@router.get(
+    "/dashboard/statsv2/v2",
+    summary="Get dashboard stats for a selected IST date, filtered by AWB source category",
+    description=(
+        "Returns AWB, scanning, skid/location, and flight stats for the given IST date.\n\n"
+        "**category** options:\n"
+        "- `all` — no source filter, all AWBs for that date\n"
+        "- `car_message` — only AWBs where source IS NULL (uploaded via CAR message)\n"
+        "- `export_tp` — only AWBs where source = `EXPORT_TP_XRAY`\n"
+        "- `import_tp` — only AWBs where source = `IMPORT_TP_XRAY`\n"
+        "- `tp_combine` — combined Export + Import TP (source IN `EXPORT_TP_XRAY`, `IMPORT_TP_XRAY`)\n\n"
+        "Flight stats are identical across all categories (not source-filtered)."
+    ),
+)
+async def get_dashboard_stats_v2_route(
+    report_date: date = Query(..., description="IST date e.g. 2026-03-20"),
+    category: CategoryLiteral = Query(
+        ...,
+        description="AWB source category: all | car_message | export_tp | import_tp | tp_combine",
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await get_dashboard_stats_v2(
+        db=db,
+        report_date=report_date,
+        category=category,
+    )
 
 @router.get(
     "/dashboard/drilldown/detail",
@@ -887,6 +914,46 @@ async def get_dashboard_detail_route(
     )
 
 
+
+
+@router.get(
+    "/dashboard/drilldown/detailv2/v2",
+    summary="Get drilldown detail for a v2 dashboard stat box",
+    description=(
+        "Returns detailed records for a specific stat box on the v2 dashboard.\n\n"
+        "**detail_type** options:\n"
+        "- `all_awbs` — all AWBs for the date, filtered by category\n"
+        "- `scanned_awbs` — AWBs with at least one scan, with scanner details\n"
+        "- `used_skids` — skids used for the date AWBs, with location and base info\n"
+        "- `flight_bookings` — all flights for the date (not source-filtered)\n\n"
+        "**category** options:\n"
+        "- `all` — no source filter\n"
+        "- `car_message` — source IS NULL\n"
+        "- `export_tp` — source = EXPORT_TP_XRAY\n"
+        "- `import_tp` — source = IMPORT_TP_XRAY\n"
+        "- `tp_combine` — source IN (EXPORT_TP_XRAY, IMPORT_TP_XRAY)\n\n"
+        "Note: `flight_bookings` ignores the category param and always returns all flights."
+    ),
+)
+async def get_dashboard_drilldown_detail_v2_route(
+    report_date: date = Query(..., description="IST date e.g. 2026-03-20"),
+    detail_type: str = Query(
+        ...,
+        description="all_awbs | scanned_awbs | used_skids | flight_bookings",
+    ),
+    category: CategoryLiteral = Query(
+        ...,
+        description="all | car_message | export_tp | import_tp | tp_combine",
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await get_dashboard_drilldown_detail_v2(
+        db=db,
+        report_date=report_date,
+        detail_type=detail_type,
+        category=category,
+    )
 
 
 
@@ -1201,7 +1268,7 @@ async def search_awb_across_all(
 
 
 
-#  =============== 🫥 INDIVIDUAL ULD CLOSING  PER FLIGHTS PER DATE ====================
+#  =============== 🫥 INDIVIDUAL ULD CLOSING or Unclosing  PER FLIGHTS PER DATE ====================
 
 @router.post("/uld/{uld_detail_id}/close")
 async def close_uld(
@@ -1215,7 +1282,17 @@ async def close_uld(
         closed_by=current_user.emp_id,
     )
 
-
+@router.post("/uld/{uld_detail_id}/open")
+async def unlock_uld(
+    uld_detail_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    return await unlock_per_uld_service(
+        db=db,
+        uld_assignment_detail_id=uld_detail_id,
+        unlocked_by=current_user.emp_id,
+    )
 
 # ========================== FIGHT HISTORY RELATED ROUTES =======================================
 

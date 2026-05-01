@@ -6,6 +6,7 @@ class CarMessageFlowModule:
     LOCATION_MAPPING    = "LOCATION_MAPPING"
     FLIGHT_BOOKING      = "FLIGHT_BOOKING"
     ULD_ASSIGNMENT      = "ULD_ASSIGNMENT"
+    ULD_CLOSE_OPEN      = "ULD_CLOSE_OPEN"
     SKID_RETRIEVAL      = "SKID_RETRIEVAL"          # ← separate from location
     BASE_DROP           = "BASE_DROP"  
     # CARGO_MANIFEST    = "CARGO_MANIFEST"
@@ -22,6 +23,7 @@ class CarMessageFlowStep:
     ULD_ASSIGNMENT      = "STEP_ULD_ASSIGNMENT"
     SKID_RETRIEVAL          = "STEP_SKID_RETRIEVAL"     # ← separate from location
     BASE_DROP               = "STEP_BASE_DROP"  
+    ULD_CLOSE_OPEN      = "ULD_CLOSE_OPEN"
     # CARGO_MANIFEST    = "STEP_CARGO_MANIFEST"
     # DEPARTURE_CTRL    = "STEP_DEPARTURE_CTRL"
     # FLIGHT_CLOSE      = "STEP_FLIGHT_CLOSE"
