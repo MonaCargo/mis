@@ -93,6 +93,7 @@ import math
 
 import pandas as pd
 from sqlalchemy import select
+from sqlalchemy.orm import aliased
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
@@ -102,6 +103,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.core.dependency import verify_token_and_get_user
 from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileUploadMetaLog
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
+from app.db.models.user import User
 from app.db.session import get_db
 from app.schemas.domesticOperation.domestic_xray_report import PaginationMetadata
 from app.schemas.exportOperation.car_message import UldInventoryRecord, UldStockRecord, UldStockSyncResponse
@@ -204,6 +206,7 @@ async def create_uld(
     uld = ExportUldMaster(
         uld_no=payload.uld_no.strip().upper(),
         carrier=payload.carrier.strip().upper(),
+        uld_type=payload.uld_type.strip().upper() if payload.uld_type else None,
         is_active=True,
         created_at=now,
         updated_at=now,
@@ -553,7 +556,7 @@ async def get_uld_master_list(
 
     # pagination
     page:      int = Query(1,  ge=1,         description="Page number"),
-    page_size: int = Query(20, ge=1, le=100, description="Records per page"),
+    page_size: int = Query(20, ge=1, le=200, description="Records per page"),
 ):
     # ✅ call via class
     records, total = await UldStockSyncService.get_filtered_uld_master(
@@ -630,29 +633,38 @@ async def search_in_uld_master(
     # ============================
     # cleaned_uld = uld_no.strip().upper().replace(" ", "")
     cleaned_uld = uld_no.strip().upper()
-
+    UserAlias = aliased(User)
     if not cleaned_uld:
         raise HTTPException(status_code=400, detail="ULD number is required")
 
     # ============================
     # Query (Exact Match)
     # ============================
-    stmt = select(ExportUldMaster).where(
+    stmt = select(
+        ExportUldMaster,
+          UserAlias.name.label("created_by_emp_name")
+                  ).outerjoin(
+        UserAlias,
+        UserAlias.emp_id == ExportUldMaster.created_by
+    ).where(
         ExportUldMaster.uld_no == cleaned_uld,
         ExportUldMaster.is_active == True
     )
 
     result = await db.execute(stmt)
-    uld = result.scalars().first()
+    row = result.first()
 
     # ============================
     # Response
     # ============================
-    if not uld:
+    if not row:
         raise HTTPException(
             status_code=404,
             detail=f"ULD {cleaned_uld} not found"
         )
+    
+    uld = row[0]
+    created_by_name = row.created_by_emp_name
 
     return {
         "status": "success",
@@ -664,6 +676,7 @@ async def search_in_uld_master(
             "is_available": uld.is_available,
             "is_active": uld.is_active,
             "created_by": uld.created_by,
+            "created_by_emp_name": created_by_name,
             "updated_by": uld.updated_by,
             "created_at": uld.created_at,
             "updated_at": uld.updated_at,
@@ -812,3 +825,38 @@ async def export_uld_master(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# Toggle Availabilty of container like BT and PD
+
+@router.get(
+    "/toggle-availability/{uld_no}",
+    summary="Toggle ULD availability (available ↔ unavailable)",
+)
+async def toggle_uld_availability(
+    uld_no: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    cleaned = uld_no.strip().upper()
+    result = await db.execute(
+        select(ExportUldMaster).where(ExportUldMaster.uld_no == cleaned)
+    )
+    uld: Optional[ExportUldMaster] = result.scalar_one_or_none()
+
+    if not uld:
+        raise HTTPException(status_code=404, detail=f"ULD '{cleaned}' not found")
+
+    uld.is_available = not uld.is_available
+    uld.updated_at   = get_utc_now()
+    uld.updated_by   = current_user.emp_id
+
+    await db.commit()
+    await db.refresh(uld)
+
+    return {
+        "success":      True,
+        "uld_no":       uld.uld_no,
+        "is_available": uld.is_available,
+        "message":      f"ULD '{uld.uld_no}' marked as {'Available' if uld.is_available else 'Unavailable'}",
+    }

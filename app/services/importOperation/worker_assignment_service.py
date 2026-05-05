@@ -6573,7 +6573,7 @@ async def get_shipments_for_loading_in_lift(
     next_date_str = next_day_ist.strftime("%Y-%m-%d")
      #========================================================================
     # Convert IST → UTC
-    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-02-11")
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-05-02")
     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(next_date_str)
 
     # Base filters (reusable)
@@ -6724,7 +6724,8 @@ async def get_shipments_for_unloading_from_lift(
     """
 
     # Convert IST → UTC
-    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-02-11")
+    # start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-02-11")
+    start_utc, _ = WorkerAssignmentFilters.convert_ist_day_to_utc_range("2026-05-02")
     _, end_utc = WorkerAssignmentFilters.convert_ist_day_to_utc_range(end_date)
 
     # Common filters
@@ -10255,3 +10256,437 @@ async def generate_excel_stream_export_gp_received(
     workbook.close()
     output.seek(0)
     yield output.read()
+
+
+# ============================== ----🫥 Generate Operator / Employee productivity Report -------------===================
+
+def _parse_display_date(date_str: str) -> str:
+    """
+    Convert 'YYYY-MM-DD' → 'DD/MM/YYYY' for header display.
+    Falls back to the original string on parse error.
+    """
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return date_str
+ 
+
+async def get_operator_productivity_preview(
+    db: AsyncSession,
+    start_date: str,
+    end_date: str,
+    extra_filters: Optional[List] = None,
+) -> dict:
+    """
+    Returns:
+    {
+        "start_date": "2026-01-01",
+        "end_date":   "2026-01-31",
+        "rows": [
+            {
+                "emp_code":     "EMP001",
+                "emp_name":     "John Doe",
+                "shipment_count":    12,
+                "piece_count":  85,
+                "total_weight": 320.5
+            },
+            ...
+        ]
+    }
+    """
+ 
+    # ── Same CTE as the XLSX service ─────────────────────────────
+    filters = WorkerAssignmentFilters(
+        shipment_model=WorkerAssignmentShipment,
+        status=None,
+        startDate=start_date,
+        endDate=end_date,
+    )
+ 
+    # Step 1 — deduplicate: one row per (assigned_person, header_id)
+    dedup_inner = (
+        filters.apply_date_filter(
+            select(
+                WorkerAssignmentShipment.assigned_person,
+                WorkerAssignmentShipment.assignment_header_id,
+                func.max(WorkerAssignmentShipment.no_of_pc)
+                    .label("no_of_pc"),
+                func.max(WorkerAssignmentShipment.weight_in_kgs)
+                    .label("weight_in_kgs"),
+            )
+            .where(
+                WorkerAssignmentShipment.assigned_person.isnot(None)
+            )
+        )
+        .group_by(
+            WorkerAssignmentShipment.assigned_person,
+            WorkerAssignmentShipment.assignment_header_id,
+        )
+    )
+ 
+    if extra_filters:
+        for f in extra_filters:
+            dedup_inner = dedup_inner.where(f)
+ 
+    dedup_cte = dedup_inner.cte("deduplicated_shipments")
+ 
+    # Step 2 — aggregate per employee
+    UserAlias = aliased(User)
+ 
+    agg_query = (
+        select(
+            dedup_cte.c.assigned_person.label("emp_code"),
+            UserAlias.name.label("emp_name"),
+            func.count(dedup_cte.c.assignment_header_id)
+                .label("shipment_count"),
+            func.coalesce(func.sum(dedup_cte.c.no_of_pc), 0)
+                .label("piece_count"),
+            func.coalesce(func.sum(dedup_cte.c.weight_in_kgs), 0.0)
+                .label("total_weight"),
+        )
+        .outerjoin(
+            UserAlias,
+            UserAlias.emp_id == dedup_cte.c.assigned_person,
+        )
+        .group_by(
+            dedup_cte.c.assigned_person,
+            UserAlias.name,
+        )
+        .order_by(UserAlias.name.asc())
+    )
+ 
+    result = await db.execute(agg_query)
+    rows = result.all()
+ 
+    return {
+        "start_date": start_date,
+        "end_date":   end_date,
+        "rows": [
+            {
+                "emp_code":     row.emp_code or "",
+                "emp_name":     row.emp_name or "",
+                "shipment_count":    int(row.shipment_count),
+                "piece_count":  int(row.piece_count),
+                "total_weight": round(float(row.total_weight), 2),
+            }
+            for row in rows
+        ],
+    }
+
+
+async def generate_operator_productivity_report(
+    db: AsyncSession,
+    start_date: str,           # 'YYYY-MM-DD' IST
+    end_date: str,             # 'YYYY-MM-DD' IST
+    extra_filters: Optional[List] = None,   # 🔌 extension point for future filters
+    chunk_size: int = 500,
+) -> AsyncGenerator[bytes, None]:
+    """
+    Streams a single XLSX file (as bytes) containing the Operator
+    Productivity Report.
+ 
+    Columns
+    -------
+    SN | Emp Code | Assigned Person Name | AWB Count | Piece Count | Weight (Kgs)
+ 
+    Footer row shows column totals.
+    """
+
+     # ── Helpers ────────────────────────────────────────────────────────
+    def _to_ist_naive(dt):
+        IST = pytz.timezone("Asia/Kolkata")
+        if not dt:
+            return None
+        if dt.tzinfo:
+            dt = dt.astimezone(IST)
+        return dt.replace(tzinfo=None)
+    
+    def _parse_display_date_in_excel(date_str: str) -> str:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%d %b %Y")
+ 
+    # ═══════════════════════════════════════════════════════════════
+    # 1. WORKBOOK SETUP
+    # ═══════════════════════════════════════════════════════════════
+ 
+    output = io.BytesIO()
+    wb = xlsxwriter.Workbook(output, {"in_memory": True})
+    ws = wb.add_worksheet("Operator Productivity")
+ 
+    # ── Formats ──────────────────────────────────────────────────
+ 
+    title_fmt = wb.add_format({
+        "bold": True,
+        "font_name": "Arial",
+        "font_size": 12,
+        "align": "center",
+        "valign": "vcenter",
+        "bg_color": "#FFFF00",
+        "border": 1,
+    })
+ 
+    sub_title_fmt = wb.add_format({
+        "bold": True,
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+    })
+ 
+    date_label_fmt = wb.add_format({
+        "bold": True,
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+    })
+ 
+    header_fmt = wb.add_format({
+        "bold": True,
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+        "text_wrap": True,
+    })
+ 
+    text_fmt = wb.add_format({
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+    })
+ 
+    center_fmt = wb.add_format({
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+    })
+ 
+    int_fmt = wb.add_format({
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+        "num_format": "0",
+    })
+ 
+    number_fmt = wb.add_format({
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+        "num_format": "0.00",
+    })
+ 
+    total_label_fmt = wb.add_format({
+        "bold": True,
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+    })
+ 
+    total_int_fmt = wb.add_format({
+        "bold": True,
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+        "num_format": "0",
+    })
+ 
+    total_number_fmt = wb.add_format({
+        "bold": True,
+        "font_name": "Arial",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+        "num_format": "0.00",
+    })
+ 
+    # ── Column widths (A-F → 0-5) ──────────────────────────────
+    col_widths = [6, 30, 28, 24, 14, 28]
+    for col, w in enumerate(col_widths):
+        ws.set_column(col, col, w)
+ 
+    # ═══════════════════════════════════════════════════════════════
+    # 2. HEADER ROWS  (rows 0-2, data starts at row 3)
+    # ═══════════════════════════════════════════════════════════════
+ 
+    # Row 0 — Report title (merged A1:F1)
+    ws.merge_range(0, 0, 0, 5,
+                   "Import Release Operator Productivity Report",
+                   title_fmt)
+ 
+
+ 
+    # Row 2 — From Date … To Date
+    from_display = _parse_display_date_in_excel(start_date)
+    to_display   = _parse_display_date_in_excel(end_date)
+ 
+    ws.merge_range(
+        1, 0, 1, 5,
+        f"From: {from_display} to {to_display}",
+        sub_title_fmt
+    )
+ 
+    # Row 3 — Column headers
+    headers = [
+        "SN",
+        "Assigned Person (Emp. Code)",
+        "Assigned Person Name",
+        "(Awb + Hwb) Combination",
+        "Pieces Sum",
+        "Grs. Weight Sum ( Kgs. )",
+    ]
+    for col, h in enumerate(headers):
+        ws.write(3, col, h, header_fmt)
+    ws.set_row(3, 30)      # taller header row for wrapped text
+ 
+    ws.freeze_panes(4, 0)  # freeze title + header rows
+ 
+    # ═══════════════════════════════════════════════════════════════
+    # 3. BUILD THE CTE QUERY
+    # ═══════════════════════════════════════════════════════════════
+    #
+    # CTE: deduplicated_shipments
+    # ────────────────────────────
+    # For each (assigned_person, assignment_header_id) pair that
+    # passes the date filter, we keep ONE representative row.
+    # We pick MAX(no_of_pc) and MAX(weight_in_kgs) to avoid zeros
+    # when one event row has NULLs/zeros and another has real values.
+    #
+    # This CTE is a subquery alias in SQLAlchemy core, then we
+    # aggregate on top of it.
+    # ─────────────────────────────────────────────────────────────
+ 
+    # Step 1 — build the date-filtered, deduplicated subquery
+    filters = WorkerAssignmentFilters(
+        shipment_model=WorkerAssignmentShipment,
+        status=None,           # no status filter for this report
+        startDate=start_date,
+        endDate=end_date,
+    )
+ 
+    # Inner query: one row per (assigned_person, header_id)
+    dedup_inner = (
+        filters.apply_date_filter(
+            select(
+                WorkerAssignmentShipment.assigned_person,
+                WorkerAssignmentShipment.assignment_header_id,
+                func.max(WorkerAssignmentShipment.no_of_pc)
+                    .label("no_of_pc"),
+                func.max(WorkerAssignmentShipment.weight_in_kgs)
+                    .label("weight_in_kgs"),
+            )
+            .where(
+                WorkerAssignmentShipment.assigned_person.isnot(None)
+            )
+        )
+        .group_by(
+            WorkerAssignmentShipment.assigned_person,
+            WorkerAssignmentShipment.assignment_header_id,
+        )
+    )
+ 
+    # 🔌 Extension point — attach any future extra filters to inner query
+    if extra_filters:
+        for f in extra_filters:
+            dedup_inner = dedup_inner.where(f)
+ 
+    dedup_cte = dedup_inner.cte("deduplicated_shipments")
+ 
+    # Step 2 — aggregate over the CTE + join User for name
+    UserAlias = aliased(User)
+ 
+    agg_query = (
+        select(
+            dedup_cte.c.assigned_person.label("emp_code"),
+            UserAlias.name.label("emp_name"),
+            func.count(dedup_cte.c.assignment_header_id)
+             .label("shipment_count"),
+            func.coalesce(func.sum(dedup_cte.c.no_of_pc), 0)
+                .label("piece_count"),
+            func.coalesce(func.sum(dedup_cte.c.weight_in_kgs), 0.0)
+                .label("total_weight"),
+        )
+        .outerjoin(
+            UserAlias,
+            UserAlias.emp_id == dedup_cte.c.assigned_person,
+        )
+        .group_by(
+            dedup_cte.c.assigned_person,
+            UserAlias.name,
+        )
+        .order_by(
+            UserAlias.name.asc(),
+        )
+    )
+ 
+    # ═══════════════════════════════════════════════════════════════
+    # 4. STREAM DATA IN CHUNKS
+    # ═══════════════════════════════════════════════════════════════
+ 
+    row_num   = 4      # data starts at Excel row index 4 (5th row)
+    sn        = 1
+    total_awb = 0
+    total_pcs = 0
+    total_wgt = 0.0
+    offset    = 0
+ 
+    while True:
+        result = await db.execute(
+            agg_query.offset(offset).limit(chunk_size)
+        )
+        rows = result.all()
+ 
+        if not rows:
+            break
+ 
+        for row in rows:
+            ws.write(row_num, 0, sn,                         center_fmt)
+            # ws.write(row_num, 1, row.emp_code or "",          text_fmt)
+            ws.write_number(row_num,1,int(row.emp_code) if row.emp_code else 0,int_fmt)
+            ws.write(row_num, 2, row.emp_name or "",          text_fmt)
+            ws.write_number(row_num, 3, row.shipment_count,        int_fmt)
+            ws.write_number(row_num, 4, row.piece_count,      int_fmt)
+            ws.write_number(row_num, 5, float(row.total_weight), number_fmt)
+ 
+            total_awb += row.shipment_count
+            total_pcs += row.piece_count
+            total_wgt += float(row.total_weight)
+ 
+            row_num += 1
+            sn      += 1
+ 
+        offset += chunk_size
+ 
+    # ═══════════════════════════════════════════════════════════════
+    # 5. TOTALS ROW
+    # ═══════════════════════════════════════════════════════════════
+ 
+    ws.merge_range(row_num, 0, row_num, 2, "Total", total_label_fmt)
+    ws.write_number(row_num, 3, total_awb,        total_int_fmt)
+    ws.write_number(row_num, 4, total_pcs,        total_int_fmt)
+    ws.write_number(row_num, 5, total_wgt,        total_number_fmt)
+ 
+    # ═══════════════════════════════════════════════════════════════
+    # 6. CLOSE & YIELD
+    # ═══════════════════════════════════════════════════════════════
+ 
+    wb.close()
+    output.seek(0)
+    yield output.read()
+ 
