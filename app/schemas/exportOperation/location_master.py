@@ -60,6 +60,7 @@ class CreateLocationResponse(BaseModel):
 class CreateUldRequest(BaseModel):
     uld_no: str
     carrier: str
+    uld_type: Optional[str] = None
 
     @field_validator("uld_no")
     @classmethod

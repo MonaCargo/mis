@@ -624,6 +624,7 @@ def _find_header_row(df_raw: pd.DataFrame) -> int:
     for i, row in df_raw.iterrows():
         vals = row.dropna().astype(str).str.upper().str.strip().tolist()
         if "AWB NO." in vals or "AWB NO" in vals:
+            # print(i)
             return i
     raise ValueError("Could not find header row with 'AWB NO.' column.")
 
@@ -737,6 +738,7 @@ def clean_export_tp_xray(
 
     # \u2500\u2500 3. Locate header row \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    
     header_row_idx = _find_header_row(df_raw)
+    print(header_row_idx,"header_row_idx")
 
     # \u2500\u2500 4. Re-read with correct header \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    
     file_bytes.seek(0)

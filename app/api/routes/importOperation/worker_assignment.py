@@ -561,7 +561,7 @@ import math
 import traceback
 from typing import List, Optional
 from zoneinfo import ZoneInfo
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 import pytz
 from fastapi import Request
@@ -600,6 +600,7 @@ from app.services.importOperation.worker_assignment_service import (
     generate_ageing_report_for_worker_assignment,
     generate_excel_stream_export_gp_received,
     generate_excel_stream_export_worker_assignment,
+    generate_operator_productivity_report,
     get_all_allowed_users_as_worker,
     get_all_open_damage_shipments,
     get_all_shipments_by_ton_category_value_particular_date_range,
@@ -611,6 +612,7 @@ from app.services.importOperation.worker_assignment_service import (
     get_full_damage_report_by_id_for_tracer,
     get_full__all_damage_grouped_by_shipment_for_tracer,
     get_gp_received_sla_summary,
+    get_operator_productivity_preview,
     get_paginated_gp_received_list,
     get_paginated_worker_assignments_data_list,
     get_paginated_worker_assignments_with_damage_filter,
@@ -2354,4 +2356,84 @@ async def export_gp_received(
         ),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+
+# ============================== ----🫥 Generate Operator / Employee productivity Report -------------===================
+ 
+@router.get(
+    "/operator-productivity/preview",
+    summary="Operator Productivity — JSON preview for web table",
+)
+async def operator_productivity_preview(
+    start_date: str = Query(..., description="Start date IST (YYYY-MM-DD)", example="2026-01-01"),
+    end_date:   str = Query(..., description="End date IST (YYYY-MM-DD)",   example="2026-01-31"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns aggregated operator stats as JSON.
+ 
+    Response shape:
+    {
+        "start_date": "2026-01-01",
+        "end_date":   "2026-01-31",
+        "rows": [
+            {
+                "emp_code":     "EMP001",
+                "emp_name":     "John Doe",
+                "shipment_count":    12,
+                "piece_count":  85,
+                "total_weight": 320.5
+            }
+        ]
+    }
+    """
+    try:
+        data = await get_operator_productivity_preview(
+            db=db,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        return {
+             "success": True,
+            "data": data 
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e)
+        }
+ 
+@router.get(
+    "/operator-productivity/download",
+    summary="Download Operator Productivity Report (XLSX)",
+    response_description="Streamed XLSX file",
+)
+async def download_operator_productivity_report(
+    start_date: str = Query(..., description="Start date IST (YYYY-MM-DD)", example="2026-01-01"),
+    end_date:   str = Query(..., description="End date IST (YYYY-MM-DD)",   example="2026-01-31"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Streams a formatted XLSX file with one row per operator.
+    Triggered by the "Download XLSX" button in the React UI.
+    """
+    filename = f"operator_productivity_{start_date}_to_{end_date}.xlsx"
+ 
+    generator =  generate_operator_productivity_report(
+        db=db,
+        start_date=start_date,
+        end_date=end_date,
+    )
+ 
+    return StreamingResponse(
+        generator,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache",
+        },
     )
