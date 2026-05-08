@@ -22,7 +22,7 @@ async def bulk_create_bases(
     db: AsyncSession = Depends(get_db),
     current_user: UserRead = Depends(verify_token_and_get_user),
 ):
-    return await bulk_create_uld_bases(db=db, payload=payload)
+    return await bulk_create_uld_bases(db=db, payload=payload,current_user=current_user)
 
 
 

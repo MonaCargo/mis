@@ -29,9 +29,15 @@ from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileU
 
 from app.db.models.domesticOperation.domestic_xray_report import DomesticXray
 from app.db.models.exportOperation.export_and_import_tp_xray import ExportTpXray
+from app.db.models.exportOperation.import_segrigation_report import ImportSegregationReport
+from app.db.models.exportOperation.export_transipment_report import ExportTranshipmentReport
 
 __all__ = [
     # 'WorkerAssignment',
+
+      'ExportTranshipmentReport',  
+       'ImportSegregationReport',
+
     "ExportTpXray",
 
     'ExportFileUploadMetaLog',

@@ -28,6 +28,7 @@ from .exportOperation.export_base_master import router as export_base_master_rou
 from .exportOperation.export_fileupload_meta_log import router as export_fileupload_meta_log_router
 from .exportOperation.export_import_tp_report_for_car import router as export_impotrt_xray_tp_report_router
 from .exportOperation.car_message_awb_history import router as export_car_message_awb_history_router
+from .exportOperation.export_transipment_import_segrigation import router as export_transipment_import_segrigation_router
 
 
 # You can add more routes here as your app grows
@@ -53,6 +54,7 @@ api_v1_router.include_router(export_carrier_master_router, prefix="/export/carri
 api_v1_router.include_router(export_fileupload_meta_log_router, prefix="/export/file-upload-meta/logs", tags=["Export File Upload Meta Logs"])
 api_v1_router.include_router(export_impotrt_xray_tp_report_router, prefix="/export/import/tp-report", tags=["Export Or ImportFile Upload TP Report"])
 api_v1_router.include_router(export_car_message_awb_history_router, prefix="/export/car-awb-history", tags=["Export Car Message Awb History"])
+api_v1_router.include_router(export_transipment_import_segrigation_router, prefix="/export/car/import-segrigation-export-transipment", tags=["Export Transipment and Import segrigation report"])
 
  
 
