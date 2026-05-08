@@ -902,7 +902,7 @@ async def get_dashboard_detail_route(
     report_date: date = Query(..., description="IST date e.g. 2026-03-20"),
     detail_type: str = Query(
         ...,
-        description="all_awbs | rcs_awbs | non_rcs_awbs | scanned_awbs | used_skids"
+        description="all_awbs | rcs_awbs | non_rcs_awbs | scanned_awbs | used_skids | others_awbs"
     ),
     db: AsyncSession = Depends(get_db),
     current_user: UserRead = Depends(verify_token_and_get_user),
@@ -926,6 +926,7 @@ async def get_dashboard_detail_route(
         "- `scanned_awbs` — AWBs with at least one scan, with scanner details\n"
         "- `used_skids` — skids used for the date AWBs, with location and base info\n"
         "- `flight_bookings` — all flights for the date (not source-filtered)\n\n"
+        "- `others_awbs` — all those awb scanned today but have carmessage date different \n\n"
         "**category** options:\n"
         "- `all` — no source filter\n"
         "- `car_message` — source IS NULL\n"
@@ -939,7 +940,7 @@ async def get_dashboard_drilldown_detail_v2_route(
     report_date: date = Query(..., description="IST date e.g. 2026-03-20"),
     detail_type: str = Query(
         ...,
-        description="all_awbs | scanned_awbs | used_skids | flight_bookings",
+        description="all_awbs | scanned_awbs | used_skids | flight_bookings | others_awbs",
     ),
     category: CategoryLiteral = Query(
         ...,

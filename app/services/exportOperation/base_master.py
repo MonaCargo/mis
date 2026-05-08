@@ -16,6 +16,7 @@ from app.utils.common.helperFunction import get_utc_now
 async def bulk_create_uld_bases(
     db: AsyncSession,
     payload: UldBaseBulkCreateRequest,
+    current_user,
 ) -> UldBaseBulkCreateResponse:
 
     now = get_utc_now()
@@ -42,6 +43,7 @@ async def bulk_create_uld_bases(
                     base_name=item.base_name,
                     created_at=now,
                     updated_at=now,
+                    created_by =current_user.emp_id
                 )
             )
 
@@ -50,10 +52,23 @@ async def bulk_create_uld_bases(
         await db.commit()
         for obj in to_insert:
             await db.refresh(obj)
+    
+
+    created_count = len(to_insert)
+    skipped_count = len(skipped_names)
+
+    if created_count and skipped_count:
+        message = f"{created_count} base(s) created, {skipped_count} skipped (already exist)"
+    elif created_count:
+        message = f"{created_count} base(s) created successfully"
+    elif skipped_count:
+        message = f"{skipped_count} base(s) skipped (already exist)"
+    else:
+        message = "No data processed"
 
     return UldBaseBulkCreateResponse(
         success=True,
-        message=f"{len(to_insert)} base(s) inserted, {len(skipped_names)} skipped (already exist)",
+         message=message,
         inserted=len(to_insert),
         skipped=len(skipped_names),
         skipped_names=skipped_names,
