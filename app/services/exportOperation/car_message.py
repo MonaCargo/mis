@@ -1583,7 +1583,13 @@ async def get_uld_master_list_eligeble_for_assignment(
     )
         # ✅ ADD
     if carriers:
-        stmt = stmt.where(ExportUldMaster.carrier.in_(carriers))
+        stmt = stmt.where(
+            # ExportUldMaster.carrier.in_(carriers)
+            or_(
+                ExportUldMaster.carrier.in_(carriers),
+                ExportUldMaster.carrier == "NO_CARRIER",   # ← always included
+            )
+            )
 
     result = await db.execute(stmt)
 
@@ -4966,7 +4972,7 @@ async def get_car_message_dashboard_stats(
 async def get_dashboard_drilldown_detail(
     db: AsyncSession,
     report_date: date,
-    detail_type: str,  # "all_awbs" | "rcs_awbs" | "non_rcs_awbs" | "scanned_awbs" | "used_skids"
+    detail_type: str,  # "all_awbs" | "rcs_awbs" | "non_rcs_awbs" | "scanned_awbs" | "used_skids" | "others_awbs"
 ) -> dict:
 
     day_start_utc, day_end_utc = ist_date_to_utc_range(report_date)
@@ -5520,7 +5526,7 @@ async def get_dashboard_drilldown_detail(
     raise HTTPException(
         status_code=400,
         detail=f"Invalid detail_type '{detail_type}'. "
-               "Use: all_awbs | rcs_awbs | non_rcs_awbs | scanned_awbs | used_skids" | "flight_bookings",
+               "Use: all_awbs | rcs_awbs | non_rcs_awbs | scanned_awbs | used_skids | flight_bookings | others_awb",
     )
 
 # =================================== ✌️flight create by pdf service ======================
@@ -6545,6 +6551,7 @@ async def get_awb_data_filtered(
                 ExportCarMessageAwbMaster.manual_created_by,
                 ExportCarMessageAwbMaster.manual_creation_remarks,
                 ExportCarMessageAwbMaster.manual_pcs,
+                ExportCarMessageAwbMaster.source,
 
         )
         .where(and_(*conditions))
@@ -6649,6 +6656,7 @@ async def get_awb_data_for_export(
             ExportCarMessageAwbMaster.is_manually_created,
             ExportCarMessageAwbMaster.manual_pcs,
             ExportCarMessageAwbMaster.created_at,
+             ExportCarMessageAwbMaster.source,
         )
         .where(and_(*conditions))
         .order_by(ExportCarMessageAwbMaster.created_at.desc())
@@ -6684,6 +6692,11 @@ def build_car_message_excel(records: list[dict]) -> BytesIO:
             return ""
         return val.strftime("%d-%b-%Y") if hasattr(val, "strftime") else str(val)
 
+    def format_source(val) -> str:
+        if not val:          # None, "", False all hit here
+            return "CAR_MESSAGE"
+        return str(val)
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Car Message AWB"
@@ -6694,6 +6707,7 @@ def build_car_message_excel(records: list[dict]) -> BytesIO:
          "Car Msg Datetime (IST)",
         "RCS Datetime (IST)", "Ultra Fast", "Manually Created",
         "Manual Pcs", "Created At (IST)",
+         "Source File",  
     ]
 
     # Header row style
@@ -6726,6 +6740,7 @@ def build_car_message_excel(records: list[dict]) -> BytesIO:
         ws.cell(row=row_idx, column=15, value="YES" if r.get("is_manually_created") else "NO")
         ws.cell(row=row_idx, column=16, value=r.get("manual_pcs"))
         ws.cell(row=row_idx, column=17, value=to_ist(r.get("created_at")))
+        ws.cell(row=row_idx, column=18, value=format_source(r.get("source")))
 
     # Auto column width
     for col in ws.columns:
@@ -7518,7 +7533,11 @@ async def get_uld_sequences_of_particular_flight(db, flight_id, uld_detail_id):
 
 
 # ======================🫥🫥 Car message V2 dashboard =================================
-CategoryLiteral = Literal["all", "car_message", "export_tp", "import_tp", "tp_combine"]
+CategoryLiteral = Literal["all", "car_message", "export_tp", "import_tp", "tp_combine",
+                           "imp_segration",       # ← NEW — Import Segregation Report
+    "exp_tranship",        # ← NEW — Export Transhipment Report
+    "seg_tranship_combine" # ← NEW — Segregation + Transhipment combined
+                          ]
  
 # Sentinel meanings used in the map:
 #   False        → no filter (all)
@@ -7531,6 +7550,10 @@ _SOURCE_FILTER_MAP: dict[str, str | None | bool | list[str]] = {
     "export_tp":  "EXPORT_TP_XRAY",
     "import_tp":  "IMPORT_TP_XRAY",
     "tp_combine": ["EXPORT_TP_XRAY", "IMPORT_TP_XRAY"],
+
+        "imp_segration"       : "IMP_SEGRATION",
+    "exp_tranship"        : "EXP_TRANSHIP",
+    "seg_tranship_combine": ["IMP_SEGRATION", "EXP_TRANSHIP"],
 }
  
 # The two TP source values — reused wherever an IN-filter is needed inline
@@ -7959,7 +7982,7 @@ def _to_ist_str(dt) -> str | None:
 async def get_dashboard_drilldown_detail_v2(
     db: AsyncSession,
     report_date: date,
-    detail_type: str,   # "all_awbs" | "scanned_awbs" | "used_skids" | "flight_bookings"
+    detail_type: str,   # "all_awbs" | "scanned_awbs" | "used_skids" | "flight_bookings" |"others_awbs"
     category: CategoryLiteral,
 ) -> dict:
  
@@ -8529,13 +8552,204 @@ async def get_dashboard_drilldown_detail_v2(
             "total": len(items),
             "items": items,
         }
- 
+    
+    # ═════════════════════════════════════════════════════════════════════
+    # OTHERS AWBs — scanned on this date but belong to a different car message date
+    # ═════════════════════════════════════════════════════════════════════
+    elif detail_type == "others_awbs":
+
+        # ── Find AWB IDs scanned today but NOT in today's date+category AWBs ──
+        others_awb_ids_stmt = (
+            select(distinct(ExportAwbSkidItemSequence.awb_master_id))
+            .join(
+                ExportCarMessageAwbMaster,
+                ExportAwbSkidItemSequence.awb_master_id == ExportCarMessageAwbMaster.id,
+            )
+            .where(
+                ExportAwbSkidItemSequence.sequence_date_time >= day_start_utc,
+                ExportAwbSkidItemSequence.sequence_date_time <= day_end_utc,
+                ExportCarMessageAwbMaster.id.notin_(awb_ids) if awb_ids else True,
+            )
+        )
+
+        # Apply source filter on joined ExportCarMessageAwbMaster
+        filter_val = _SOURCE_FILTER_MAP[category]
+        if filter_val is not False:
+            if filter_val is None:
+                others_awb_ids_stmt = others_awb_ids_stmt.where(
+                    ExportCarMessageAwbMaster.source.is_(None)
+                )
+            elif isinstance(filter_val, list):
+                others_awb_ids_stmt = others_awb_ids_stmt.where(
+                    ExportCarMessageAwbMaster.source.in_(filter_val)
+                )
+            else:
+                others_awb_ids_stmt = others_awb_ids_stmt.where(
+                    ExportCarMessageAwbMaster.source == filter_val
+                )
+
+        others_awb_ids_result = await db.execute(others_awb_ids_stmt)
+        others_awb_ids = [r[0] for r in others_awb_ids_result.all()]
+
+        if not others_awb_ids:
+            return {
+                "detail_type": detail_type,
+                "category": category,
+                "report_date": str(report_date),
+                "total": 0,
+                "items": [],
+            }
+
+        # ── AWB level data + total ever scanned pcs ───────────────────────────
+        result = await db.execute(
+            select(
+                ExportCarMessageAwbMaster.id.label("awb_master_id"),
+                ExportCarMessageAwbMaster.awb_no,
+                ExportCarMessageAwbMaster.origin,
+                ExportCarMessageAwbMaster.destination,
+                ExportCarMessageAwbMaster.pcs.label("total_pcs"),
+                ExportCarMessageAwbMaster.status,
+                ExportCarMessageAwbMaster.agent,
+                ExportCarMessageAwbMaster.source,
+                ExportCarMessageAwbMaster.car_message_datetime_combo,
+                ExportCarMessageAwbMaster.is_ultra_fast,
+                ExportCarMessageAwbMaster.is_manually_created,
+                # total ever scanned (all time, not just today)
+                func.count(ExportAwbSkidItemSequence.id).label("total_scanned_pcs"),
+            )
+            .join(
+                ExportAwbSkidItemSequence,
+                ExportAwbSkidItemSequence.awb_master_id == ExportCarMessageAwbMaster.id,
+            )
+            .where(ExportCarMessageAwbMaster.id.in_(others_awb_ids))
+            .group_by(
+                ExportCarMessageAwbMaster.id,
+                ExportCarMessageAwbMaster.awb_no,
+                ExportCarMessageAwbMaster.origin,
+                ExportCarMessageAwbMaster.destination,
+                ExportCarMessageAwbMaster.pcs,
+                ExportCarMessageAwbMaster.status,
+                ExportCarMessageAwbMaster.agent,
+                ExportCarMessageAwbMaster.source,
+                ExportCarMessageAwbMaster.car_message_datetime_combo,
+                ExportCarMessageAwbMaster.is_ultra_fast,
+                ExportCarMessageAwbMaster.is_manually_created,
+            )
+            .order_by(ExportCarMessageAwbMaster.awb_no)
+        )
+        rows = result.mappings().all()
+
+        # ── Scanned pcs on THIS date only (for "scanned today" breakdown) ─────
+        scanned_today_result = await db.execute(
+            select(
+                ExportAwbSkidItemSequence.awb_master_id,
+                func.count(ExportAwbSkidItemSequence.id).label("scanned_today_pcs"),
+            )
+            .where(
+                ExportAwbSkidItemSequence.awb_master_id.in_(others_awb_ids),
+                ExportAwbSkidItemSequence.sequence_date_time >= day_start_utc,
+                ExportAwbSkidItemSequence.sequence_date_time <= day_end_utc,
+            )
+            .group_by(ExportAwbSkidItemSequence.awb_master_id)
+        )
+        scanned_today_map = {
+            r.awb_master_id: r.scanned_today_pcs
+            for r in scanned_today_result.mappings().all()
+        }
+
+        # ── Scanner details (scanned on this date only) ───────────────────────
+        scanner_result = await db.execute(
+            select(
+                ExportAwbSkidItemSequence.awb_master_id,
+                ExportAwbSkidItemSequence.mapping_id,
+                ExportAwbSkidItemSequence.scanned_by,
+                User.name.label("scanned_by_name"),
+                ExportAwbSkidItemSequence.scan_by_device,
+                ExportSkidMaster.skid_no,
+                func.count(ExportAwbSkidItemSequence.id).label("scanned_pcs"),
+                func.max(ExportAwbSkidItemSequence.sequence_date_time).label("last_scanned_at"),
+            )
+            .join(
+                ExportAwbSkidMapping,
+                ExportAwbSkidItemSequence.mapping_id == ExportAwbSkidMapping.id,
+            )
+            .join(
+                ExportSkidMaster,
+                ExportAwbSkidMapping.skid_id == ExportSkidMaster.id,
+            )
+            .join(
+                User,
+                User.emp_id == ExportAwbSkidItemSequence.scanned_by,
+                isouter=True,
+            )
+            .where(
+                ExportAwbSkidItemSequence.awb_master_id.in_(others_awb_ids),
+                # only scans done on the selected date
+                ExportAwbSkidItemSequence.sequence_date_time >= day_start_utc,
+                ExportAwbSkidItemSequence.sequence_date_time <= day_end_utc,
+            )
+            .group_by(
+                ExportAwbSkidItemSequence.awb_master_id,
+                ExportAwbSkidItemSequence.mapping_id,
+                ExportAwbSkidItemSequence.scanned_by,
+                User.name,
+                ExportAwbSkidItemSequence.scan_by_device,
+                ExportSkidMaster.skid_no,
+            )
+            .order_by(ExportAwbSkidItemSequence.awb_master_id)
+        )
+        scanner_rows = scanner_result.mappings().all()
+
+        scanners_by_awb: dict[int, list] = defaultdict(list)
+        for r in scanner_rows:
+            scanners_by_awb[r.awb_master_id].append({
+                "emp_id": r.scanned_by,
+                "name": r.scanned_by_name or "",
+                "scan_by_device": r.scan_by_device,
+                "skid_no": r.skid_no,
+                "scanned_pcs": r.scanned_pcs,
+                "last_scanned_at": _to_ist_str(r.last_scanned_at),
+            })
+
+        return {
+            "detail_type": detail_type,
+            "category": category,
+            "report_date": str(report_date),
+            "note": "AWBs from other car message dates that were scanned on this date",
+            "total": len(rows),
+            "items": [
+                {
+                    "awb_no": r.awb_no,
+                    "origin": r.origin,
+                    "destination": r.destination,
+                    "total_pcs": r.total_pcs or 0,
+                    # scanned on selected date only
+                    "scanned_today_pcs": scanned_today_map.get(r.awb_master_id, 0),
+                    # ever scanned across all dates
+                    "scanned_pcs": r.total_scanned_pcs,
+                    "pending_pcs": max(0, (r.total_pcs or 0) - r.total_scanned_pcs),
+                    "scan_pct": round(
+                        r.total_scanned_pcs / r.total_pcs * 100, 1
+                    ) if r.total_pcs else 0,
+                    "status": r.status or "—",
+                    "agent": r.agent or "—",
+                    "source": r.source or "CAR_MESSAGE",
+                    "is_ultra_fast": bool(r.is_ultra_fast),
+                    "is_manually_created": bool(r.is_manually_created),
+                    # shows which date this AWB actually belongs to
+                    "car_message_datetime": _to_ist_str(r.car_message_datetime_combo),
+                    "scanners": scanners_by_awb.get(r.awb_master_id, []),
+                }
+                for r in rows
+            ],
+        }
+
     # ── Unknown detail_type ───────────────────────────────────────────────
     raise HTTPException(
         status_code=400,
         detail=(
             f"Invalid detail_type '{detail_type}'. "
-            "Use: all_awbs | scanned_awbs | used_skids | flight_bookings"
+            "Use: all_awbs | scanned_awbs | used_skids | flight_bookings | others_awbs"
         ),
     )
 

@@ -33,6 +33,7 @@ class UldBaseResponse(BaseModel):
     base_name: str
     created_at: datetime
     updated_at: datetime
+    created_by:str | None
     model_config = {"from_attributes": True}
 
 
