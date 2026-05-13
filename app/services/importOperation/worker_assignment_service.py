@@ -2771,6 +2771,18 @@ async def process_worker_assignment(db: AsyncSession, req):
             irr.gate_pass_issued_time
         )
 
+        # 🆕 Segregation datetime — same pattern as gate pass combo
+        seg_combo = None
+        if irr.segregation_date and irr.segregation_time:
+            try:
+                seg_combo = combine_gate_pass_date_with_time_and_return_utc_datetime(
+                    irr.segregation_date,
+                    irr.segregation_time
+                )
+            except Exception as e:
+                print(f"⚠️ Failed to combine segregation datetime for GP={irr.gate_pass_no}: {e}")
+                seg_combo = None
+
         header_stmt = (
             insert(WorkerAssignmentHeader)
             .values(
@@ -2852,6 +2864,30 @@ async def process_worker_assignment(db: AsyncSession, req):
                 )
                 if str(irr.gate_pass_no) == "25276836":
                     print("✅ FIX: Updated end time on existing IRR")
+
+            # 🆕 SAME PATTERN — only fill if NULL
+            # 🆕 MERGED PATCH — segregation + boe_no in ONE update trip
+            patch_segregation = existing_irr_event.segregation_datetime is None and seg_combo
+            patch_boe_no      = existing_irr_event.boe_no is None and irr.boe_num
+
+            if patch_segregation or patch_boe_no:
+                await db.execute(
+                    update(WorkerAssignmentShipment)
+                    .where(WorkerAssignmentShipment.id == existing_irr_event.id)
+                    .values(
+                        # 🟢 Only overwrite segregation if it was NULL
+                        segregation_datetime=case(
+                            (WorkerAssignmentShipment.segregation_datetime.is_(None), seg_combo),
+                            else_=WorkerAssignmentShipment.segregation_datetime
+                        ),
+                        # 🟢 Only overwrite boe_no if it was NULL
+                        boe_no=case(
+                            (WorkerAssignmentShipment.boe_no.is_(None), irr.boe_num),
+                            else_=WorkerAssignmentShipment.boe_no
+                        ),
+                        updated_at=now
+                    )
+                )
             continue
 
         # ============================================================
@@ -2954,6 +2990,17 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.release_zone.is_(None), irr.dlv_zone),
                             else_=WorkerAssignmentShipment.release_zone
                         ),
+
+                        # 🆕 ADD THIS
+                        segregation_datetime=case(
+                            (WorkerAssignmentShipment.segregation_datetime.is_(None), seg_combo),
+                            else_=WorkerAssignmentShipment.segregation_datetime
+                        ),
+                        # 🆕 ADD THIS
+                        boe_no=case(
+                            (WorkerAssignmentShipment.boe_no.is_(None), irr.boe_num),
+                            else_=WorkerAssignmentShipment.boe_no
+                        ),
                         updated_at=now
                     )
                 )
@@ -3017,6 +3064,16 @@ async def process_worker_assignment(db: AsyncSession, req):
                         release_zone=case(
                             (WorkerAssignmentShipment.release_zone.is_(None), irr.dlv_zone),
                             else_=WorkerAssignmentShipment.release_zone
+                        ),
+                        # 🆕 ADD THIS
+                        segregation_datetime=case(
+                            (WorkerAssignmentShipment.segregation_datetime.is_(None), seg_combo),
+                            else_=WorkerAssignmentShipment.segregation_datetime
+                        ),
+                        # 🆕 ADD THIS
+                        boe_no=case(
+                            (WorkerAssignmentShipment.boe_no.is_(None), irr.boe_num),
+                            else_=WorkerAssignmentShipment.boe_no
                         ),
                         updated_at=now
                     )
@@ -3087,6 +3144,8 @@ async def process_worker_assignment(db: AsyncSession, req):
                     agent_name=irr.agent,
                     customer_name=irr.consignee,
                     release_zone=irr.dlv_zone,
+                    segregation_datetime=seg_combo,
+                    boe_no=irr.boe_num, 
                     updated_at=now
                 )
             )
@@ -3113,6 +3172,8 @@ async def process_worker_assignment(db: AsyncSession, req):
                 agent_name=irr.agent,
                 customer_name=irr.consignee,
                 release_zone=irr.dlv_zone,
+                segregation_datetime=seg_combo,   # 🆕
+                boe_no=irr.boe_num,  #   🆕
                 from_irr_table=True,
                 created_at=now,
                 updated_at=now
@@ -4181,7 +4242,11 @@ async def get_paginated_worker_assignments_data_list(
             "damage_resolve_datetime":shipment.damage_resolve_datetime,
             "is_final_delivered":shipment.is_final_delivered,
             "loading_in_lift_zone":shipment.loading_in_lift_zone,
+            "loading_in_lift_zone_datetime":shipment.loading_in_lift_zone_datetime,
+            "loading_in_lift_person":shipment.loading_in_lift_person,
             "unloading_from_lift_zone":shipment.unloading_from_lift_zone,
+            "unloading_from_lift_zone_datetime":shipment.unloading_from_lift_zone_datetime,
+            "unloading_from_lift_person":shipment.unloading_from_lift_person,
 
             "gp_received_by":shipment.gp_received_by,
             "gp_received_datetime":shipment.gp_received_datetime,
@@ -4231,6 +4296,7 @@ async def get_paginated_worker_assignments_data_list(
 
 
 # 👌====================This is used for search in worker assignment page where I can search by awb hawb gp_no, oc_no, temp_oc -------
+
 async def search_in_worker_assignments(
     db: AsyncSession,
     search_type: str,
@@ -4247,19 +4313,18 @@ async def search_in_worker_assignments(
     shipment_fields = {
         "gp_no": WorkerAssignmentShipment.gate_pass_no,
     }
+
     def model_to_dict(obj):
         return {
             column.name: getattr(obj, column.name)
             for column in obj.__table__.columns
         }
 
-
     # ----------------------------------------------------------------
     # 1️⃣ HEADER SEARCH
     # ----------------------------------------------------------------
     if search_type in header_fields:
         column = header_fields[search_type]
-
         stmt = (
             select(WorkerAssignmentShipment, WorkerAssignmentHeader)
             .join(
@@ -4274,7 +4339,6 @@ async def search_in_worker_assignments(
     # ----------------------------------------------------------------
     elif search_type in shipment_fields:
         column = shipment_fields[search_type]
-
         stmt = (
             select(WorkerAssignmentShipment, WorkerAssignmentHeader)
             .join(
@@ -4293,21 +4357,128 @@ async def search_in_worker_assignments(
     response_list = []
 
     for shipment, header in rows:
-
-        # Convert shipment model → dictionary (ALL columns)
         shipment_dict = model_to_dict(shipment)
-
-        # Add header identity fields manually
         shipment_dict.update({
             "oc_no": header.oc_no,
             "awb_no": header.awb_no,
             "hawb": header.hawb,
             "temp_irm_oc_no": header.temp_irm_oc_no,
         })
-
         response_list.append(shipment_dict)
 
+    # ============================================================
+    # 🆕 ENRICH: Add *_name fields by looking up users by emp_id
+    # ============================================================
+    USER_ID_FIELDS = [
+        "assigned_person",
+        # "verified_by",
+        "loading_in_lift_person",
+        "unloading_from_lift_person",
+        "final_delivery_by_person",
+        "gp_received_by",
+    ]
+
+    # 1. Collect all unique emp_ids across all records
+    emp_ids = set()
+    for row in response_list:
+        for field in USER_ID_FIELDS:
+            val = row.get(field)
+            if val:
+                emp_ids.add(val)
+
+    # 2. One query → fetch all needed user names
+    users_map = {}
+    if emp_ids:
+        res = await db.execute(
+            select(User.emp_id, User.name).where(User.emp_id.in_(emp_ids))
+        )
+        users_map = {u.emp_id: u.name for u in res.fetchall()}
+
+    # 3. Inject *_name field next to each emp_id field
+    for row in response_list:
+        for field in USER_ID_FIELDS:
+            emp_id_val = row.get(field)
+            row[f"{field}_name"] = users_map.get(emp_id_val) if emp_id_val else None
+
     return response_list
+
+# async def search_in_worker_assignments(
+#     db: AsyncSession,
+#     search_type: str,
+#     search_value: str
+# ):
+
+#     header_fields = {
+#         "oc_no": WorkerAssignmentHeader.oc_no,
+#         "awb": WorkerAssignmentHeader.awb_no,
+#         "hawb": WorkerAssignmentHeader.hawb,
+#         "temp_oc": WorkerAssignmentHeader.temp_irm_oc_no,
+#     }
+
+#     shipment_fields = {
+#         "gp_no": WorkerAssignmentShipment.gate_pass_no,
+#     }
+#     def model_to_dict(obj):
+#         return {
+#             column.name: getattr(obj, column.name)
+#             for column in obj.__table__.columns
+#         }
+
+
+#     # ----------------------------------------------------------------
+#     # 1️⃣ HEADER SEARCH
+#     # ----------------------------------------------------------------
+#     if search_type in header_fields:
+#         column = header_fields[search_type]
+
+#         stmt = (
+#             select(WorkerAssignmentShipment, WorkerAssignmentHeader)
+#             .join(
+#                 WorkerAssignmentHeader,
+#                 WorkerAssignmentShipment.assignment_header_id == WorkerAssignmentHeader.id
+#             )
+#             .where(column == search_value)
+#         )
+
+#     # ----------------------------------------------------------------
+#     # 2️⃣ SHIPMENT SEARCH
+#     # ----------------------------------------------------------------
+#     elif search_type in shipment_fields:
+#         column = shipment_fields[search_type]
+
+#         stmt = (
+#             select(WorkerAssignmentShipment, WorkerAssignmentHeader)
+#             .join(
+#                 WorkerAssignmentHeader,
+#                 WorkerAssignmentShipment.assignment_header_id == WorkerAssignmentHeader.id
+#             )
+#             .where(func.lower(column).contains(search_value.lower()))
+#         )
+
+#     else:
+#         return []
+
+#     result = await db.execute(stmt)
+#     rows = result.all()
+
+#     response_list = []
+
+#     for shipment, header in rows:
+
+#         # Convert shipment model → dictionary (ALL columns)
+#         shipment_dict = model_to_dict(shipment)
+
+#         # Add header identity fields manually
+#         shipment_dict.update({
+#             "oc_no": header.oc_no,
+#             "awb_no": header.awb_no,
+#             "hawb": header.hawb,
+#             "temp_irm_oc_no": header.temp_irm_oc_no,
+#         })
+
+#         response_list.append(shipment_dict)
+
+#     return response_list
 
 # 👌👌=================== EXPORT WORKER ASSIGNMNET REPORT BASED ON FILTERD (STREAMING) ===================
 #============= IT IS USED TO EXPORT EXCEL STREAMING FOR WORKER ASSIGNMENT DATA WITH FILTERS ================
@@ -4881,8 +5052,557 @@ async def generate_ageing_report_for_worker_assignment(
 
     yield output.read()
 
+# Full report with steps timeline for worker assignment
+async def generate_excel_stream_export_worker_assignment_with_step_timeline(
+    db: AsyncSession,
+    assignment_status: str,
+    start_date: str,
+    end_date: str,
+    chunk_size: int = 1000,
+    time_diff_format: str = "decimal"  # "decimal" -> 3.75  |  "hm" -> "3h 45m"
+) -> AsyncGenerator[bytes, None]:
+    """
+    Async generator that streams Excel file in chunks (STEP-TIMELINE report).
 
+    Superset of `generate_excel_stream_export_worker_assignment`:
+    - Includes all base columns
+    - Adds lift loading / unloading datetimes
+    - Adds step-by-step time-diff columns (decimal hours by default)
+    - Column order matches the frontend UserAssignmentTable
+    - Negative time diffs are shown (in RED) to flag data ordering issues
 
+    Args:
+        time_diff_format: "decimal" -> writes decimal hours (e.g. 3.75) [DEFAULT]
+                         "hm"      -> writes string format (e.g. "3h 45m")
+    """
+
+    # -------------------------------------------------------------------------
+    # Setup workbook
+    # -------------------------------------------------------------------------
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    worksheet = workbook.add_worksheet('Worker Assignments Timeline')
+
+    # ---- Formats ----
+    header_format = workbook.add_format({
+        'bold': True,
+        'border': 1,
+        'align': 'center',
+        'valign': 'vcenter',
+        'text_wrap': True,
+        'bg_color': '#F3F4F6'
+    })
+    date_format = workbook.add_format({
+        'num_format': 'dd/mm/yyyy hh:mm',
+        'align': 'left'
+    })
+    number_format = workbook.add_format({
+        'num_format': '0.00',
+        'align': 'right'
+    })
+    integer_format = workbook.add_format({
+        'num_format': '0',
+        'align': 'right'
+    })
+    decimal_hours_format = workbook.add_format({
+        'num_format': '0.00',
+        'align': 'right'
+    })
+    text_format = workbook.add_format({
+        'align': 'left',
+        'valign': 'top',
+        'text_wrap': True
+    })
+    text_center = workbook.add_format({
+        'align': 'center',
+        'valign': 'vcenter'
+    })
+
+    # 🔴 Negative-value formats (to flag data ordering issues)
+    negative_hours_format = workbook.add_format({
+        'num_format': '0.00',
+        'align': 'right',
+        'font_color': '#DC2626',  # red
+        'bold': True
+    })
+    negative_hm_format = workbook.add_format({
+        'align': 'right',
+        'font_color': '#DC2626',
+        'bold': True
+    })
+
+    # -------------------------------------------------------------------------
+    # Column definitions (ORDER MATCHES FRONTEND TABLE)
+    # -------------------------------------------------------------------------
+    diff_header_suffix = "(hrs)" if time_diff_format == "decimal" else "(h m)"
+
+    headers = [
+        'S.No',                                        # 0
+        f'SLA Time Diff {diff_header_suffix}',         # 1
+        'OC No',                                       # 2
+        'Gate Pass No',                                # 3
+        'Gate Pass Issue Date',                        # 4
+        'AWB',                                         # 5
+        'HAWB',                                        # 6
+        'Pcs',                                         # 7
+        'Gross Wgt',                                   # 8
+        'GP Received Time (by security)',              # 9
+        'Operator Emp ID',                             # 10
+        'Operator Name',                               # 11
+        'Operator Assigned Date/Time',                 # 12
+        f'GP Issued vs Opr Assign {diff_header_suffix}',  # 13
+        'From Where',                                  # 14
+        'Location',                                    # 15
+        'Drop Dlv Zone',                               # 16
+        'Drop Dlv Zone Date/Time',                     # 17
+        f'Assign vs Lift Drop {diff_header_suffix}',   # 18
+        'Lift Loading Date Time',                      # 19
+        f'Lift Drop vs Lift Loading {diff_header_suffix}',  # 20
+        'Lift Unloading Date Time',                    # 21
+        f'Lift Loading vs Lift Unloading {diff_header_suffix}',  # 22
+        'Final Delivery Time (by security)',           # 23
+        f'Final Delivery vs Lift Unloading {diff_header_suffix}',  # 24
+        f'GP Issue vs Final Delivery {diff_header_suffix}',  # 25
+        f'GP Received vs Final Delivery {diff_header_suffix}',  # 26
+        'Gatepass End Datetime (COSYS)',               # 27
+        'Integrated At',                               # 28
+        'Temp IRM OC No',                              # 29
+        'CHG Wgt',                                     # 30
+        'Damage Report Status',                        # 31
+    ]
+
+    # Write headers
+    for col_num, header in enumerate(headers):
+        worksheet.write(0, col_num, header, header_format)
+
+    # Column widths
+    column_widths = {
+        0: 6,    # S.No
+        1: 14,   # SLA Time Diff
+        2: 15,   # OC No
+        3: 18,   # Gate Pass No
+        4: 18,   # GP Issue Date
+        5: 18,   # AWB
+        6: 18,   # HAWB
+        7: 8,    # Pcs
+        8: 12,   # Gross Wgt
+        9: 18,   # GP Received Time
+        10: 14,  # Operator Emp ID
+        11: 25,  # Operator Name
+        12: 18,  # Operator Assigned DateTime
+        13: 16,  # GP Issued vs Opr Assign
+        14: 12,  # From Where
+        15: 30,  # Location
+        16: 18,  # Drop Dlv Zone
+        17: 18,  # Drop Dlv Zone Date/Time
+        18: 16,  # Assign vs Lift Drop
+        19: 18,  # Lift Loading Date Time
+        20: 16,  # Lift Drop vs Lift Loading
+        21: 18,  # Lift Unloading Date Time
+        22: 16,  # Lift Loading vs Lift Unloading
+        23: 18,  # Final Delivery Time
+        24: 16,  # Final Delivery vs Lift Unloading
+        25: 16,  # GP Issue vs Final Delivery
+        26: 16,  # GP Received vs Final Delivery
+        27: 18,  # Gatepass End Datetime (COSYS)
+        28: 18,  # Integrated At
+        29: 15,  # Temp IRM OC No
+        30: 12,  # CHG Wgt
+        31: 18,  # Damage Report Status
+    }
+    for col, width in column_widths.items():
+        worksheet.set_column(col, col, width)
+
+    worksheet.freeze_panes(1, 0)
+
+    # -------------------------------------------------------------------------
+    # Date parsing
+    # -------------------------------------------------------------------------
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+    # -------------------------------------------------------------------------
+    # Query construction (same pattern as base export)
+    # -------------------------------------------------------------------------
+    UserAlias = aliased(User)
+
+    filters = WorkerAssignmentFilters(
+        shipment_model=WorkerAssignmentShipment,
+        status=assignment_status,
+        startDate=start_date,
+        endDate=end_date
+    )
+
+    base_query = (
+        filters.apply_all(
+            select(
+                WorkerAssignmentHeader,
+                WorkerAssignmentShipment,
+                UserAlias.name.label("assigned_person_name")
+            )
+            .join(
+                WorkerAssignmentShipment,
+                WorkerAssignmentHeader.id == WorkerAssignmentShipment.assignment_header_id
+            )
+            .outerjoin(
+                UserAlias,
+                UserAlias.emp_id == WorkerAssignmentShipment.assigned_person
+            )
+        )
+    )
+
+    base_query = base_query.order_by(
+        WorkerAssignmentShipment.gate_pass_no.is_(None),
+        WorkerAssignmentShipment.gate_pass_no.asc(),
+        WorkerAssignmentHeader.oc_no.asc()
+    )
+
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+    IST = pytz.timezone("Asia/Kolkata")
+
+    def to_ist_no_tz(dt):
+        """UTC -> IST naive datetime (for Excel)."""
+        if not dt:
+            return None
+        if dt.tzinfo:
+            dt = dt.astimezone(IST)
+        return dt.replace(tzinfo=None)
+
+    def get_source_label(header, shipment):
+        if shipment.from_irr_table and not header.temp_irm_oc_no:
+            return "IRR"
+        if header.temp_irm_oc_no and not shipment.from_irr_table:
+            return "IRM"
+        if not header.temp_irm_oc_no and not shipment.from_irr_table:
+            return "OC MERGE"
+        return ""
+
+    def compute_diff_hours(start_dt, end_dt):
+        """
+        Return diff in hours as float (decimal).
+        Returns None ONLY if dates are missing.
+        Negative values are returned as-is (indicates data ordering issue).
+        """
+        if not start_dt or not end_dt:
+            return None
+        try:
+            # Both should be tz-aware (UTC from DB) -> safe subtraction
+            delta_seconds = (end_dt - start_dt).total_seconds()
+            return delta_seconds / 3600.0
+        except Exception:
+            return None
+
+    def write_diff(row_num, col_num, start_dt, end_dt):
+        """
+        Write a time diff cell in the chosen format.
+        decimal -> number (3.75, or -2.50 for negative)
+        hm      -> string ("3h 45m", or "-2h 30m" for negative)
+        Negative values are highlighted in red bold.
+        """
+        hours = compute_diff_hours(start_dt, end_dt)
+        if hours is None:
+            worksheet.write(row_num, col_num, '', text_format)
+            return
+
+        is_negative = hours < 0
+
+        if time_diff_format == "decimal":
+            fmt = negative_hours_format if is_negative else decimal_hours_format
+            worksheet.write_number(row_num, col_num, round(hours, 2), fmt)
+        else:
+            abs_hours = abs(hours)
+            h = int(abs_hours)
+            m = int(round((abs_hours - h) * 60))
+            sign = "-" if is_negative else ""
+            fmt = negative_hm_format if is_negative else text_format
+            worksheet.write(row_num, col_num, f"{sign}{h}h {m}m", fmt)
+
+    def compute_sla_diff_hours(shipment):
+        """
+        SLA: from gp_received_datetime to final_delivery_datetime.
+        If final_delivery_datetime is null -> use current time (export time).
+        """
+        if not shipment.gp_received_datetime:
+            return None
+
+        end_dt = shipment.final_delivery_datetime
+        if not end_dt:
+            # Use current UTC time (tz-aware to match DB datetimes)
+            end_dt = datetime.now(pytz.UTC)
+
+        return compute_diff_hours(shipment.gp_received_datetime, end_dt)
+
+    def write_sla(row_num, col_num, shipment):
+        hours = compute_sla_diff_hours(shipment)
+        if hours is None:
+            worksheet.write(row_num, col_num, '', text_format)
+            return
+
+        is_negative = hours < 0
+
+        if time_diff_format == "decimal":
+            fmt = negative_hours_format if is_negative else decimal_hours_format
+            worksheet.write_number(row_num, col_num, round(hours, 2), fmt)
+        else:
+            abs_hours = abs(hours)
+            h = int(abs_hours)
+            m = int(round((abs_hours - h) * 60))
+            sign = "-" if is_negative else ""
+            fmt = negative_hm_format if is_negative else text_format
+            worksheet.write(row_num, col_num, f"{sign}{h}h {m}m", fmt)
+
+    def write_dt(row_num, col_num, dt_value):
+        """Write datetime or blank."""
+        if dt_value:
+            worksheet.write_datetime(row_num, col_num, to_ist_no_tz(dt_value), date_format)
+        else:
+            worksheet.write(row_num, col_num, '', text_format)
+
+    # -------------------------------------------------------------------------
+    # Stream rows
+    # -------------------------------------------------------------------------
+    row_num = 1
+    offset = 0
+
+    while True:
+        chunk_query = base_query.offset(offset).limit(chunk_size)
+        result = await db.execute(chunk_query)
+        chunk = result.all()
+
+        if not chunk:
+            break
+
+        for header, shipment, assigned_person_name in chunk:
+
+            # 0 - S.No
+            worksheet.write(row_num, 0, row_num, text_center)
+
+            # 1 - SLA Time Diff (gp_received -> final_delivery OR now)
+            write_sla(row_num, 1, shipment)
+
+            # 2 - OC No (header)
+            worksheet.write(row_num, 2, header.oc_no or '', text_format)
+
+            # 3 - Gate Pass No
+            worksheet.write(row_num, 3, shipment.gate_pass_no or '', text_format)
+
+            # 4 - Gate Pass Issue Date
+            write_dt(row_num, 4, shipment.gate_pass_issued_date_time_combo)
+
+            # 5 - AWB (header)
+            worksheet.write(row_num, 5, header.awb_no or '', text_format)
+
+            # 6 - HAWB (header)
+            worksheet.write(row_num, 6, header.hawb or '', text_format)
+
+            # 7 - Pcs
+            if shipment.no_of_pc is not None:
+                worksheet.write_number(row_num, 7, shipment.no_of_pc, integer_format)
+            else:
+                worksheet.write_blank(row_num, 7, None)
+
+            # 8 - Gross Wgt
+            if shipment.weight_in_kgs is not None:
+                worksheet.write_number(row_num, 8, shipment.weight_in_kgs, number_format)
+            else:
+                worksheet.write_blank(row_num, 8, None)
+
+            # 9 - GP Received Time
+            write_dt(row_num, 9, shipment.gp_received_datetime)
+
+            # 10 - Operator Emp ID (as number when possible)
+            if shipment.assigned_person is not None and str(shipment.assigned_person).strip().isdigit():
+                worksheet.write_number(row_num, 10, int(shipment.assigned_person), integer_format)
+            else:
+                worksheet.write(row_num, 10, shipment.assigned_person or '', text_format)
+
+            # 11 - Operator Name
+            worksheet.write(row_num, 11, assigned_person_name or '', text_format)
+
+            # 12 - Operator Assigned Date/Time
+            write_dt(row_num, 12, shipment.assigned_person_datetime)
+
+            # 13 - GP Issued vs Opr Assign
+            write_diff(
+                row_num, 13,
+                shipment.gate_pass_issued_date_time_combo,
+                shipment.assigned_person_datetime
+            )
+
+            # 14 - From Where
+            worksheet.write(row_num, 14, get_source_label(header, shipment), text_center)
+
+            # 15 - Location
+            worksheet.write(row_num, 15, shipment.location or '', text_format)
+
+            # 16 - Drop Dlv Zone
+            worksheet.write(row_num, 16, shipment.drop_dlv_zone or '', text_format)
+
+            # 17 - Drop Dlv Zone Date/Time
+            write_dt(row_num, 17, shipment.drop_dlv_zone_datetime)
+
+            # 18 - Assign vs Lift Drop
+            write_diff(
+                row_num, 18,
+                shipment.assigned_person_datetime,
+                shipment.drop_dlv_zone_datetime
+            )
+
+            # 19 - Lift Loading Date Time
+            write_dt(row_num, 19, shipment.loading_in_lift_zone_datetime)
+
+            # 20 - Lift Drop vs Lift Loading
+            write_diff(
+                row_num, 20,
+                shipment.drop_dlv_zone_datetime,
+                shipment.loading_in_lift_zone_datetime
+            )
+
+            # 21 - Lift Unloading Date Time
+            write_dt(row_num, 21, shipment.unloading_from_lift_zone_datetime)
+
+            # 22 - Lift Loading vs Lift Unloading
+            write_diff(
+                row_num, 22,
+                shipment.loading_in_lift_zone_datetime,
+                shipment.unloading_from_lift_zone_datetime
+            )
+
+            # 23 - Final Delivery Time
+            write_dt(row_num, 23, shipment.final_delivery_datetime)
+
+            # 24 - Final Delivery vs Lift Unloading
+            write_diff(
+                row_num, 24,
+                shipment.unloading_from_lift_zone_datetime,
+                shipment.final_delivery_datetime
+            )
+
+            # 25 - GP Issue vs Final Delivery
+            write_diff(
+                row_num, 25,
+                shipment.gate_pass_issued_date_time_combo,
+                shipment.final_delivery_datetime
+            )
+
+            # 26 - GP Received vs Final Delivery
+            write_diff(
+                row_num, 26,
+                shipment.gp_received_datetime,
+                shipment.final_delivery_datetime
+            )
+
+            # 27 - Gatepass End Datetime (COSYS)
+            write_dt(row_num, 27, shipment.gate_pass_end_datetime)
+
+            # 28 - Integrated At
+            write_dt(row_num, 28, shipment.integrate_date_time)
+
+            # 29 - Temp IRM OC No (header)
+            worksheet.write(row_num, 29, header.temp_irm_oc_no or '', text_format)
+
+            # 30 - CHG Wgt
+            if shipment.chg_wgt_in_kg is not None:
+                worksheet.write_number(row_num, 30, shipment.chg_wgt_in_kg, number_format)
+            else:
+                worksheet.write_blank(row_num, 30, None)
+
+            # 31 - Damage Report Status
+            worksheet.write(row_num, 31, shipment.damage_report_status or '', text_format)
+
+            row_num += 1
+
+        offset += chunk_size
+
+    # -------------------------------------------------------------------------
+    # METADATA FOOTER
+    # -------------------------------------------------------------------------
+    # Leave 2 empty rows after data, then write metadata
+    meta_start_row = row_num + 2
+
+    # Metadata-specific formats
+    meta_label_format = workbook.add_format({
+        'bold': True,
+        'align': 'left',
+        'valign': 'vcenter',
+        'bg_color': '#E5E7EB',
+        'border': 1
+    })
+    meta_value_format = workbook.add_format({
+        'align': 'left',
+        'valign': 'vcenter',
+        'text_wrap': True,
+        'border': 1
+    })
+    meta_section_format = workbook.add_format({
+        'bold': True,
+        'font_size': 11,
+        'align': 'left',
+        'valign': 'vcenter',
+        'bg_color': '#1F2937',
+        'font_color': '#FFFFFF',
+        'border': 1
+    })
+
+    # IST current time (for "downloaded at")
+    now_ist = datetime.now(pytz.UTC).astimezone(IST).replace(tzinfo=None)
+
+    # ---- Section 1: File metadata ----
+    worksheet.merge_range(meta_start_row, 0, meta_start_row, 3,
+                          'REPORT METADATA', meta_section_format)
+
+    meta_rows = [
+        ('Report Type', 'Operator Assignment with Step Timeline'),
+        ('Downloaded At (IST)', now_ist.strftime('%d-%b-%Y %H:%M:%S')),
+        ('Filter: Assignment Status', assignment_status or 'ALL'),
+        ('Filter: Start Date', start_date),
+        ('Filter: End Date', end_date),
+        ('Total Records', row_num - 1),
+        ('Time Diff Format', 'Decimal hours (e.g. 3.75)' if time_diff_format == "decimal"
+                              else 'Hours & minutes (e.g. 3h 45m)'),
+    ]
+
+    for i, (label, value) in enumerate(meta_rows):
+        r = meta_start_row + 1 + i
+        worksheet.write(r, 0, label, meta_label_format)
+        worksheet.merge_range(r, 1, r, 3, str(value), meta_value_format)
+
+    # ---- Section 2: SLA calculation logic ----
+    sla_section_row = meta_start_row + 1 + len(meta_rows) + 1
+    worksheet.merge_range(sla_section_row, 0, sla_section_row, 3,
+                          'SLA TIME DIFF — CALCULATION LOGIC', meta_section_format)
+
+    sla_rows = [
+        ('Base Field',
+         'gp_received_datetime (time gatepass physically received by security)'),
+        ('Condition 1: Shipment Delivered',
+         'When final_delivery_datetime IS present  →  '
+         'SLA = final_delivery_datetime − gp_received_datetime'),
+        ('Condition 2: Shipment NOT Yet Delivered',
+         'When final_delivery_datetime is NULL  →  '
+         'SLA = (Report Download Time) − gp_received_datetime  '
+         '(i.e. live elapsed time at the moment this file was generated)'),
+        ('Note on Blank Cells',
+         'Blank cells in any time-diff column mean one of the required datetimes is missing.'),
+        ('Note on Negative Values',
+         'Negative values (shown in RED, e.g. -2.50) indicate the end datetime is BEFORE the start datetime. '
+         'This points to a data-entry / ordering issue and should be investigated. '
+         'You can sort the column ascending or filter "less than 0" to find all such records.'),
+    ]
+
+    for i, (label, value) in enumerate(sla_rows):
+        r = sla_section_row + 1 + i
+        worksheet.write(r, 0, label, meta_label_format)
+        worksheet.merge_range(r, 1, r, 3, str(value), meta_value_format)
+        # Taller row for the explanation cells
+        worksheet.set_row(r, 30)
+
+    workbook.close()
+    output.seek(0)
+    yield output.read()
+# ------------------------------------------------
 #👌 =========================  USER / WORKER ASSIGNMENT SUMMARY ============================
 
 async def get_assignment_summary_according_to_assigned_person(

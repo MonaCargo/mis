@@ -236,7 +236,8 @@ class WorkerAssignmentShipment(Base):
     gp_received_datetime= Column(DateTime(timezone=True))
     gp_received_by = Column(String(30), nullable=True)
 
-
+    segregation_datetime = Column(DateTime(timezone=True), nullable=True) #this filed come from imp_relase_report
+    boe_no = Column(String(100), nullable=True)   # 🆕 ADD THIS
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 

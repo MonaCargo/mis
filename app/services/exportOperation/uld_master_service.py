@@ -11,11 +11,17 @@ from itertools import islice
 from operator import and_
 from typing import Optional
 
+from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from sqlalchemy.exc import IntegrityError
+from app.db.models.exportOperation.export_carrier_master import ExportCarrierMaster
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.schemas.exportOperation.car_message import UldInventoryRecord, UldStockRecord, UldStockSyncResponse, UldSyncResult
+from app.schemas.exportOperation.uld_master import ExportUldCreate
+from app.services.exportOperation.uld_master_log_service import UldAction, uld_snapshot, write_uld_log
+from app.services.export_slot_file_upload_service import get_utc_now
+from app.utils.exportOperation.validator.uld_pattern_validator import validate_uld_no
 
 
 # Identifies this automated process as the creator when no user is logged in
@@ -230,3 +236,162 @@ class UldStockSyncService:
             select(ExportUldMaster.carrier).distinct().order_by(ExportUldMaster.carrier)
         )
         return [row[0] for row in result.fetchall() if row[0]]
+    
+
+
+
+    # =========================😎😎😎😎 New create ULD with defined pattern ==================================
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────────────────────────
+    async def _get_uld_by_id(db: AsyncSession, uld_id: int) -> ExportUldMaster:
+        """Fetch a ULD row by id or raise 404."""
+        result = await db.execute(
+            select(ExportUldMaster).where(ExportUldMaster.id == uld_id)
+        )
+        row = result.scalar_one_or_none()
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"ULD with id '{uld_id}' not found.",
+            )
+        return row
+    
+    @staticmethod
+    async def _get_uld_by_no(db: AsyncSession, uld_no: str) -> Optional[ExportUldMaster]:
+        """Fetch a ULD row by uld_no (case-insensitive normalised)."""
+        result = await db.execute(
+            select(ExportUldMaster).where(
+                ExportUldMaster.uld_no == uld_no.strip().upper()
+            )
+        )
+        return result.scalar_one_or_none()
+    
+    
+    # ----------------
+
+    @staticmethod
+    # ─────────────────────────────────────────────────────────────────────────────
+    # CREATE
+    # ─────────────────────────────────────────────────────────────────────────────
+    async def create_export_uld_or_container_based_on_defined_patterns(
+        db: AsyncSession,
+        payload: ExportUldCreate,
+        actor: Optional[str] = None,
+    ) -> dict:
+        """
+        Create a new Export ULD record.
+    
+        Validates the uld_no against the allowed patterns, auto-derives uld_type
+        from the matched pattern, and ensures uniqueness.
+    
+        Returns the created ULD details.
+        """
+        # ── Re-validate uld_no (defence-in-depth, even though schema validated) ──
+        result = validate_uld_no(payload.uld_no)
+        if not result.is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": result.reason,
+                    "suggestions": result.suggestions,
+                },
+            )
+    
+        derived_type = result.uld_type  # guaranteed non-None when is_valid
+    
+        # ── If client supplied uld_type, verify it matches the pattern ──────────
+        if payload.uld_type and payload.uld_type.strip().upper() != derived_type:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Supplied uld_type '{payload.uld_type}' does not match "
+                    f"the pattern-derived type '{derived_type}'."
+                ),
+            )
+        
+        # ── Carrier must exist and be active in export_carrier_master ──────────
+        carrier_result = await db.execute(
+            select(ExportCarrierMaster.id).where(
+                ExportCarrierMaster.carrier_code == payload.carrier,
+                ExportCarrierMaster.is_active.is_(True),
+            )
+        )
+        print(carrier_result,"carrier-result")
+        if carrier_result.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Carrier '{payload.carrier}' is not registered or inactive.",
+            )
+    
+        # ── Uniqueness pre-check (DB unique index is still source of truth) ─────
+        existing = await UldStockSyncService._get_uld_by_no(db, payload.uld_no)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"ULD '{payload.uld_no}' already exists.",
+            )
+    
+        # ── Build & insert ──────────────────────────────────────────────────────
+        now = get_utc_now()
+        row = ExportUldMaster(
+            uld_no=payload.uld_no,
+            carrier=payload.carrier,
+            uld_type=derived_type,
+            is_active=True,
+            is_available=True,
+            created_at=now,
+            updated_at=now,
+            created_by=actor,
+            updated_by=actor,
+        )
+    
+        try:
+            db.add(row)
+
+            await db.flush()  # populates row.id without committing
+ 
+            # ── Audit log lives in the SAME transaction ─────────────────────────
+            await write_uld_log(
+                db,
+                action=UldAction.CREATE,
+                uld_id=row.id,
+                uld_no=row.uld_no,
+                message=(
+                    f"ULD '{row.uld_no}' created with type '{row.uld_type}' "
+                    f"for carrier '{row.carrier}'."
+                ),
+                before_state=None,
+                after_state=uld_snapshot(row),
+                performed_by=actor,
+                remarks=payload.remarks,
+            )
+
+            await db.commit()
+            await db.refresh(row)
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"ULD '{payload.uld_no}' already exists.",
+            )
+    
+        return {
+            "success": True,
+            "message": f"ULD '{row.uld_no}' created successfully.",
+            "item": {
+                "id": row.id,
+                "uld_no": row.uld_no,
+                "carrier": row.carrier,
+                "uld_type": row.uld_type,
+                "is_active": row.is_active,
+                "is_available": row.is_available,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+                "created_by": row.created_by,
+                "updated_by": row.updated_by,
+            },
+        }
+    
+    

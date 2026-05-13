@@ -63,7 +63,7 @@ class OcMergeGatePass(Base):
 
     integrate_date_time = Column(DateTime(timezone=True), nullable=True,index=True)  # ✅ NEW FIELD
 
-
+    boe_no = Column(String(100), nullable=True, index=True)   # 🆕 ADD THIS
     
      
   

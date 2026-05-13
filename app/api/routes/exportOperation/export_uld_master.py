@@ -101,6 +101,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
 from app.core.dependency import verify_token_and_get_user
+from app.db.models.exportOperation.export_carrier_master import ExportCarrierMaster
 from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileUploadMetaLog
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.db.models.user import User
@@ -108,6 +109,8 @@ from app.db.session import get_db
 from app.schemas.domesticOperation.domestic_xray_report import PaginationMetadata
 from app.schemas.exportOperation.car_message import UldInventoryRecord, UldStockRecord, UldStockSyncResponse
 from app.schemas.exportOperation.location_master import CreateUldRequest
+from app.schemas.exportOperation.uld_master import ChangeCarrierBody, ExportUldCreate
+from app.services.exportOperation.uld_master_log_service import UldAction, uld_snapshot, write_uld_log
 from app.services.exportOperation.uld_master_service import MultipleCarriersError, UldStockSyncService
 from app.utils.common.helperFunction import get_utc_now
 from app.utils.exportOperation.export_uld_inventory_all_carrier import SUPPORTED_EXTENSIONS, extract_all_carrier_uld_inventory
@@ -847,9 +850,26 @@ async def toggle_uld_availability(
     if not uld:
         raise HTTPException(status_code=404, detail=f"ULD '{cleaned}' not found")
 
+        # Snapshot before change for the audit log
+    before = uld_snapshot(uld)
+    
     uld.is_available = not uld.is_available
     uld.updated_at   = get_utc_now()
     uld.updated_by   = current_user.emp_id
+
+    after = uld_snapshot(uld)
+
+        # Write audit log in the SAME transaction
+    await write_uld_log(
+        db,
+        action=UldAction.MARK_AVAILABLE if uld.is_available else UldAction.MARK_UNAVAILABLE,
+        uld_id=uld.id,
+        uld_no=uld.uld_no,
+        message=f"ULD '{uld.uld_no}' marked as {'Available' if uld.is_available else 'Unavailable'}",
+        before_state=before,
+        after_state=after,
+        performed_by=current_user.emp_id,
+    )
 
     await db.commit()
     await db.refresh(uld)
@@ -860,3 +880,103 @@ async def toggle_uld_availability(
         "is_available": uld.is_available,
         "message":      f"ULD '{uld.uld_no}' marked as {'Available' if uld.is_available else 'Unavailable'}",
     }
+
+
+@router.patch(
+    "/change-carrier-of-uld-or-container/{uld_no}",
+    summary="Change the carrier assigned to a ULD",
+)
+async def change_uld_carrier(
+    uld_no: str,
+    body: ChangeCarrierBody,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    cleaned_uld = uld_no.strip().upper()
+    new_carrier = body.carrier.strip().upper()
+
+    # ── Fetch ULD ──────────────────────────────────────────────────────
+    result = await db.execute(
+        select(ExportUldMaster).where(ExportUldMaster.uld_no == cleaned_uld)
+    )
+    uld: Optional[ExportUldMaster] = result.scalar_one_or_none()
+    if not uld:
+        raise HTTPException(status_code=404, detail=f"ULD '{cleaned_uld}' not found")
+
+    # ── No-op short circuit ────────────────────────────────────────────
+    if uld.carrier == new_carrier:
+        return {
+            "success": True,
+            "uld_no": uld.uld_no,
+            "carrier": uld.carrier,
+            "message": f"Carrier is already '{new_carrier}'. No change made.",
+        }
+
+    # ── Verify the new carrier exists & is active ──────────────────────
+    carrier_result = await db.execute(
+        select(ExportCarrierMaster.id).where(
+            ExportCarrierMaster.carrier_code == new_carrier,
+            ExportCarrierMaster.is_active.is_(True),
+        )
+    )
+    if carrier_result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Carrier '{new_carrier}' is not registered or inactive.",
+        )
+
+    # ── Snapshot, mutate, log, commit ──────────────────────────────────
+    before = uld_snapshot(uld)
+    old_carrier = uld.carrier
+
+    uld.carrier = new_carrier
+    uld.updated_at = get_utc_now()
+    uld.updated_by = current_user.emp_id
+
+    after = uld_snapshot(uld)
+
+    await write_uld_log(
+        db,
+        action=UldAction.CHANGE_CARRIER,
+        uld_id=uld.id,
+        uld_no=uld.uld_no,
+        message=f"Carrier changed for '{uld.uld_no}': {old_carrier} → {new_carrier}",
+        before_state=before,
+        after_state=after,
+        performed_by=current_user.emp_id,
+         remarks=body.remarks, 
+    )
+
+    await db.commit()
+    await db.refresh(uld)
+
+    return {
+        "success": True,
+        "uld_no": uld.uld_no,
+        "carrier": uld.carrier,
+        "message": f"Carrier for '{uld.uld_no}' changed from '{old_carrier}' to '{new_carrier}'.",
+    }
+
+
+# ========================= crfeate uld based on fixed patterns ==================================
+# 2026-12-05 16:25:00+05:30
+@router.post(
+    "/create-uld-or-container/based-on-pattern",
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Export ULD",
+)
+async def create_uld_route(
+    payload: ExportUldCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    """
+    Create a new ULD record.
+ 
+    The `uld_no` must match one of the allowed patterns; `uld_type` is
+    auto-derived from the matched pattern. Returns 422 on invalid format,
+    409 if the ULD already exists.
+    """
+    actor =current_user.emp_id
+    return await UldStockSyncService.create_export_uld_or_container_based_on_defined_patterns(db, payload, actor=actor)
+ 
