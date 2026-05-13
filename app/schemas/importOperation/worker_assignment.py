@@ -375,7 +375,7 @@ class WorkerAssignmentExportRequest(BaseModel):
     assignment_status: str = Field(default="all", description="all | assigned | unassigned | dlv_added | assigned_but_not_delivered")
     startDate: str = Field(..., description="Start date in YYYY-MM-DD format")
     endDate: str = Field(..., description="End date in YYYY-MM-DD format")
-
+    time_diff_format:Optional[str] = None
     report_type: str = "DEFAULT" 
 
 class WorkerAssignmentExportResponse(APIResponseBase):

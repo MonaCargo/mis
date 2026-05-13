@@ -422,9 +422,14 @@ async def bulk_create_users(
     ip_address: str | None,
     user_agent: str | None,
     device_id: str | None,
+     password: str | None = None,  # 👈 new
 ):
     created_users = []
     skipped_users = []  # track already existing
+
+       # Hash once, not per row
+    effective_password = password if password else "cargo123"
+    hashed = hash_password(effective_password)
 
     try:
         for user_data in users:
@@ -437,7 +442,7 @@ async def bulk_create_users(
                 emp_id=user_data["emp_id"],
                 name=user_data["name"],
                 role=user_data["role"],
-                password=hash_password("cargo123"),
+                password=hashed,  # 👈 use the precomputed hash
                 created_by=created_by,
             )
 
