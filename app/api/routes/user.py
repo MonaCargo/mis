@@ -69,7 +69,7 @@
 
 
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependency import require_roles, verify_token_and_get_user
@@ -314,16 +314,25 @@ async def update_user_password_api(
 async def bulk_upload_users(
     request: Request,
     file: UploadFile = File(...),
+    role: str = Form(...),  # 👈 accept role from FormData
+    password: str | None = Form(None),  # 👈 optional
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(verify_token_and_get_user),
 ):
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="Only Excel files allowed")
 
-    users = parse_user_excel(file.file)
+    valid_users, invalid_users = parse_user_excel(file.file,role=role)
+
+    # Validate password if provided
+    if password is not None and len(password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Custom password must be at least 6 characters",
+        )
 
     created_users,skipped_users = await bulk_create_users(
-        users=users,
+        users=valid_users,
         db=db,
         created_by=current_user.emp_id,
         changed_by_role=current_user.role,
@@ -333,12 +342,18 @@ async def bulk_upload_users(
     )
 
     return {
-        "success": True,
-        "created_count": len(created_users),
-        "skipped_count": len(skipped_users),
-        "skipped_emp_ids": skipped_users,  # so frontend knows exactly who was skipped
-        "message": f"{len(created_users)} users created, {len(skipped_users)} already existed and were skipped.",
-    }
+            "success": True,
+            "created_count": len(created_users),
+            "skipped_count": len(skipped_users),
+            "invalid_count": len(invalid_users),
+            "skipped_emp_ids": skipped_users,
+            "invalid_users": invalid_users,  # 👈 list of {emp_id, name, row, reason}
+            "message": (
+                f"{len(created_users)} created, "
+                f"{len(skipped_users)} already existed, "
+                f"{len(invalid_users)} invalid."
+            ),
+        }
 
 
 # Get a user by emp_id

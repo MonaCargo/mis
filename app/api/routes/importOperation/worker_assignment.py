@@ -600,6 +600,7 @@ from app.services.importOperation.worker_assignment_service import (
     generate_ageing_report_for_worker_assignment,
     generate_excel_stream_export_gp_received,
     generate_excel_stream_export_worker_assignment,
+    generate_excel_stream_export_worker_assignment_with_step_timeline,
     generate_operator_productivity_report,
     get_all_allowed_users_as_worker,
     get_all_open_damage_shipments,
@@ -692,7 +693,6 @@ async def search_worker_assignment(
 ):
 
     data = await search_in_worker_assignments(db, search_type=type, search_value=term)
-
     return {
         "status": "success",
         "success": True,
@@ -1048,6 +1048,20 @@ async def export_worker_assignments_stream(
                 end_date=request.endDate,
             )
 
+        # 🆕 NEW: step-timeline report (superset of DEFAULT)
+        elif report_type == "STEP_TIMELINE":
+            print("time_diff_format",request.time_diff_format)
+            generator = generate_excel_stream_export_worker_assignment_with_step_timeline(
+                db=db,
+                assignment_status=request.assignment_status,
+                start_date=request.startDate,
+                end_date=request.endDate,
+                # default = "decimal" (3.75).
+                # To switch to "3h 45m" format, pass: time_diff_format="hm"
+                time_diff_format=getattr(request, "time_diff_format", "hm"),
+                # time_diff_format=getattr(request, "time_diff_format", "decimal"),
+            )
+            
         else:
             raise HTTPException(400, "Invalid report type")
 
@@ -1708,7 +1722,7 @@ async def get_final_delivery_shipments(
 async def mark_final_delivery(
     req: MarkShipmentFinalDeliveryRequest,
     fastApiRequest: Request,
-    current_user: User = Depends(require_roles(["imp_sec_fd"])),
+    current_user: User = Depends(require_roles(["imp_sec_fd","imp_security"])),
     db: AsyncSession = Depends(get_db),
 ):
     try:

@@ -777,6 +777,7 @@ async def generate_and_save_gatepass(
                 oc.awb_no,
                 oc.hawb_no AS hawb,
                 oc.oc_no,
+                oc.boe_no,
                 oc.pcs AS no_of_pc,
                 oc.integrate_date_time,
                 wh.location_pcs_pairs AS locations,
@@ -907,6 +908,7 @@ async def generate_and_save_gatepass(
                 "awb_no": r.awb_no,
                 "hawb": r.hawb,
                 "oc_no": r.oc_no,
+                "boe_no": r.boe_no,
                 "temp_irm_oc_no": None,      # DEFAULT history if it come from  temp then get value other wise null
                 "is_temp_irm_oc": False,
                 "igp_no": None,
@@ -1010,6 +1012,7 @@ async def generate_and_save_gatepass(
                     ],
                     set_={
                         "oc_no": insert(OcMergeGatePass).excluded.oc_no,   # ✅ allow OC change
+                        "boe_no": insert(OcMergeGatePass).excluded.boe_no, 
                         "location": insert(OcMergeGatePass).excluded.location,
                         "weight_in_kgs": insert(OcMergeGatePass).excluded.weight_in_kgs,
                         "chg_wgt_in_kg": insert(OcMergeGatePass).excluded.chg_wgt_in_kg,

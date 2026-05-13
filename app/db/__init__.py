@@ -31,9 +31,11 @@ from app.db.models.domesticOperation.domestic_xray_report import DomesticXray
 from app.db.models.exportOperation.export_and_import_tp_xray import ExportTpXray
 from app.db.models.exportOperation.import_segrigation_report import ImportSegregationReport
 from app.db.models.exportOperation.export_transipment_report import ExportTranshipmentReport
+from app.db.models.exportOperation.uld_master_logs import ExportUldMasterOperationLogs
 
 __all__ = [
     # 'WorkerAssignment',
+    'ExportUldMasterOperationLogs',
 
       'ExportTranshipmentReport',  
        'ImportSegregationReport',
