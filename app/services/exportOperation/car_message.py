@@ -39,7 +39,7 @@ from app.utils.common.helperFunction import get_utc_now
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING = {"RCS", "TFD", "RCT"} 
+FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING = {"RCS", "TFD", "RCT","PRE"} 
 
 # ── 😎 reusable booked_pcs subquery }───────────────────────────────
 def _booked_pcs_subquery():
@@ -370,10 +370,30 @@ async def enrich_awb_from_wh_inventory(db: AsyncSession, df) -> dict:
     and update: status, rcs_datetime, agent, vol_mc.
 
     Rules:
-        - If master.status is already RCS → skip status, rcs_datetime, vol_mc
-        - If not RCS yet → always update status, rcs_datetime, vol_mc
-        - agent → update if currently NULL (always, regardless of status)
+        - agent → updated if currently NULL (always, regardless of status).
+
+        - Status decision tree (per AWB):
+            1. master.status == "PRE":
+                 - rcs_datetime set → fully locked.
+                 - rcs_datetime NULL + PDF says "PRE" → fill datetime + vol_mc.
+
+            2. master.status in FINAL_STATUSES, source in (EXP_TRANSHIP, IMP_SEGRATION):
+                 - PDF = expected final (RCT/TFD), status differs → promote.
+                 - PDF = expected final, status matches, rcs_datetime NULL → repair.
+                 - PDF = "PRE", rcs_datetime NULL → override status to PRE.
+
+            3. master.status in FINAL_STATUSES, source NULL/unknown:
+                 - PDF = "PRE", rcs_datetime NULL → override status to PRE.
+                 - PDF = master.status, rcs_datetime NULL → fill datetime (repair).
+
+            4. master.status NOT in FINAL_STATUSES:
+                 - Write through status / rcs_datetime / vol_mc from PDF.
     """
+    SOURCE_FINAL_STATUS = {
+        "EXP_TRANSHIP":  "RCT",
+        "IMP_SEGRATION": "TFD",
+        }
+    
     if df.empty:
         return {
             "total_in_pdf": 0,
@@ -404,6 +424,7 @@ async def enrich_awb_from_wh_inventory(db: AsyncSession, df) -> dict:
     # ── 3. Update fields ──────────────────────────────────────────────────────
     matched: set[str] = set()
     now = get_utc_now()
+    
 
     for master in masters:
         if master.awb_no not in df_unique.index:
@@ -415,10 +436,56 @@ async def enrich_awb_from_wh_inventory(db: AsyncSession, df) -> dict:
         if master.agent is None:
             master.agent = _val(row.get("AGENT"))
 
-        # If already RCS — final status, don't touch anything else
+        #==========🫥 If already RCS — final status, don't touch anything else
         # if master.status == "RCS":
-        if master.status in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:
-            pass
+        pdf_status = _val(row.get("STATUS"))
+
+        # ── GROUP 1: PRE is universal early-final (any source) ────────────────
+        if master.status == "PRE":
+            if master.rcs_datetime is None and pdf_status == "PRE":
+                # Repair missing datetime
+                master.rcs_datetime = _to_datetime(row.get("DATETIME"))
+                if master.vol_mc is None:
+                    master.vol_mc = _to_float(row.get("VOL_MC"))
+            # else: PRE + datetime present → fully locked, OR PDF mismatched → skip
+
+        # ── GROUP 2 & 3: status is in FINAL_STATUSES ──────────────────────────
+        elif master.status in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:
+
+            # GROUP 2: source-tagged AWBs — react to source-specific final status
+            if master.source in SOURCE_FINAL_STATUS:
+                expected_final = SOURCE_FINAL_STATUS[master.source]
+
+                if pdf_status == expected_final:
+                    if master.status != expected_final:
+                        master.status       = expected_final
+                        master.rcs_datetime = _to_datetime(row.get("DATETIME"))
+                        master.vol_mc       = _to_float(row.get("VOL_MC"))
+                    elif master.rcs_datetime is None:
+                        master.rcs_datetime = _to_datetime(row.get("DATETIME"))
+                        if master.vol_mc is None:
+                            master.vol_mc = _to_float(row.get("VOL_MC"))
+
+                # ✅ NEW: PRE override when rcs_datetime is missing
+                elif pdf_status == "PRE" and master.rcs_datetime is None:
+                    master.status       = "PRE"
+                    master.rcs_datetime = _to_datetime(row.get("DATETIME"))
+                    master.vol_mc       = _to_float(row.get("VOL_MC"))
+
+            # GROUP 3: NULL / unknown source
+            else:
+                # ✅ NEW: PRE override when rcs_datetime is missing
+                if pdf_status == "PRE" and master.rcs_datetime is None:
+                    master.status       = "PRE"
+                    master.rcs_datetime = _to_datetime(row.get("DATETIME"))
+                    master.vol_mc       = _to_float(row.get("VOL_MC"))
+
+                # Repair missing datetime when PDF status matches current status
+                elif pdf_status == master.status and master.rcs_datetime is None:
+                    master.rcs_datetime = _to_datetime(row.get("DATETIME"))
+                    if master.vol_mc is None:
+                        master.vol_mc = _to_float(row.get("VOL_MC"))
+
 
         else:
             # Not yet RCS — update status, datetime, vol_mc
@@ -6810,7 +6877,8 @@ async def create_manual_awb_service(
         awb_no=data.awb_no,
         pcs=data.pcs,
 
-
+        # ✅ NEW — source from request (None if not provided)
+        source=data.source,
         # ✅ manual flags
         is_manually_created=True,
         manual_created_by=emp_id,
@@ -6836,6 +6904,36 @@ async def create_manual_awb_service(
     )
 
     db.add(new_awb)
+
+    await db.flush()   # ✅ assigns new_awb.id without committing yet
+
+    # ── 3. Audit log ────────────────────────────
+    await write_car_message_flow_audit(
+        db=db,
+        awb_reference_id=new_awb.id,
+        flight_reference_id=None,
+        module=CarMessageFlowModule.MANUAL_AWB_CREATE,
+        flow_step=CarMessageFlowStep.MANUAL_AWB_CREATE,
+        record_id=new_awb.id,
+        action="CREATE",
+        performed_by=emp_id,
+        changes={
+            "event": "MANUAL_AWB_CREATED",
+            "awb_no": new_awb.awb_no,
+            "pcs": new_awb.pcs,
+            "manual_pcs": new_awb.manual_pcs,
+            "source": new_awb.source,
+            "status": new_awb.status,
+            "is_ultra_fast": new_awb.is_ultra_fast,
+            "manual_creation_remarks": new_awb.manual_creation_remarks,
+            "summary": (
+                f"AWB {new_awb.awb_no} manually created by {emp_id}"
+                f"{f' with source {new_awb.source}' if new_awb.source else ''}"
+            ),
+        },
+        note="Manual AWB creation",
+    )
+
     await db.commit()
     await db.refresh(new_awb)
 
@@ -6847,6 +6945,7 @@ async def create_manual_awb_service(
         "is_manually_created": new_awb.is_manually_created,
         "is_ultra_fast" : new_awb.is_ultra_fast,
         "manual_pcs": new_awb.manual_pcs,
+        "source": new_awb.source,
     }
 
 

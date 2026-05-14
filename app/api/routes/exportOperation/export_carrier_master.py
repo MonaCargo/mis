@@ -61,7 +61,7 @@ async def get_all_carriers(db: AsyncSession = Depends(get_db)):
             ExportCarrierMaster.carrier_code,
             ExportCarrierMaster.name,
         )
-        .where(ExportCarrierMaster.is_active.is_(True))
+        .where(ExportCarrierMaster.is_active.is_(True),ExportCarrierMaster.carrier_code != "**")
         .order_by(ExportCarrierMaster.carrier_code.asc())
     )
     rows = result.all()
