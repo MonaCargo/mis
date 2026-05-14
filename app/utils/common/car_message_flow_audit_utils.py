@@ -1,6 +1,7 @@
 # utils/audit_modules.py
 
 class CarMessageFlowModule:
+    MANUAL_AWB_CREATE = "MANUAL_AWB_CREATE"
     AWB_MASTER          = "AWB_MASTER"
     SKID_ASSIGNMENT     = "SKID_ASSIGNMENT"
     LOCATION_MAPPING    = "LOCATION_MAPPING"
@@ -16,6 +17,7 @@ class CarMessageFlowModule:
 
 # ✅ Fixed immutable step codes — never integers, never reordered
 class CarMessageFlowStep:
+    MANUAL_AWB_CREATE = "MANUAL_AWB_CREATE"
     AWB_MASTER          = "STEP_AWB_MASTER"
     SKID_ASSIGNMENT     = "STEP_SKID_ASSIGNMENT"
     LOCATION_MAPPING    = "STEP_LOCATION_MAPPING"
@@ -32,6 +34,7 @@ class CarMessageFlowStep:
 # ✅ Separate display order — only used for UI/report rendering
 # changing this never affects stored data
 FLOW_DISPLAY_ORDER = [
+    CarMessageFlowStep.MANUAL_AWB_CREATE,
     CarMessageFlowStep.AWB_MASTER,
     CarMessageFlowStep.SKID_ASSIGNMENT,
     CarMessageFlowStep.LOCATION_MAPPING,

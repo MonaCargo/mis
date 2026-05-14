@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import pytz
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -336,6 +336,10 @@ async def _process_segregation(db, month_current, month_prev, emp_id):
                 "nog"        : stmt.excluded.nog,
                 "shc"        : stmt.excluded.shc,
                 "updated_at" : stmt.excluded.updated_at,
+                 "source"     : func.coalesce(
+            func.nullif(func.trim(ExportCarMessageAwbMaster.source), ''),
+            stmt.excluded.source,
+        ),
             },
         )
         await db.execute(stmt)
@@ -588,6 +592,10 @@ async def _process_transhipment(db, month_current, month_prev, emp_id):
                 "chg_wt"     : stmt.excluded.chg_wt,
                 "shc"        : stmt.excluded.shc,
                 "updated_at" : stmt.excluded.updated_at,
+                  "source"     : func.coalesce(
+                    func.nullif(func.trim(ExportCarMessageAwbMaster.source), ''),
+                    stmt.excluded.source,
+                ),
                 # ── NOT updated (by design — first datetime never changes):
                 # "car_message_datetime_combo"
                 # "car_msg_date"

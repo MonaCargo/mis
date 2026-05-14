@@ -2,6 +2,8 @@
 
 
 
+from typing_extensions import Literal
+
 from pydantic import BaseModel, Field, field_validator
 from datetime import date, datetime
 from typing import Optional
@@ -521,6 +523,8 @@ class AwbManualCreateRequest(BaseModel):
     awb_no: str 
     pcs: int
     manual_creation_remarks: Optional[str] = None
+    source: Optional[Literal["EXP_TRANSHIP", "IMP_SEGRATION"]] = None
+
 
 class AwbManualCreateResponse(BaseModel):
     success: bool
@@ -530,8 +534,7 @@ class AwbManualCreateResponse(BaseModel):
     is_ultra_fast: bool
     is_manually_created: bool
     manual_pcs: int
-
-
+    source: Optional[str] = None
 
 
 
