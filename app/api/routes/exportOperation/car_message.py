@@ -4,7 +4,7 @@ import io
 import math
 from typing import Any, Optional
 
-from fastapi import APIRouter, Form, HTTPException, Query, UploadFile, File, Depends
+from fastapi import APIRouter, Body, Form, HTTPException, Query, UploadFile, File, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -17,9 +17,10 @@ from app.db.models.exportOperation.export_location_master import ExportLocations
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.session import get_db
 from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, AwbLookupError, AwbManualCreateRequest, AwbManualCreateResponse, CarMessageExcelExportRequest, CreateFlightBookingFromPdfResponse, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse, UltraFastScanRequest
+from app.schemas.exportOperation.uld_master import AddUldsRequest
 from app.schemas.user import UserRead
 from app.services.exportOperation.base_master import ultra_fast_scan_and_load
-from app.services.exportOperation.car_message import CategoryLiteral, build_car_message_excel, close_per_uld__per_flight_service, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_awb_data_for_export, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_dashboard_drilldown_detail_v2, get_dashboard_stats_v2, get_flight_awb_breakdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_history, get_flight_particular_flight_detail, get_flight_uld_loading_status, get_flights_by_date, get_loading_sheet_report_service, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, get_uld_sequences_of_particular_flight, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, scan_item_into_uld, unlock_per_uld_service, upsert_flight_booking_from_pdf, verify_uld_for_loading
+from app.services.exportOperation.car_message import CategoryLiteral, assign_ulds_to_flight_mobile, build_car_message_excel, close_per_uld__per_flight_service, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_awb_data_for_export, get_awb_missing_sequence_status, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_dashboard_drilldown_detail_v2, get_dashboard_stats_v2, get_flight_awb_breakdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_history, get_flight_particular_flight_detail, get_flight_uld_loading_status, get_flights_by_date, get_latest_uld_assignment_service, get_loading_sheet_form_history_service, get_loading_sheet_form_service, get_loading_sheet_report_service, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, get_uld_sequences_of_particular_flight, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, save_loading_sheet_form_service, scan_item_into_uld, trace_sequence_full_info, unlock_per_uld_service, upsert_flight_booking_from_pdf, verify_uld_for_loading
 from app.services.export_slot_file_upload_service import get_utc_now
 from app.utils.exportOperation.car_message import clean_car_message
 from app.utils.exportOperation.extract_flight_planning_data import extract_flight_planning
@@ -1295,6 +1296,17 @@ async def unlock_uld(
         unlocked_by=current_user.emp_id,
     )
 
+@router.get("/uld/{uld_no}/get-latest-uld-assignment")
+async def get_latest_close_uld_assignment(
+    uld_no: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    return await get_latest_uld_assignment_service(
+        db=db,
+        uld_no=uld_no,
+    )
+
 # ========================== FIGHT HISTORY RELATED ROUTES =======================================
 
 @router.get("/flight/by-date-for-history", 
@@ -1335,4 +1347,207 @@ async def get_loading_sheet(
         db,
         flight_id,
         uld_detail_id
+    )
+
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SAVE — POST /loading-sheet-form/save
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@router.post("/loading-sheet-form/save")
+async def save_loading_sheet_form(
+    flight_id: int = Body(...),
+    uld_detail_id: int = Body(...),
+    form_data: dict = Body(...),
+    
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user)
+):
+    """
+    Save (or update) the loading sheet form for a Flight + ULD combo.
+ 
+    Request body:
+    ```json
+    {
+        "flight_id": 14,
+        "uld_detail_id": 19,
+        "saved_by": "523520",
+        "form_data": {
+            "operational": { ... },
+            "user_input": { ... }
+        }
+    }
+    ```
+ 
+    - First save → creates new row + first history entry
+    - Subsequent saves → updates live row + appends new history entry
+    - API snapshot is auto-captured at save time for audit trail
+    """
+    result = await save_loading_sheet_form_service(
+        db=db,
+        flight_id=flight_id,
+        uld_detail_id=uld_detail_id,
+        form_data=form_data,
+        saved_by=current_user.emp_id,
+    )
+    return result
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+#  LOAD — GET /get-saved/loading-sheet-form-data/{flight_id}/{uld_detail_id}
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@router.get("/get-saved/loading-sheet-form-data/{flight_id}/{uld_detail_id}")
+async def get_loading_sheet_form(
+    flight_id: int,
+    uld_detail_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Load the saved loading sheet form for a Flight + ULD combo.
+ 
+    Returns:
+    ```json
+    {
+        "is_saved": true,
+        "form_data": { "operational": {...}, "user_input": {...} },
+        "last_saved_at": "2026-04-29T16:30:00+05:30",
+        "last_saved_by": "523520"
+    }
+    ```
+ 
+    If no form was saved yet:
+    ```json
+    {
+        "is_saved": false,
+        "form_data": null,
+        "last_saved_at": null,
+        "last_saved_by": null
+    }
+    ```
+    """
+    result = await get_loading_sheet_form_service(
+        db=db,
+        flight_id=flight_id,
+        uld_detail_id=uld_detail_id,
+    )
+    return result
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+#  HISTORY — GET /loading-sheet-form/{flight_id}/{uld_detail_id}/history
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@router.get("/loading-sheet-form/{flight_id}/{uld_detail_id}/history")
+async def get_loading_sheet_form_history(
+    flight_id: int,
+    uld_detail_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get the complete save history for a loading sheet form.
+    Returns all snapshots, newest first.
+ 
+    Each entry contains:
+    - `form_data`: what the form looked like at that save
+    - `api_snapshot`: what the API returned at that moment
+    - `saved_at`: when the save happened
+    - `saved_by`: who saved it
+    - `save_type`: "first" | "manual" | "auto"
+ 
+    Example response:
+    ```json
+    [
+        {
+            "id": 12,
+            "form_data": { "operational": {...}, "user_input": {...} },
+            "api_snapshot": { "flight_info": {...}, "awb_list": [...], ... },
+            "saved_at": "2026-04-29T16:45:00+05:30",
+            "saved_by": "523520",
+            "save_type": "manual"
+        },
+        {
+            "id": 8,
+            "form_data": { ... },
+            "api_snapshot": { ... },
+            "saved_at": "2026-04-29T16:30:00+05:30",
+            "saved_by": "523520",
+            "save_type": "first"
+        }
+    ]
+    ```
+    """
+    result = await get_loading_sheet_form_history_service(
+        db=db,
+        flight_id=flight_id,
+        uld_detail_id=uld_detail_id,
+    )
+    return result
+ 
+
+
+
+@router.post(
+    "/flight/{flight_header_id}/uld-assignment/assign-ulds/mobile",
+    response_model=UldAssignmentResponse,
+)
+async def assign_ulds_to_flight_mobile_route(
+    flight_header_id: int,
+    payload: AddUldsRequest,           # { uld_ids: List[int] }
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    
+    print(f"assign_ulds_to_flight_mobile_route called with: flight_header_id={flight_header_id}, payload={payload}")
+    return await assign_ulds_to_flight_mobile(
+        db=db,
+        flight_header_id=flight_header_id,
+        uld_ids=payload.uld_ids,
+        uld_detail_ids_to_remove=payload.uld_detail_ids_to_remove,  # NEW: list of uld_detail_ids to unassign
+        performed_by=current_user.emp_id,
+    )
+
+
+
+@router.get("/awb/{awb_no}/missing-sequence-status")
+async def fetch_awb_sequence_status_route(
+    awb_no: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    """
+    Get sequence number status for an AWB:
+      - loaded:       scanned and loaded on a ULD
+      - scanned_only: scanned but not yet loaded
+      - missing:      in valid pcs range but never scanned
+      - extra:        scanned but outside the valid pcs range (data sanity)
+    """
+    print(f"fetch_awb_sequence_status_route called with: awb_no={awb_no}")
+    return await get_awb_missing_sequence_status(
+        db=db,
+        awb_no=awb_no.strip().upper(),
+    )
+
+
+@router.get("/trace-skid-flight-by-seq/{sequence_no}")
+async def trace_sequence_route(
+    sequence_no: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    """
+    Trace a sequence_no:
+      - Which skid it was scanned onto
+      - Which flight it was actually loaded onto (if loaded on ULD)
+      - All booked/candidate flights for the AWB (AWB may split across flights)
+    Each flight includes its departure datetime (flight_dpt_datetime in UTC).
+    """
+    print(f"trace_sequence_route called with: sequence_no={sequence_no}")
+    return await trace_sequence_full_info(
+        db=db,
+        sequence_no=sequence_no.strip().upper(),
     )
