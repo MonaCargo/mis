@@ -3,15 +3,15 @@
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 import re
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 from fastapi import status
 from zoneinfo import ZoneInfo
-
+from sqlalchemy.orm import joinedload
 from fastapi import HTTPException
 import openpyxl
 import pytz
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import and_, case, distinct, func, or_, select, text, update
+from sqlalchemy import and_, case, desc, distinct, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from app.api.routes.domesticOperation.domestic_xray_report import convert_ist_day_to_utc_range
 from app.db.models.exportOperation.car_message import (
@@ -30,6 +30,7 @@ from app.db.models.exportOperation.export_base_master import ExportBaseMaster
 from app.db.models.exportOperation.export_carrier_master import ExportCarrierMaster
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
+from app.db.models.exportOperation.export_uld_loading_sheet_form import ExportLoadingSheetForm, ExportLoadingSheetFormHistoryLog
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.db.models.user import User
 from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AwbChangeRecord, AwbDaySummary, AwbLoadingStatusItem, AwbLookupError, AwbManualCreateRequest, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightBookingDetailResponse, FlightBookingDetailWithAwbResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, ScanItemIntoUldRequest, ScanItemIntoUldResponse, ScanItemResult, ScanningDaySummary, SkidDaySummary, UldAssignmentDataResponse, UldAssignmentDetailResponse, UldAssignmentResponse, UldLoadingStatusItem, UldMasterResponse, UldVerifyForLoadingResponse
@@ -2480,8 +2481,86 @@ async def edit_uld_assignment(
         message=f"ULD assignment updated for flight {header.flight_no}",
         data=data,
     )
+
 # ============ END ULD =========================
 
+# -----==== Assign new uld to flight by mobile or hst (we reuse edit_uld_assignment) -----=========
+
+# async def add_ulds_to_particular_flight_in_mobile(db, assignment_id, uld_ids, added_by):
+#     payload = EditUldAssignmentRequest(
+#         uld_ids_to_add=uld_ids,
+#         uld_detail_ids_to_remove=[],
+#     )
+#     return await edit_uld_assignment(db, assignment_id, payload, added_by)
+
+
+# -----==== Mobile: Assign ULDs to flight (auto create or edit) -----=========
+async def assign_ulds_to_flight_mobile(
+    db: AsyncSession,
+    flight_header_id: int,
+    uld_ids: list[int],
+    uld_detail_ids_to_remove: list[int],
+    performed_by: str,
+) -> UldAssignmentResponse:
+
+    # validate flight
+    flight = await db.get(ExportFlightBookingHeader, flight_header_id)
+    if not flight or not flight.is_active:
+        raise HTTPException(status_code=404, detail="Flight not found")
+
+    # must do at least one action
+    if not uld_ids and not uld_detail_ids_to_remove:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one ULD to add or remove",
+        )
+
+    # check if assignment already exists for this flight
+    existing = await db.execute(
+        select(ExportUldAssignment.id).where(
+            ExportUldAssignment.flight_header_id == flight_header_id,
+            ExportUldAssignment.is_active == True,
+        )
+    )
+    assignment_id = existing.scalar_one_or_none()
+
+    # ── CREATE MODE — no assignment yet ────────────────────
+    if assignment_id is None:
+        # can't remove from nothing
+        if uld_detail_ids_to_remove:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot remove ULDs — no assignment exists for this flight yet",
+            )
+
+        # must have ULDs to add when creating
+        if not uld_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide uld_ids to create assignment",
+            )
+
+        payload = CreateUldAssignmentRequest(
+            flight_header_id=flight_header_id,
+            uld_ids=uld_ids,
+        )
+        return await create_uld_assignment(
+            db=db,
+            payload=payload,
+            assigned_by=performed_by,
+        )
+
+    # ── EDIT MODE — assignment exists, add and/or remove ───
+    payload = EditUldAssignmentRequest(
+        uld_ids_to_add=uld_ids,
+        uld_detail_ids_to_remove=uld_detail_ids_to_remove,
+    )
+    return await edit_uld_assignment(
+        db=db,
+        assignment_id=assignment_id,
+        payload=payload,
+        edited_by=performed_by,
+    )
 
 # ======================✌️Skid Retrival from location ===================
 async def get_flights_by_date(
@@ -7109,7 +7188,13 @@ async def unlock_per_uld_service(
     
         # ── get flight id ──────────────────────
     assignment = await db.get(ExportUldAssignment, uld.assignment_id)
+    if not assignment:
+        raise HTTPException(404, "ULD assignment not found")
     flight_id = assignment.flight_header_id
+
+    # ── ✅ get ULD number from master ──────
+    uld_master = await db.get(ExportUldMaster, uld.uld_id)
+    uld_no = uld_master.uld_no if uld_master else "UNKNOWN"
 
     loaded_count = await db.scalar(
     select(func.count(ExportSequenceItemUldLoading.id))
@@ -7129,20 +7214,20 @@ async def unlock_per_uld_service(
         flight_reference_id=flight_id,  # or actual flight_id if needed
          module=CarMessageFlowModule.ULD_CLOSE_OPEN,
         flow_step="ULD_OPEN",
-        record_id=uld.id,
+        record_id=uld.id, # detail id
         action="UPDATE",
         performed_by=unlocked_by,
-         changes={
-           "event":"ULD_OPEN",
+        changes={
+            "event": "ULD_OPEN",
             "is_closed": False,
-            "closed_by": "",
-            "closed_at": ""
+            "closed_by": None,
+            "closed_at": None,
         },
-        note=(
-            f"ULD {uld.id} unlocked by {unlocked_by}. "
-            f"Previously locked by {previous_closed_by} at {previous_closed_at} (utc time)."
+          note=(
+            f"ULD {uld_no} (detail id: {uld.id}) unlocked by {unlocked_by}. "
+            f"Previously locked by {previous_closed_by} at {previous_closed_at} (utc time). "
             f"Items inside: {loaded_count}"
-        ),
+        )
     )
 
     await db.commit()
@@ -7150,11 +7235,102 @@ async def unlock_per_uld_service(
     return {
         "success": True,
         "message": "ULD unlocked successfully",
-        "uld_id": uld_assignment_detail_id,
+        "uld_id": uld_assignment_detail_id
     }
 
 
+async def get_latest_uld_assignment_service(
+    db: AsyncSession,
+    uld_no: str,
+) -> dict:
+    """
+    Search a ULD by uld_no and return its latest flight assignment.
+    
+    Response cases:
+      - 404: ULD not found in master
+      - 200 + is_assigned=False: ULD exists but never assigned to any flight
+      - 200 + is_assigned=True + assignment details: ULD found with latest assignment
+    """
 
+    # 1. Check ULD exists in master
+    uld_result = await db.execute(
+        select(ExportUldMaster).where(ExportUldMaster.uld_no == uld_no)
+    )
+    uld = uld_result.scalar_one_or_none()
+
+    if not uld:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"ULD '{uld_no}' not found in the system.",
+        )
+
+    # 2. Look for the latest assignment detail for this ULD
+    detail_result = await db.execute(
+        select(ExportUldAssignmentDetail)
+        .where(ExportUldAssignmentDetail.uld_id == uld.id)
+        .order_by(ExportUldAssignmentDetail.id.desc())  # latest by id
+        .limit(1)
+    )
+    detail = detail_result.scalar_one_or_none()
+
+    # ── CASE: ULD exists but never assigned ────────────────
+    if not detail:
+        return {
+            "is_assigned": False,
+            "uld_id": uld.id,
+            "uld_no": uld.uld_no,
+            "uld_type": getattr(uld, "uld_type", None),
+            "carrier": getattr(uld, "carrier", None),
+            "message": "This ULD has never been assigned to any flight.",
+        }
+
+    # 3. Fetch the assignment + flight header for this detail
+    assignment_result = await db.execute(
+        select(ExportUldAssignment).where(
+            ExportUldAssignment.id == detail.assignment_id
+        )
+    )
+    assignment = assignment_result.scalar_one_or_none()
+
+    flight = None
+    if assignment:
+        flight_result = await db.execute(
+            select(ExportFlightBookingHeader).where(
+                ExportFlightBookingHeader.id == assignment.flight_header_id
+            )
+        )
+        flight = flight_result.scalar_one_or_none()
+
+    # 4. ✅ Fetch the user name of the person who closed this ULD
+    closed_by_person_name = None
+    if detail.closed_by:
+        user_result = await db.execute(
+            select(User.name).where(User.emp_id == detail.closed_by)
+        )
+        closed_by_person_name = user_result.scalar_one_or_none()
+
+
+    # ── CASE: Assigned ─────────────────────────────────────
+    return {
+        "is_assigned": True,
+        "uld_detail_id": detail.id,
+        "uld_id": uld.id,
+        "uld_no": uld.uld_no,
+        "uld_type": getattr(uld, "uld_type", None),
+        "carrier": getattr(uld, "carrier", None),
+        "assignment_id": detail.assignment_id,
+        "is_closed": detail.is_closed,
+        "closed_by": detail.closed_by,
+        "closed_by_person_name": closed_by_person_name,  
+        "closed_at": detail.closed_at,
+        "detail_created_at": detail.created_at,
+        "flight": {
+            "flight_header_id": flight.id if flight else None,
+            "flight_no": flight.flight_no if flight else None,
+            "flight_date": flight.flight_date if flight else None,
+            "flight_dpt_datetime": flight.flight_dpt_datetime if flight else None,
+        } if flight else None,
+    }
 
 # ============================== ✈️✈️FIGHT HISTORY RELATED ROUTES======================
 
@@ -8856,7 +9032,202 @@ async def get_dashboard_drilldown_detail_v2(
 
 
 
-    # ================================= LOADING SHEET REPORT =============================
+    # ================================= 🫥🫥 ULD LOADING SHEET REPORT =============================
+
+
+
+# async def get_loading_sheet_report_service(
+#     db: AsyncSession,
+#     flight_id: int,
+#     uld_detail_id: int
+# ):
+#     # ── 1. FLIGHT ─────────────────────────
+#     flight = await db.get(ExportFlightBookingHeader, flight_id)
+#     if not flight:
+#         raise HTTPException(404, "Flight not found")
+
+#     # ── 2. ULD DETAIL + ULD NO ───────────
+#     uld_result = await db.execute(
+#         select(
+#             ExportUldAssignmentDetail,
+#             ExportUldMaster.uld_no
+#         )
+#         .join(
+#             ExportUldMaster,
+#             ExportUldMaster.id == ExportUldAssignmentDetail.uld_id
+#         )
+#         .where(
+#             ExportUldAssignmentDetail.id == uld_detail_id
+#         )
+#     )
+
+#     uld_row = uld_result.first()
+#     if not uld_row:
+#         raise HTTPException(404, "ULD not found")
+
+#     uld_detail, uld_no = uld_row
+
+#     # ── 3. AWBs IN FLIGHT ────────────────
+#     result = await db.execute(
+#         select(
+#             ExportFlightBookingDetail,
+#             ExportCarMessageAwbMaster
+#         )
+#         .join(
+#             ExportCarMessageAwbMaster,
+#             ExportCarMessageAwbMaster.id == ExportFlightBookingDetail.awb_master_id
+#         )
+#         .where(
+#             ExportFlightBookingDetail.flight_header_id == flight_id
+#         )
+#     )
+
+#     rows = result.all()
+
+#     awb_list = []
+
+#     for detail, awb in rows:
+       
+#         total_awb_pcs = awb.pcs or 0
+
+#         gross_wt = awb.gross_wt or 0
+#         chg_wt = awb.chg_wt or 0
+
+#         # 🔥 PER ITEM
+#         per_item_gross = (gross_wt / total_awb_pcs) if total_awb_pcs > 0 else 0
+#         per_item_chg = (chg_wt / total_awb_pcs) if total_awb_pcs > 0 else 0
+
+#         # 🔥 BOOKED PCS WEIGHT
+#         booked_pcs = detail.booked_pcs or 0
+
+#         booked_gross = per_item_gross * booked_pcs
+#         booked_chg = per_item_chg * booked_pcs
+
+#         awb_list.append({
+#             "awb_no": awb.awb_no,
+#             "origin": awb.origin,
+#             "destination": awb.destination,
+
+#             "booked_pcs": booked_pcs,
+
+#             "gross_weight": gross_wt,
+#             "chargeable_weight": chg_wt,
+
+#             "per_item_gross_weight": round(per_item_gross, 2),
+#             "per_item_chargeable_weight": round(per_item_chg, 2),
+
+#             "booked_pcs_gross_wt": round(booked_gross, 2),
+#             "booked_pcs_chargeable_wt": round(booked_chg, 2),
+#            "shc": awb.shc,
+#         })
+
+#     # ── 4. LOADING USERS (WHO LOADED THIS ULD) ─────────
+#     user_result = await db.execute(
+#         select(
+#             ExportSequenceItemUldLoading.loaded_by,
+#             User.name
+#         )
+#         .join(
+#             User,
+#             User.emp_id == ExportSequenceItemUldLoading.loaded_by
+#         )
+#         .where(
+#             ExportSequenceItemUldLoading.flight_header_id == flight_id,
+#             ExportSequenceItemUldLoading.uld_assignment_detail_id == uld_detail_id
+#         )
+#         .distinct()
+#     )
+
+#     users = [
+#         {
+#             "emp_id": u.emp_id if hasattr(u, "emp_id") else u[0],
+#             "name": u.name if hasattr(u, "name") else u[1],
+#         }
+#         for u in user_result.fetchall()
+#     ]
+
+
+#     # ── 5. LOADING START / END TIME ─────────
+#     loading_time_result = await db.execute(
+#         select(
+#             func.min(ExportSequenceItemUldLoading.loaded_at),
+#             func.max(ExportSequenceItemUldLoading.loaded_at)
+#         )
+#         .where(
+#             ExportSequenceItemUldLoading.flight_header_id == flight_id,
+#             ExportSequenceItemUldLoading.uld_assignment_detail_id == uld_detail_id
+#         )
+#     )
+
+#     loading_start_time, loading_end_time = loading_time_result.first()
+
+#     if not loading_start_time:
+#         loading_start_time = None
+#         loading_end_time = None
+
+
+#     # ── 6. BASES FOR THIS ULD ON THIS FLIGHT ─────────
+#     base_result = await db.execute(
+#         select(
+#             ExportBaseMaster.id.label("base_id"),
+#            ExportBaseMaster.base_name,
+#             func.min(ExportSkidBaseMapping.dropped_at).label("dropped_at"),
+#         )
+#         .join(
+#             ExportSkidBaseMapping,
+#             ExportSkidBaseMapping.base_id == ExportBaseMaster.id,
+#         )
+#         .where(
+#             ExportSkidBaseMapping.mapping_id.in_(
+#                 select(ExportSequenceItemUldLoading.mapping_id)
+#                 .where(
+#                     ExportSequenceItemUldLoading.flight_header_id == flight_id,
+#                     ExportSequenceItemUldLoading.uld_assignment_detail_id == uld_detail_id,
+#                 )
+#                 .distinct()
+#             )
+#         )
+#         .group_by(ExportBaseMaster.id, ExportBaseMaster.base_name)
+#         .order_by(func.min(ExportSkidBaseMapping.dropped_at))
+#     )
+
+#     bases = [
+#         {
+#             "base_id": row.base_id,
+#             "base_name": row.base_name,
+#             "dropped_at": row.dropped_at,
+#         }
+#         for row in base_result.all()
+#     ]
+
+#     # ── FINAL RESPONSE ───────────────────
+#     return {
+#         "flight_info": {
+#             "flight_id": flight.id,
+#             "flight_no": flight.flight_no,
+#             "flight_date": str(flight.flight_date),
+#             "departure": flight.flight_dpt_datetime,
+#         },
+
+#         "uld_info": {
+#             "uld_detail_id": uld_detail.id,
+#             "uld_no": uld_no,
+#             "is_closed": uld_detail.is_closed,
+           
+#         },
+#         "loadingInfo":{
+#              "loading_start_time": loading_start_time,
+#             "loading_end_time": loading_end_time,
+#         },
+
+#          "bases": bases, 
+
+#         "loaded_users": users,
+
+#         "awb_list": awb_list
+#     }
+
+
 
 
 
@@ -8891,18 +9262,32 @@ async def get_loading_sheet_report_service(
 
     uld_detail, uld_no = uld_row
 
-    # ── 3. AWBs IN FLIGHT ────────────────
+    # ── 3. AWBs LOADED INTO THIS SPECIFIC ULD ────────────────
+    # 🔥 KEY CHANGE: Only fetch AWBs that were actually loaded into THIS ULD on THIS flight.
+    # Previously we filtered by flight only, which returned ALL booked AWBs regardless of ULD.
+    # Now we join with ExportSequenceItemUldLoading to count actual pieces loaded into this ULD.
     result = await db.execute(
         select(
             ExportFlightBookingDetail,
-            ExportCarMessageAwbMaster
+            ExportCarMessageAwbMaster,
+            func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
         )
         .join(
             ExportCarMessageAwbMaster,
-            ExportCarMessageAwbMaster.id == ExportFlightBookingDetail.awb_master_id
+            ExportCarMessageAwbMaster.id == ExportFlightBookingDetail.awb_master_id,
+        )
+        .join(
+            ExportSequenceItemUldLoading,
+            ExportSequenceItemUldLoading.awb_master_id == ExportCarMessageAwbMaster.id,
         )
         .where(
-            ExportFlightBookingDetail.flight_header_id == flight_id
+            ExportFlightBookingDetail.flight_header_id == flight_id,
+            ExportSequenceItemUldLoading.flight_header_id == flight_id,
+            ExportSequenceItemUldLoading.uld_assignment_detail_id == uld_detail_id,
+        )
+        .group_by(
+            ExportFlightBookingDetail.id,
+            ExportCarMessageAwbMaster.id,
         )
     )
 
@@ -8910,8 +9295,7 @@ async def get_loading_sheet_report_service(
 
     awb_list = []
 
-    for detail, awb in rows:
-       
+    for detail, awb, loaded_pcs in rows:
         total_awb_pcs = awb.pcs or 0
 
         gross_wt = awb.gross_wt or 0
@@ -8921,18 +9305,20 @@ async def get_loading_sheet_report_service(
         per_item_gross = (gross_wt / total_awb_pcs) if total_awb_pcs > 0 else 0
         per_item_chg = (chg_wt / total_awb_pcs) if total_awb_pcs > 0 else 0
 
-        # 🔥 BOOKED PCS WEIGHT
-        booked_pcs = detail.booked_pcs or 0
+        # 🔥 USE ACTUAL LOADED PCS (count of items physically scanned into this ULD)
+        actual_pcs = loaded_pcs or 0
 
-        booked_gross = per_item_gross * booked_pcs
-        booked_chg = per_item_chg * booked_pcs
+        loaded_gross = per_item_gross * actual_pcs
+        loaded_chg = per_item_chg * actual_pcs
 
         awb_list.append({
             "awb_no": awb.awb_no,
+             "id": awb.id,
             "origin": awb.origin,
             "destination": awb.destination,
 
-            "booked_pcs": booked_pcs,
+            "booked_pcs": detail.booked_pcs,         # what was booked on the flight
+            "loaded_pcs": actual_pcs,                # what's actually loaded into THIS ULD
 
             "gross_weight": gross_wt,
             "chargeable_weight": chg_wt,
@@ -8940,8 +9326,11 @@ async def get_loading_sheet_report_service(
             "per_item_gross_weight": round(per_item_gross, 2),
             "per_item_chargeable_weight": round(per_item_chg, 2),
 
-            "booked_pcs_gross_wt": round(booked_gross, 2),
-            "booked_pcs_chargeable_wt": round(booked_chg, 2),
+            # 🔥 Weight totals now based on ACTUALLY LOADED pcs (not booked)
+            "booked_pcs_gross_wt": round(loaded_gross, 2),
+            "booked_pcs_chargeable_wt": round(loaded_chg, 2),
+
+            "shc": awb.shc,
         })
 
     # ── 4. LOADING USERS (WHO LOADED THIS ULD) ─────────
@@ -8969,7 +9358,6 @@ async def get_loading_sheet_report_service(
         for u in user_result.fetchall()
     ]
 
-
     # ── 5. LOADING START / END TIME ─────────
     loading_time_result = await db.execute(
         select(
@@ -8988,6 +9376,42 @@ async def get_loading_sheet_report_service(
         loading_start_time = None
         loading_end_time = None
 
+    # ── 6. BASES FOR THIS ULD ON THIS FLIGHT ─────────
+    # Get all distinct bases where cargo was staged before being loaded into this ULD.
+    # Path: ULD loadings → mapping_ids → base drops → bases
+    base_result = await db.execute(
+        select(
+            ExportBaseMaster.id.label("base_id"),
+            ExportBaseMaster.base_name,
+            func.min(ExportSkidBaseMapping.dropped_at).label("dropped_at"),
+        )
+        .join(
+            ExportSkidBaseMapping,
+            ExportSkidBaseMapping.base_id == ExportBaseMaster.id,
+        )
+        .where(
+            ExportSkidBaseMapping.mapping_id.in_(
+                select(ExportSequenceItemUldLoading.mapping_id)
+                .where(
+                    ExportSequenceItemUldLoading.flight_header_id == flight_id,
+                    ExportSequenceItemUldLoading.uld_assignment_detail_id == uld_detail_id,
+                )
+                .distinct()
+            )
+        )
+        .group_by(ExportBaseMaster.id, ExportBaseMaster.base_name)
+        .order_by(func.min(ExportSkidBaseMapping.dropped_at))
+    )
+
+    bases = [
+        {
+            "base_id": row.base_id,
+            "base_name": row.base_name,
+            "dropped_at": row.dropped_at,
+        }
+        for row in base_result.all()
+    ]
+
     # ── FINAL RESPONSE ───────────────────
     return {
         "flight_info": {
@@ -9001,14 +9425,474 @@ async def get_loading_sheet_report_service(
             "uld_detail_id": uld_detail.id,
             "uld_no": uld_no,
             "is_closed": uld_detail.is_closed,
-           
         },
-        "loadingInfo":{
-             "loading_start_time": loading_start_time,
+
+        "loadingInfo": {
+            "loading_start_time": loading_start_time,
             "loading_end_time": loading_end_time,
         },
+
+        "bases": bases,
 
         "loaded_users": users,
 
         "awb_list": awb_list
+    }
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SAVE — upsert live form + append history log
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+async def save_loading_sheet_form_service(
+    db: AsyncSession,
+    flight_id: int,
+    uld_detail_id: int,
+    form_data: dict,
+    saved_by: str,
+):
+    """
+    Saves the complete loading sheet form data.
+ 
+    - Upserts the live row in `export_loading_sheet_form`
+    - Appends an immutable snapshot in `export_loading_sheet_form_history_log`
+    - Re-fetches current API data to store as `api_snapshot` in history
+ 
+    Args:
+        db: async database session
+        flight_id: FK to export_flight_booking_header.id
+        uld_detail_id: FK to export_uld_assignment_detail.id
+        form_data: complete form snapshot (both operational + user_input sections)
+        saved_by: emp_id of the user saving
+    """
+ 
+    # ── 1. Capture current API state as snapshot ──────────────
+    #    This lets us trace "what did the API say when the user clicked Save?"
+    try:
+        api_snapshot = await get_loading_sheet_report_service(
+            db, flight_id, uld_detail_id
+        )
+        # Convert datetime objects to strings for JSON serialization
+        api_snapshot = _serialize_snapshot(api_snapshot)
+    except Exception:
+        # If API fetch fails, still save the form — just skip snapshot
+        api_snapshot = None
+ 
+    # ── 2. Upsert live form row ──────────────────────────────
+    stmt = (
+        insert(ExportLoadingSheetForm)
+        .values(
+            flight_header_id=flight_id,
+            uld_assignment_detail_id=uld_detail_id,
+            form_data=form_data,
+            created_by=saved_by,
+            updated_by=saved_by,
+        )
+        .on_conflict_do_update(
+            index_elements=["flight_header_id", "uld_assignment_detail_id"],
+            set_=dict(
+                form_data=form_data,
+                updated_by=saved_by,
+                updated_at=func.now(),
+            ),
+        )
+        .returning(ExportLoadingSheetForm.id)
+    )
+ 
+    result = await db.execute(stmt)
+    form_row_id = result.scalar_one()
+ 
+    # ── 3. Determine save type ───────────────────────────────
+    #    Check if history exists for this form — if not, it's the first save
+    history_count_result = await db.execute(
+        select(func.count(ExportLoadingSheetFormHistoryLog.id)).where(
+            ExportLoadingSheetFormHistoryLog.loading_sheet_form_id == form_row_id
+        )
+    )
+    history_count = history_count_result.scalar_one()
+    save_type = "first" if history_count == 0 else "manual"
+ 
+    # ── 4. Append history log row (immutable) ────────────────
+    history = ExportLoadingSheetFormHistoryLog(
+        loading_sheet_form_id=form_row_id,
+        flight_header_id=flight_id,
+        uld_assignment_detail_id=uld_detail_id,
+        form_data=form_data,
+        api_snapshot=api_snapshot,
+        saved_by=saved_by,
+        save_type=save_type,
+    )
+    db.add(history)
+ 
+    await db.commit()
+ 
+    return {
+        "form_id": form_row_id,
+        "save_type": save_type,
+        "message": "Loading sheet form saved successfully",
+    }
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+#  LOAD — get saved form data for a flight + ULD
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+async def get_loading_sheet_form_service(
+    db: AsyncSession,
+    flight_id: int,
+    uld_detail_id: int,
+):
+    """
+    Loads the saved loading sheet form for a Flight + ULD combo.
+ 
+    Returns:
+        - saved form_data if exists
+        - metadata (is_saved, last_saved_at, last_saved_by)
+        - None if no form was saved yet
+    """
+ 
+    result = await db.execute(
+        select(ExportLoadingSheetForm).where(
+            ExportLoadingSheetForm.flight_header_id == flight_id,
+            ExportLoadingSheetForm.uld_assignment_detail_id == uld_detail_id,
+        )
+    )
+ 
+    saved_form = result.scalar_one_or_none()
+ 
+    if not saved_form:
+        return {
+            "is_saved": False,
+            "form_data": None,
+            "last_saved_at": None,
+            "last_saved_by": None,
+        }
+ 
+    return {
+        "is_saved": True,
+        "form_data": saved_form.form_data,
+        "last_saved_at": saved_form.updated_at,
+        "last_saved_by": saved_form.updated_by,
+    }
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+#  HISTORY — get all save snapshots for a flight + ULD
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+async def get_loading_sheet_form_history_service(
+    db: AsyncSession,
+    flight_id: int,
+    uld_detail_id: int,
+):
+    """
+    Returns the complete save history for a loading sheet form.
+    Results are ordered by newest first.
+    """
+ 
+    result = await db.execute(
+        select(ExportLoadingSheetFormHistoryLog)
+        .where(
+            ExportLoadingSheetFormHistoryLog.flight_header_id == flight_id,
+            ExportLoadingSheetFormHistoryLog.uld_assignment_detail_id == uld_detail_id,
+        )
+        .order_by(ExportLoadingSheetFormHistoryLog.saved_at.desc())
+    )
+ 
+    history_rows = result.scalars().all()
+ 
+    return [
+        {
+            "id": row.id,
+            "form_data": row.form_data,
+            "api_snapshot": row.api_snapshot,
+            "saved_at": row.saved_at,
+            "saved_by": row.saved_by,
+            "save_type": row.save_type,
+        }
+        for row in history_rows
+    ]
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+#  HELPER — serialize datetime objects in API snapshot for JSONB storage
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def _serialize_snapshot(data):
+    """
+    Recursively converts datetime objects to ISO strings
+    so the dict is JSON-serializable for JSONB storage.
+    """
+    import datetime
+ 
+    if isinstance(data, dict):
+        return {k: _serialize_snapshot(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [_serialize_snapshot(item) for item in data]
+    elif isinstance(data, (datetime.datetime, datetime.date)):
+        return data.isoformat()
+    else:
+        return data
+ 
+
+#  ========----------- 🫥 end of uld loading sheet report ----------=================
+
+
+# ✅ Get missing sequence numbers for an AWB, categorized by loaded vs scanned-only vs missing
+
+async def get_awb_missing_sequence_status(
+    db: AsyncSession,
+    awb_no: str,
+) -> Dict:
+    """
+    For a given AWB no, return 3 lists of sequence numbers:
+      1. loaded         -> scanned AND loaded on a ULD
+      2. scanned_only   -> scanned but not yet loaded on a ULD
+      3. missing        -> in valid pcs range (00001..pcs) but never scanned
+      4. extra          -> scanned but outside the valid pcs range (sanity)
+
+    Sequence no format: {awb_no(11)}{piece_no(5-digit zero-padded)} = 16 chars
+    """
+
+    # 1. Fetch AWB master
+    result = await db.execute(
+        select(ExportCarMessageAwbMaster).where(
+            ExportCarMessageAwbMaster.awb_no == awb_no
+        )
+    )
+    awb = result.scalar_one_or_none()
+
+    if not awb:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"AWB {awb_no} not found",
+        )
+
+    # 2. Determine total pcs (fallback to manual_pcs)
+    total_pcs = awb.pcs if awb.pcs is not None else awb.manual_pcs
+
+    if total_pcs is None or total_pcs <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"AWB {awb_no} has no valid pcs count",
+        )
+
+    # 3. Get all scanned sequences for this AWB
+    scanned_result = await db.execute(
+        select(
+            ExportAwbSkidItemSequence.id,
+            ExportAwbSkidItemSequence.sequence_no,
+        ).where(ExportAwbSkidItemSequence.awb_master_id == awb.id)
+    )
+    scanned_rows = scanned_result.all()
+
+    scanned_seq_map = {row.id: row.sequence_no for row in scanned_rows}
+    scanned_ids = set(scanned_seq_map.keys())
+    scanned_seq_set = set(scanned_seq_map.values())
+
+    # 4. Get loaded sequence ids (those that appear in uld loading table)
+    loaded_seq_ids: set = set()
+    if scanned_ids:
+        loaded_result = await db.execute(
+            select(ExportSequenceItemUldLoading.sequence_id).where(
+                ExportSequenceItemUldLoading.sequence_id.in_(scanned_ids)
+            )
+        )
+        loaded_seq_ids = {row.sequence_id for row in loaded_result.all()}
+
+    # 5. Split scanned into loaded vs scanned-only
+    loaded = sorted(
+        scanned_seq_map[sid] for sid in scanned_ids if sid in loaded_seq_ids
+    )
+    scanned_only = sorted(
+        scanned_seq_map[sid] for sid in scanned_ids if sid not in loaded_seq_ids
+    )
+
+    # 6. Build expected set and find missing
+    expected_seq_set = {
+        f"{awb_no}{str(i).zfill(5)}" for i in range(1, total_pcs + 1)
+    }
+    missing = sorted(expected_seq_set - scanned_seq_set)
+
+    # 7. Sanity: sequences scanned outside expected range
+    extra = sorted(scanned_seq_set - expected_seq_set)
+
+    return {
+        "awb_no": awb_no,
+        "total_pcs": total_pcs,
+        "summary": {
+            "loaded_count": len(loaded),
+            "scanned_only_count": len(scanned_only),
+            "missing_count": len(missing),
+            "extra_count": len(extra),
+        },
+        "loaded": loaded,
+        "scanned_only": scanned_only,
+        "missing": missing,
+        "extra": extra,
+    }
+
+
+# 🫥 Get The trace info of sequance that Inwhich skid is belong which Flight It booked and If loaded then which Flight and when it is loaded on ULD
+async def trace_sequence_full_info(db: AsyncSession, sequence_no: str) -> dict:
+    """
+    Given a sequence_no, return:
+      - sequence info
+      - AWB info
+      - skid info (real or virtual)
+      - actual loaded flight + departure datetime (if loaded on ULD)
+      - all booked/candidate flights + departure datetimes
+    """
+
+    # ─────────────────────────────────────────────────────────────
+    # 1. Find the sequence row
+    # ─────────────────────────────────────────────────────────────
+    stmt = select(ExportAwbSkidItemSequence).where(
+        ExportAwbSkidItemSequence.sequence_no == sequence_no
+    )
+    result = await db.execute(stmt)
+    sequence = result.scalar_one_or_none()
+
+    if not sequence:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sequence no '{sequence_no}' not found.",
+        )
+
+    # ─────────────────────────────────────────────────────────────
+    # 2. Get AWB
+    # ─────────────────────────────────────────────────────────────
+    stmt = select(ExportCarMessageAwbMaster).where(
+        ExportCarMessageAwbMaster.id == sequence.awb_master_id
+    )
+    result = await db.execute(stmt)
+    awb = result.scalar_one_or_none()
+
+    if not awb:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"AWB not found for sequence '{sequence_no}'.",
+        )
+
+    # ─────────────────────────────────────────────────────────────
+    # 3. Get skid info via mapping
+    # ─────────────────────────────────────────────────────────────
+    stmt = select(ExportAwbSkidMapping).where(
+        ExportAwbSkidMapping.id == sequence.mapping_id
+    )
+    result = await db.execute(stmt)
+    mapping = result.scalar_one_or_none()
+
+    skid_info = None
+    if mapping:
+        if mapping.skid_id:
+            stmt = select(ExportSkidMaster).where(
+                ExportSkidMaster.id == mapping.skid_id
+            )
+            result = await db.execute(stmt)
+            skid = result.scalar_one_or_none()
+            if skid:
+                skid_info = {
+                    "skid_id": skid.id,
+                    "skid_no": skid.skid_no,
+                    "skid_type": skid.skid_type,
+                    "is_virtual": False,
+                    "mapping_id": mapping.id,
+                }
+        elif mapping.is_virtual and mapping.virtual_skid_no:
+            skid_info = {
+                "skid_id": None,
+                "skid_no": mapping.virtual_skid_no,
+                "skid_type": "virtual",
+                "is_virtual": True,
+                "mapping_id": mapping.id,
+            }
+
+    # ─────────────────────────────────────────────────────────────
+    # 4. Find the ACTUAL loaded flight (if piece is on ULD)
+    # ─────────────────────────────────────────────────────────────
+    loaded_flight_info = None
+    stmt = select(ExportSequenceItemUldLoading).where(
+        ExportSequenceItemUldLoading.sequence_id == sequence.id
+    )
+    result = await db.execute(stmt)
+    uld_loading = result.scalar_one_or_none()
+
+    if uld_loading:
+        stmt = select(ExportFlightBookingHeader).where(
+            ExportFlightBookingHeader.id == uld_loading.flight_header_id
+        )
+        result = await db.execute(stmt)
+        loaded_flight = result.scalar_one_or_none()
+
+        if loaded_flight:
+            loaded_flight_info = {
+                "flight_header_id": loaded_flight.id,
+                "flight_no": loaded_flight.flight_no,
+                "flight_date": loaded_flight.flight_date.isoformat()
+                    if loaded_flight.flight_date else None,
+                # ✅ Departure datetime (UTC with timezone)
+                "flight_dpt_datetime": loaded_flight.flight_dpt_datetime.isoformat()
+                    if loaded_flight.flight_dpt_datetime else None,
+                "loaded_by": uld_loading.loaded_by,
+                "loaded_at": uld_loading.loaded_at.isoformat()
+                    if uld_loading.loaded_at else None,
+                "status": "loaded_on_uld",
+            }
+
+    # ─────────────────────────────────────────────────────────────
+    # 5. Get ALL booked/candidate flights for this AWB
+    #    (AWB may split across multiple flights)
+    # ─────────────────────────────────────────────────────────────
+    stmt = (
+        select(ExportFlightBookingDetail, ExportFlightBookingHeader)
+        .join(
+            ExportFlightBookingHeader,
+            ExportFlightBookingDetail.flight_header_id == ExportFlightBookingHeader.id,
+        )
+        .where(ExportFlightBookingDetail.awb_master_id == awb.id)
+        .where(ExportFlightBookingHeader.is_active == True)
+        .order_by(ExportFlightBookingHeader.flight_dpt_datetime.asc())
+    )
+    result = await db.execute(stmt)
+    booked_flights_rows = result.all()
+
+    booked_flights = []
+    for detail, header in booked_flights_rows:
+        booked_flights.append({
+            "flight_header_id": header.id,
+            "flight_no": header.flight_no,
+            "flight_date": header.flight_date.isoformat() if header.flight_date else None,
+            # ✅ Departure datetime (UTC with timezone)
+            "flight_dpt_datetime": header.flight_dpt_datetime.isoformat()
+                if header.flight_dpt_datetime else None,
+            "booked_pcs": detail.booked_pcs,
+        })
+
+    # ─────────────────────────────────────────────────────────────
+    # 6. Final response
+    # ─────────────────────────────────────────────────────────────
+    return {
+        "sequence": {
+            "sequence_id": sequence.id,
+            "sequence_no": sequence.sequence_no,
+            "sequence_date_time": sequence.sequence_date_time.isoformat()
+                if sequence.sequence_date_time else None,
+            "scanned_by": sequence.scanned_by,
+            "scan_by_device": sequence.scan_by_device,
+        },
+        "awb": {
+            "awb_master_id": awb.id,
+            "awb_no": awb.awb_no,
+            "origin": awb.origin,
+            "destination": awb.destination,
+            "pcs": awb.pcs,
+            "gross_wt": awb.gross_wt,
+            "status": awb.status,
+        },
+        "skid": skid_info,
+        "loaded_flight": loaded_flight_info,
+        "booked_flights": booked_flights,
+        "is_loaded_on_uld": loaded_flight_info is not None,
     }

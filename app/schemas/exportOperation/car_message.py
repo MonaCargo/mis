@@ -406,6 +406,7 @@ class SequenceWithLoadingStatus(BaseModel):
 
 class FlightUldLoadingStatusResponse(APIResponseBase):
     flight_header_id: int
+    
     flight_no: str
     flight_date: date
     flight_dpt_datetime: datetime
