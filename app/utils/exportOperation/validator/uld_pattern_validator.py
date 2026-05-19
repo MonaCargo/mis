@@ -36,7 +36,7 @@ _R_PREFIXES = (
 def _build_patterns() -> List[UldPattern]:
     patterns: List[UldPattern] = [
         # ---- AI column (suffix "AI") ----
-        UldPattern("AKE", re.compile(r"^AKE\d{4}AI$"),     "AKE1234AI"),
+        UldPattern("AKE", re.compile(r"^AKE\d{4,5}AI$"),     "AKE12345AI"),
         UldPattern("PMC", re.compile(r"^PMC\d{4,5}AI$"),   "PMC12345AI"),
         UldPattern("PKC", re.compile(r"^PKC\d{4,5}AI$"),   "PKC12345AI"),
         UldPattern("PAG", re.compile(r"^PAG\d{4,5}AI$"),   "PAG12345AI"),

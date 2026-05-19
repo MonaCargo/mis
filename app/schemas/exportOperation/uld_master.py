@@ -100,3 +100,23 @@ class ExportUldListResponse(BaseModel):
 class ChangeCarrierBody(BaseModel):
     carrier: str = Field(..., min_length=2, max_length=20)
     remarks: Optional[str] = Field(None, max_length=500)
+
+
+# Used in Uld assignment by to particulr flight used in hst or mobile app
+class AddUldsRequest(BaseModel):
+    uld_ids: List[int] = Field(
+        ...,
+        description="List of ULD master IDs to add to the assignment",
+    )
+    uld_detail_ids_to_remove: List[int] = Field(
+        default_factory=list,
+        description="List of ULD assignment detail IDs to remove from the assignment",
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "uld_ids": [101,102],
+                "uld_detail_ids_to_remove": [55, 56],
+            }
+        }
