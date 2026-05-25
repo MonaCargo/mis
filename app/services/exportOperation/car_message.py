@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
+import io
 import re
 from typing import Dict, Literal, Optional
 from fastapi import status
@@ -3496,6 +3497,25 @@ async def scan_item_into_uld(
 ) -> ScanItemIntoUldResponse:
 
     now = get_utc_now()
+    IST = timezone(timedelta(hours=5, minutes=30))
+
+#     scanned_at_map: dict[str, datetime] = {
+#     item.sequence_no: item.scanned_at for item in payload.sequence_nos
+# }
+    scanned_at_map: dict[str, datetime] = {}
+    for item in payload.sequence_nos:
+        dt = item.scanned_at
+        
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        
+        converted = dt.astimezone(timezone.utc)
+        scanned_at_map[item.sequence_no] = converted
+
+    sequence_nos: list[str] = [item.sequence_no for item in payload.sequence_nos]
+
+    for seq_no, scanned_at in scanned_at_map.items():
+        print(f"Sequence {seq_no} scanned at {scanned_at.isoformat()} UTC")    
 
     # ── verify flight ──────────────────────────────────────
     flight = await db.get(ExportFlightBookingHeader, flight_header_id)
@@ -3552,7 +3572,7 @@ async def scan_item_into_uld(
             ExportAwbSkidItemSequence.awb_master_id,
             ExportAwbSkidItemSequence.sequence_no,
         )
-        .where(ExportAwbSkidItemSequence.sequence_no.in_(payload.sequence_nos))
+        .where(ExportAwbSkidItemSequence.sequence_no.in_(sequence_nos))
     )
     seq_map = {row.sequence_no: row for row in seq_result.mappings().all()}
 
@@ -3560,7 +3580,7 @@ async def scan_item_into_uld(
     normal_seq_nos: list[str] = []
     ultra_fast_by_awb: dict[int, list[str]] = {}
 
-    for seq_no in payload.sequence_nos:
+    for seq_no in sequence_nos:
         if seq_no in seq_map:
             # normal_seq_nos.append(seq_no)
             seq = seq_map[seq_no]
@@ -3703,7 +3723,7 @@ async def scan_item_into_uld(
             awb_master_id=seq.awb_master_id,
             mapping_id=seq.mapping_id,
             loaded_by=loaded_by,
-            loaded_at=now,
+            loaded_at=scanned_at_map[seq_no],  # ← frontend datetime
             created_at=now,
         ))
         results.append(ScanItemResult(
@@ -3869,7 +3889,8 @@ async def scan_item_into_uld(
                     awb_master_id=uf_awb_id,
                     mapping_id=mapping_id,
                     sequence_no=seq_no,
-                    sequence_date_time=now,
+                    # sequence_date_time=now,
+                    sequence_date_time=scanned_at_map[seq_no],  # ← frontend datetime
                     scanned_by=loaded_by,
                     scan_by_device="ULTRAFAST-ULD-GATE",
                 ))
@@ -3891,7 +3912,7 @@ async def scan_item_into_uld(
                         awb_master_id=uf_awb_id,
                         mapping_id=mapping_id,
                         loaded_by=loaded_by,
-                        loaded_at=now,
+                        loaded_at=scanned_at_map[s.sequence_no],  # ← frontend datetime
                         created_at=now,
                     )
                     for s in uf_to_insert_seqs
@@ -3918,7 +3939,7 @@ async def scan_item_into_uld(
         success=True,
         message=f"{total_loaded} loaded, {total_failed} failed",
         uld_no=uld_detail.uld_no,
-        total_submitted=len(payload.sequence_nos),
+        total_submitted=len(sequence_nos),
         total_loaded=total_loaded,
         total_failed=total_failed,
         results=results,
@@ -5885,7 +5906,7 @@ async def upsert_flight_booking_from_pdf(
                 skipped.append(AwbChangeRecord(
                     awb_no=awb_no,
                     action="SKIPPED",
-                    reason=f"AWB not eligible for booking (current status: {row.status})",
+                    reason=f"AWB not eligible for booking ( current status: {row.status})",
                 ))
                 continue
 
@@ -5973,7 +5994,7 @@ async def upsert_flight_booking_from_pdf(
                 skipped.append(AwbChangeRecord(
                     awb_no=awb_no,
                     action="SKIPPED",
-                    reason=f"PDF pcs ({pdf_pcs}) exceeds available ({available})",
+                    reason=f"PDF pcs ({pdf_pcs}) exceeds from available ({available})",
                 ))
                 continue
 
@@ -7118,6 +7139,10 @@ async def close_per_uld__per_flight_service(
     assignment = await db.get(ExportUldAssignment, uld.assignment_id)
     flight_id = assignment.flight_header_id
 
+        # ── fetch ULD master for uld_no ────────
+    uld_master = await db.get(ExportUldMaster, uld.uld_id)
+    uld_no = uld_master.uld_no if uld_master else "UNKNOWN"
+
     # ── get sequences loaded in THIS ULD ───
     loaded_count = await db.scalar(
         select(func.count(ExportSequenceItemUldLoading.id))
@@ -7154,7 +7179,7 @@ async def close_per_uld__per_flight_service(
             "closed_by": closed_by,
             "closed_at": str(now)
     },
-        note=f"ULD {uld.id} closed by {closed_by} with {loaded_count} items",
+        note=f"ULD {uld_no} (detail_id={uld.id}) closed by {closed_by} with {loaded_count} items",
     )
 
     await db.commit()
@@ -9896,3 +9921,201 @@ async def trace_sequence_full_info(db: AsyncSession, sequence_no: str) -> dict:
         "booked_flights": booked_flights,
         "is_loaded_on_uld": loaded_flight_info is not None,
     }
+
+
+
+    # ==================== ✅ ULD Loading Sheet Report Shift wise ==========================
+
+
+
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def _to_ist(dt: datetime | None) -> str:
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = pytz.utc.localize(dt)
+    return dt.astimezone(IST).strftime("%d-%b-%Y %H:%M:%S")
+ 
+def _ist_to_utc(dt: datetime) -> datetime:
+    """
+    Converts a naive or IST-aware datetime (coming from frontend) to UTC.
+    Frontend always sends IST — DB stores UTC — so we must convert before querying.
+    """
+    if dt.tzinfo is None:
+        dt = IST.localize(dt)          # treat naive as IST
+    return dt.astimezone(pytz.utc)
+ 
+
+async def _fetch_loading_rows(
+    db: AsyncSession,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> list[dict]:
+    ul  = ExportSequenceItemUldLoading
+    awb = ExportCarMessageAwbMaster
+    
+    fh  = ExportFlightBookingHeader
+    ud  = ExportUldAssignmentDetail
+    uld = ExportUldMaster
+    seq = ExportAwbSkidItemSequence 
+    # from_utc = _ist_to_utc(from_dt)
+    # to_utc   = _ist_to_utc(to_dt)
+
+    from_utc = _ist_to_utc(from_dt.replace(second=0,  microsecond=0))
+    to_utc   = _ist_to_utc(to_dt.replace(second=59, microsecond=999999))
+
+    stmt = (
+        select(
+            fh.flight_no,
+            fh.flight_date,
+            fh.flight_dpt_datetime,
+            seq.sequence_no, 
+            awb.awb_no,
+            uld.uld_no,
+            ul.loaded_by,
+            User.name.label("loaded_by_name"),
+            ul.loaded_at,
+        )
+        # AWB — ul.awb_master_id is denormalized directly on the loading table
+        .join(awb, ul.awb_master_id == awb.id)
+        .join(seq, ul.sequence_id == seq.id)  
+        .join(User, ul.loaded_by == User.emp_id)
+        # Flight header
+        .join(fh,  ul.flight_header_id == fh.id)
+        # ULD path: loading → uld_assignment_detail → uld_master
+        .join(ud,  ul.uld_assignment_detail_id == ud.id)
+        .join(uld, ud.uld_id == uld.id)
+        .where(
+            and_(
+                ul.loaded_at >= from_utc,
+                ul.loaded_at <= to_utc,
+            )
+        )
+        .order_by(fh.flight_date, fh.flight_no, uld.uld_no, ul.loaded_at)
+    )
+
+    result = await db.execute(stmt)
+    rows   = result.fetchall()
+
+    return [
+        {
+            # "Flight No":          r.flight_no,
+            "Flight Date": r.flight_date if r.flight_date else "",
+            "Flight Date":        r.flight_date.strftime("%d-%b-%Y") if r.flight_date else "",
+            # "Flight Departure":   _to_ist(r.flight_dpt_datetime),
+            "Flight Departure":    r.flight_dpt_datetime.astimezone(IST).replace(tzinfo=None) if r.flight_dpt_datetime else "",  # UTC → IST → naive
+            
+              "AWB No":           (r.awb_no) if r.awb_no else "",    # ← number
+        "Sequence No":      (r.sequence_no) if r.sequence_no else "",  # ← number
+            "ULD No":             r.uld_no,
+            "Loaded By":          int(r.loaded_by) if r.loaded_by else "",  # ← number
+            "Loaded By (Name)":   r.loaded_by_name,
+            # "Loaded At":    _to_ist(r.loaded_at),
+            "Loaded At":        r.loaded_at.astimezone(IST).replace(tzinfo=None) if r.loaded_at else "",  # UTC → IST → naive
+            
+        }
+        for r in rows
+    ]
+
+
+# ── Excel builder ─────────────────────────────────────────────────────────────
+
+COLUMNS    = ["Flight No", "Flight Date", "Flight Departure", "AWB No","Sequence No", "ULD No", "Loaded By", "Loaded By (Name)", "Loaded At"]
+COL_WIDTHS = [14,           14,            24,                  16,   18,    16,        16,    24,       22]
+N_COLS     = len(COLUMNS)
+
+
+def _build_excel(rows: list[dict], from_dt: datetime, to_dt: datetime) -> io.BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Shift Loading Report"
+
+    # styles
+    HEADER_FILL = PatternFill("solid", start_color="1F3864")
+    HEADER_FONT = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    TITLE_FONT  = Font(bold=True, name="Arial", size=13, color="1F3864")
+    CELL_FONT   = Font(name="Arial", size=10)
+    CENTER      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    LEFT        = Alignment(horizontal="left",   vertical="center")
+    THIN        = Side(style="thin", color="CCCCCC")
+    BORDER      = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    ALT_FILL    = PatternFill("solid", start_color="EEF2FF")
+
+    last_col = get_column_letter(N_COLS)
+
+    # title block
+    ws.merge_cells(f"A1:{last_col}1")
+    ws["A1"] = "Shift Loading Report"
+    ws["A1"].font      = TITLE_FONT
+    ws["A1"].alignment = CENTER
+    ws.row_dimensions[1].height = 28
+
+    ws.merge_cells(f"A2:{last_col}2")
+    ws["A2"] = f"Date Time: {from_dt.strftime('%d-%b-%Y %H:%M')}  →  {to_dt.strftime('%d-%b-%Y %H:%M')}"
+    ws["A2"].font      = Font(name="Arial", size=10, color="000000")
+    ws["A2"].alignment = CENTER
+    ws.row_dimensions[2].height = 18
+
+    # ws.merge_cells(f"A3:{last_col}3")
+    # ws["A3"] = f"Total Records: {len(rows)}"
+    # ws["A3"].font      = Font(name="Arial", size=10, bold=True)
+    # ws["A3"].alignment = CENTER
+    # ws.row_dimensions[3].height = 18
+
+    # header row
+    HEADER_ROW = 4
+    for col_idx, (col_name, width) in enumerate(zip(COLUMNS, COL_WIDTHS), start=1):
+        cell = ws.cell(row=HEADER_ROW, column=col_idx, value=col_name)
+        cell.font      = HEADER_FONT
+        cell.fill      = HEADER_FILL
+        cell.alignment = CENTER
+        cell.border    = BORDER
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    ws.row_dimensions[HEADER_ROW].height = 22
+
+    # data rows
+    if not rows:
+        ws.merge_cells(f"A{HEADER_ROW+1}:{last_col}{HEADER_ROW+1}")
+        c = ws.cell(row=HEADER_ROW+1, column=1, value="No records found for the selected period.")
+        c.alignment = CENTER
+        c.font      = Font(name="Arial", size=10, italic=True, color="888888")
+    else:
+        for row_idx, row_data in enumerate(rows, start=HEADER_ROW + 1):
+            fill = ALT_FILL if row_idx % 2 == 0 else None
+            for col_idx, col_name in enumerate(COLUMNS, start=1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=row_data.get(col_name, ""))
+                cell.font      = CELL_FONT
+                cell.border    = BORDER
+                # center: Flight No, Flight Date, ULD No, Loaded By
+                cell.alignment = CENTER if col_idx in (1, 2, 5, 6) else LEFT
+                if col_idx == 2:
+                    cell.number_format = "DD MMM YYYY"
+                elif col_idx in (3, 9):
+                    cell.number_format = "DD MMM YYYY HH:MM"
+                elif col_idx == 7:        # ← ADD
+                    cell.number_format = "0"
+                # if fill:
+                #     cell.fill = fill
+            ws.row_dimensions[row_idx].height = 18
+
+    ws.freeze_panes = ws.cell(row=HEADER_ROW + 1, column=1)
+    # ws.auto_filter.ref = f"A{HEADER_ROW}:{last_col}{HEADER_ROW}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+async def generate_loading_report_excel_shift_wise(
+    db: AsyncSession,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> io.BytesIO:
+    rows  = await _fetch_loading_rows(db, from_dt, to_dt)
+    return _build_excel(rows, from_dt, to_dt)
+
+
+

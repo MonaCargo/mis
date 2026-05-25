@@ -561,14 +561,16 @@ import math
 import traceback
 from typing import List, Optional
 from zoneinfo import ZoneInfo
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, UploadFile, status
+from fastapi.params import File
 from fastapi.responses import StreamingResponse
+import pandas as pd
 import pytz
 from fastapi import Request
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependency import require_roles, verify_token_and_get_user
-
+from sqlalchemy.exc import SQLAlchemyError
 # from app.db.models.importOperation.worker_assignment import WorkerAssignment
 from app.db.models.importOperation.worker_assignment import WorkerAssignmentShipment
 from app.db.models.user import User
@@ -635,6 +637,7 @@ from app.services.importOperation.worker_assignment_service import (
 )
 from app.services.user_service import get_active_import_tracer
 from app.utils.common.get_request_ip import get_request_ip
+from app.utils.importOperation.imp_truck_in_out_cleaning import truck_in_out_clean_with_report
 
 router = APIRouter(prefix="/worker-assignment", tags=[""])
 
@@ -2451,3 +2454,182 @@ async def download_operator_productivity_report(
             "Cache-Control": "no-cache",
         },
     )
+
+
+
+
+
+
+
+
+
+# ================================ 🫥 TRUCK iN AND TRUCK OUT DATE TIME ADDON IN WORKER ASSIGNMENT =======
+
+def _isna(val) -> bool:
+    try:
+        return val is None or pd.isna(val)
+    except (TypeError, ValueError):
+        return False
+ 
+ 
+def _to_py_dt(ts) -> datetime | None:
+    """pandas Timestamp (UTC-aware) → Python datetime, or None for NaT."""
+    if _isna(ts):
+        return None
+    return ts.to_pydatetime()
+
+
+@router.post("/truck-in-out/upload", status_code=status.HTTP_201_CREATED)
+async def upload_import_truck_file(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload IMPORT Truck IN/OUT Excel/CSV.
+ 
+    Updates truck_in_datetime / truck_out_datetime on existing
+    WorkerAssignmentShipment rows that match by gate_pass_no.
+ 
+    Response:
+        status              – "ok"
+        file_rows_cleaned   – rows that passed cleaning
+        dropped_no_gp       – rows dropped for missing/invalid GP No
+        dropped_no_awb      – rows dropped for missing AWB No
+        shipments_updated   – count of WA rows that got truck times
+        gp_not_found_in_db  – GP Nos in file but with no shipment row
+        update_errors       – per-row write failures (rare)
+    """
+ 
+    raw_bytes = await file.read()
+ 
+    try:
+        df, report = truck_in_out_clean_with_report(raw_bytes)
+        # print(f"File cleaned. {report}")
+        # print(f"Cleaned DataFrame head:\n{df.tail(10)}")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"File parsing failed: {exc}",
+        )
+ 
+    if df.empty:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No valid rows found after cleaning.",
+        )
+ 
+    matched, unmatched, errors = await _batched_update_truck_datetimes(db, df)
+
+    # print(f"Matched: {matched}, Unmatched GPs: {len(unmatched)}, Errors: {len(errors)}")
+    # return {"test": "test", "errors": errors}
+    await db.commit()
+ 
+    return {
+        "status":              "ok",
+        "success":             True,
+        "file_rows_cleaned":   report["final_count"],
+        "dropped_no_gp":       report["dropped_no_gp"],
+        "dropped_no_awb":      report["dropped_no_awb"],
+        "shipments_updated":   matched,
+        "gp_not_found_in_db":  unmatched,
+        "update_errors":       errors,
+    }
+ 
+ 
+# ──────────────────────────────────────────────────────────────────
+# Batched update logic
+# ──────────────────────────────────────────────────────────────────
+ 
+async def _batched_update_truck_datetimes(
+    db: AsyncSession,
+    df: pd.DataFrame,
+) -> tuple[int, list[str], list[dict]]:
+    """
+    Process the cleaned DataFrame in chunks of CHUNK_SIZE.
+ 
+    Returns:
+        matched     – count of WA rows successfully updated
+        unmatched   – list of GP Nos in file but not found in WA table
+        errors      – list of {gate_pass_no, wa_id, message} for failures
+    """
+    CHUNK_SIZE = 500 
+    # Keep only rows with a GP No and at least one time value
+    has_time = df["time_in_utc"].notna() | df["time_out_utc"].notna()
+    work = df[df["gp_no"].notna() & has_time][
+        ["gp_no", "time_in_utc", "time_out_utc", "truck_no"]
+    ].reset_index(drop=True)
+ 
+    if work.empty:
+        return 0, [], []
+ 
+    matched = 0
+    unmatched: list[str] = []
+    errors: list[dict] = []
+ 
+    for chunk_start in range(0, len(work), CHUNK_SIZE):
+        chunk = work.iloc[chunk_start : chunk_start + CHUNK_SIZE]
+ 
+        # Build { gp_str: (time_in, time_out) } for this chunk
+        gp_times: dict[str, tuple] = {}
+        for row in chunk.itertuples(index=False):
+            gp_str = str(int(row.gp_no))
+            gp_times[gp_str] = (
+                _to_py_dt(row.time_in_utc),
+                _to_py_dt(row.time_out_utc),
+                row.truck_no if not _isna(row.truck_no) else None, 
+            )
+ 
+        # One SELECT for the whole chunk
+        result = await db.execute(
+            select(WorkerAssignmentShipment).where(
+                WorkerAssignmentShipment.gate_pass_no.in_(gp_times.keys())
+            )
+        )
+        wa_rows = result.scalars().all()
+ 
+        found_gps: set[str] = set()
+ 
+        for wa in wa_rows:
+            time_in, time_out,truck_no  = gp_times.get(wa.gate_pass_no, (None, None, None))
+            if time_in is None and time_out is None and truck_no is None:
+                continue
+
+            found_gps.add(wa.gate_pass_no)
+
+            # 🆕 SKIP if both already filled in DB
+            if (wa.truck_in_datetime is not None and wa.truck_out_datetime is not None  and wa.truck_no is not None):
+                continue
+
+            try:
+                sp = await db.begin_nested()
+                # 🆕 Only write if the DB field is currently NULL
+                if wa.truck_in_datetime is None:
+                    wa.truck_in_datetime = time_in
+                if wa.truck_out_datetime is None:
+                    wa.truck_out_datetime = time_out
+                if wa.truck_no is None:                                  
+                    wa.truck_no = truck_no
+                await db.flush()
+                await sp.commit()
+                matched += 1
+            except SQLAlchemyError as exc:
+                await sp.rollback()
+                errors.append({
+                    "gate_pass_no": wa.gate_pass_no,
+                    "wa_id":        wa.id,
+                    "message":      str(exc.__cause__ or exc)[:30],
+                })
+
+        # GPs in this chunk that had no matching WA row
+        for gp_str in gp_times.keys():
+            if gp_str not in found_gps:
+                unmatched.append(gp_str)
+ 
+        await db.flush()
+        del wa_rows
+        del gp_times
+ 
+    return matched, unmatched, errors
+ 
+ 
+

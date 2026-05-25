@@ -4252,6 +4252,10 @@ async def get_paginated_worker_assignments_data_list(
             "gp_received_datetime":shipment.gp_received_datetime,
             "final_delivery_datetime":shipment.final_delivery_datetime,
 
+            "truck_no":shipment.truck_no,
+            "truck_in_datetime":shipment.truck_in_datetime,
+            "truck_out_datetime":shipment.truck_out_datetime,
+
 
         })
     # -----------------------------------------------------
@@ -5165,10 +5169,26 @@ async def generate_excel_stream_export_worker_assignment_with_step_timeline(
         f'GP Issue vs Final Delivery {diff_header_suffix}',  # 25
         f'GP Received vs Final Delivery {diff_header_suffix}',  # 26
         'Gatepass End Datetime (COSYS)',               # 27
-        'Integrated At',                               # 28
-        'Temp IRM OC No',                              # 29
-        'CHG Wgt',                                     # 30
-        'Damage Report Status',                        # 31
+
+        # 🆕 Truck section
+    'Truck In Date/Time',                          # 28
+    'Truck Number',                                # 29
+    'Truck Out Date/Time',                         # 30
+    f'Truck In vs Truck Out {diff_header_suffix}',              # 31
+    f'GP Issue vs Truck In {diff_header_suffix}',               # 32
+    f'Final Delivery vs Truck In {diff_header_suffix}',         # 33
+    f'Final Delivery vs Truck Out {diff_header_suffix}',        # 34
+    f'GP End (COSYS) vs Truck In {diff_header_suffix}',         # 35
+    f'GP End (COSYS) vs Truck Out {diff_header_suffix}',        # 36
+    f'GP Received vs Truck In {diff_header_suffix}',            # 37
+    f'GP Received vs Truck Out {diff_header_suffix}',           # 38
+    # ---- tail (shifted) ----
+    'Integrated At',                               # 39
+    'Temp IRM OC No',                              # 40
+    'CHG Wgt',                                     # 41
+    'Damage Report Status',                        # 42
+
+       
     ]
 
     # Write headers
@@ -5205,10 +5225,23 @@ async def generate_excel_stream_export_worker_assignment_with_step_timeline(
         25: 16,  # GP Issue vs Final Delivery
         26: 16,  # GP Received vs Final Delivery
         27: 18,  # Gatepass End Datetime (COSYS)
-        28: 18,  # Integrated At
-        29: 15,  # Temp IRM OC No
-        30: 12,  # CHG Wgt
-        31: 18,  # Damage Report Status
+        # 🆕 Truck section
+    28: 18,  # Truck In Date/Time
+    29: 16,  # Truck Number
+    30: 18,  # Truck Out Date/Time
+    31: 16,  # Truck In vs Truck Out
+    32: 16,  # GP Issue vs Truck In
+    33: 16,  # Final Delivery vs Truck In
+    34: 16,  # Final Delivery vs Truck Out
+    35: 16,  # GP End (COSYS) vs Truck In
+    36: 16,  # GP End (COSYS) vs Truck Out
+    37: 16,  # GP Received vs Truck In
+    38: 16,  # GP Received vs Truck Out
+    # ---- tail (shifted) ----
+    39: 18,  # Integrated At
+    40: 15,  # Temp IRM OC No
+    41: 12,  # CHG Wgt
+    42: 18,  # Damage Report Status
     }
     for col, width in column_widths.items():
         worksheet.set_column(col, col, width)
@@ -5385,8 +5418,14 @@ async def generate_excel_stream_export_worker_assignment_with_step_timeline(
             # 2 - OC No (header)
             worksheet.write(row_num, 2, header.oc_no or '', text_format)
 
-            # 3 - Gate Pass No
-            worksheet.write(row_num, 3, shipment.gate_pass_no or '', text_format)
+            # # 3 - Gate Pass No
+            # worksheet.write(row_num, 3, shipment.gate_pass_no or '', text_format)
+            
+            # 3 - Gate Pass No (numeric if possible, blank otherwise)
+            if shipment.gate_pass_no is not None and str(shipment.gate_pass_no).strip().isdigit():
+                worksheet.write_number(row_num, 3, int(shipment.gate_pass_no), integer_format)
+            else:
+                worksheet.write_blank(row_num, 3, None)
 
             # 4 - Gate Pass Issue Date
             write_dt(row_num, 4, shipment.gate_pass_issued_date_time_combo)
@@ -5497,20 +5536,89 @@ async def generate_excel_stream_export_worker_assignment_with_step_timeline(
             # 27 - Gatepass End Datetime (COSYS)
             write_dt(row_num, 27, shipment.gate_pass_end_datetime)
 
-            # 28 - Integrated At
-            write_dt(row_num, 28, shipment.integrate_date_time)
+            # 🆕 ── Truck section ───────────────────────────────────────────
 
-            # 29 - Temp IRM OC No (header)
-            worksheet.write(row_num, 29, header.temp_irm_oc_no or '', text_format)
+            # 28 - Truck In Date/Time
+            write_dt(row_num, 28, shipment.truck_in_datetime)
 
-            # 30 - CHG Wgt
+            # 29 - Truck Number
+            worksheet.write(row_num, 29, shipment.truck_no or '', text_format)
+
+            # 30 - Truck Out Date/Time
+            write_dt(row_num, 30, shipment.truck_out_datetime)
+
+            # 31 - Truck In vs Truck Out
+            write_diff(
+                row_num, 31,
+                shipment.truck_in_datetime,
+                shipment.truck_out_datetime
+            )
+
+            # 32 - GP Issue vs Truck In
+            write_diff(
+                row_num, 32,
+                shipment.gate_pass_issued_date_time_combo,
+                shipment.truck_in_datetime
+            )
+
+            # 33 - Final Delivery vs Truck In
+            write_diff(
+                row_num, 33,
+                shipment.truck_in_datetime,
+                shipment.final_delivery_datetime
+            )
+
+            # 34 - Final Delivery vs Truck Out
+            write_diff(
+                row_num, 34,
+                shipment.truck_out_datetime,
+                shipment.final_delivery_datetime
+            )
+
+            # 35 - GP End (COSYS) vs Truck In
+            write_diff(
+                row_num, 35,
+                shipment.gate_pass_end_datetime,
+                shipment.truck_in_datetime
+            )
+
+            # 36 - GP End (COSYS) vs Truck Out
+            write_diff(
+                row_num, 36,
+                shipment.gate_pass_end_datetime,
+                shipment.truck_out_datetime
+            )
+
+            # 37 - GP Received vs Truck In
+            write_diff(
+                row_num, 37,
+                shipment.gp_received_datetime,
+                shipment.truck_in_datetime
+            )
+
+            # 38 - GP Received vs Truck Out
+            write_diff(
+                row_num, 38,
+                shipment.gp_received_datetime,
+                shipment.truck_out_datetime
+            )
+
+            # 🆕 ── End truck section ───────────────────────────────────────
+
+            # 39 - Integrated At
+            write_dt(row_num, 39, shipment.integrate_date_time)
+
+            # 40 - Temp IRM OC No (header)
+            worksheet.write(row_num, 40, header.temp_irm_oc_no or '', text_format)
+
+            # 41 - CHG Wgt
             if shipment.chg_wgt_in_kg is not None:
-                worksheet.write_number(row_num, 30, shipment.chg_wgt_in_kg, number_format)
+                worksheet.write_number(row_num, 41, shipment.chg_wgt_in_kg, number_format)
             else:
-                worksheet.write_blank(row_num, 30, None)
+                worksheet.write_blank(row_num, 41, None)
 
-            # 31 - Damage Report Status
-            worksheet.write(row_num, 31, shipment.damage_report_status or '', text_format)
+            # 42 - Damage Report Status
+            worksheet.write(row_num, 42, shipment.damage_report_status or '', text_format)
 
             row_num += 1
 
