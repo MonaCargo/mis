@@ -323,16 +323,33 @@ class UldVerifyForLoadingResponse(APIResponseBase):
 
 
 # ── Scan item into ULD ─────────────────────────────────────
+class SequenceNoItem(BaseModel):
+    sequence_no: str
+    scanned_at: datetime
+    is_ultra_fast: bool = False
+
+    @field_validator("sequence_no")
+    @classmethod
+    def strip_sequence_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("sequence_no cannot be blank")
+        return v
+
 class ScanItemIntoUldRequest(BaseModel):
     uld_assignment_detail_id: int
-    sequence_nos: list[str]
+    sequence_nos: list[SequenceNoItem]
 
     @field_validator("sequence_nos")
     @classmethod
-    def validate_sequence_nos(cls, v: list) -> list:
+    def validate_sequence_nos(cls, v: list[SequenceNoItem]) -> list[SequenceNoItem]:
         if not v:
             raise ValueError("At least one sequence_no required")
-        return [s.strip() for s in v if s.strip()]
+        # drop any that became blank after strip (edge case)
+        filtered = [item for item in v if item.sequence_no]
+        if not filtered:
+            raise ValueError("At least one valid sequence_no required")
+        return filtered
 
 class ScanItemResult(BaseModel):
     sequence_no: str

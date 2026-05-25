@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependency import verify_token_and_get_user
-from app.db.models.exportOperation.car_message import ExportAwbSkidItemSequence, ExportAwbSkidMapping, ExportCarMessageAwbMaster, ExportSkidLocationMapping
+from app.db.models.exportOperation.car_message import ExportAwbSkidItemSequence, ExportAwbSkidMapping, ExportCarMessageAwbMaster, ExportFlightBookingDetail, ExportFlightBookingHeader, ExportSkidLocationMapping
 from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileUploadMetaLog
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
@@ -20,7 +20,7 @@ from app.schemas.exportOperation.car_message import AvailableAwbForFlightBooking
 from app.schemas.exportOperation.uld_master import AddUldsRequest
 from app.schemas.user import UserRead
 from app.services.exportOperation.base_master import ultra_fast_scan_and_load
-from app.services.exportOperation.car_message import CategoryLiteral, assign_ulds_to_flight_mobile, build_car_message_excel, close_per_uld__per_flight_service, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_awb_data_for_export, get_awb_missing_sequence_status, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_dashboard_drilldown_detail_v2, get_dashboard_stats_v2, get_flight_awb_breakdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_history, get_flight_particular_flight_detail, get_flight_uld_loading_status, get_flights_by_date, get_latest_uld_assignment_service, get_loading_sheet_form_history_service, get_loading_sheet_form_service, get_loading_sheet_report_service, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, get_uld_sequences_of_particular_flight, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, save_loading_sheet_form_service, scan_item_into_uld, trace_sequence_full_info, unlock_per_uld_service, upsert_flight_booking_from_pdf, verify_uld_for_loading
+from app.services.exportOperation.car_message import CategoryLiteral, assign_ulds_to_flight_mobile, build_car_message_excel, close_per_uld__per_flight_service, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, generate_loading_report_excel_shift_wise, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_awb_data_for_export, get_awb_missing_sequence_status, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_dashboard_drilldown_detail_v2, get_dashboard_stats_v2, get_flight_awb_breakdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_history, get_flight_particular_flight_detail, get_flight_uld_loading_status, get_flights_by_date, get_latest_uld_assignment_service, get_loading_sheet_form_history_service, get_loading_sheet_form_service, get_loading_sheet_report_service, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, get_uld_sequences_of_particular_flight, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, save_loading_sheet_form_service, scan_item_into_uld, trace_sequence_full_info, unlock_per_uld_service, upsert_flight_booking_from_pdf, verify_uld_for_loading
 from app.services.export_slot_file_upload_service import get_utc_now
 from app.utils.exportOperation.car_message import clean_car_message
 from app.utils.exportOperation.extract_flight_planning_data import extract_flight_planning
@@ -805,7 +805,7 @@ async def scan_item_into_uld_route(
     db: AsyncSession = Depends(get_db),
     current_user: UserRead = Depends(verify_token_and_get_user),
 ):
-    print(f"Received scan request: flight_header_id={flight_header_id}, payload={payload}")
+    print(f"Received scan request: flight_header_id={flight_header_id}, payload={payload}") 
     return await scan_item_into_uld(
         db=db,
         flight_header_id=flight_header_id,
@@ -1227,46 +1227,132 @@ async def create_manual_awb(
 
 
 # =============== Search awb across all table FOR web table not mobile app ================
+
+from sqlalchemy import select, func
+from sqlalchemy import inspect
+
+def model_to_dict(obj):
+    return {
+        c.key: getattr(obj, c.key)
+        for c in inspect(obj).mapper.column_attrs
+    }
 @router.get(
     "/car-message/awb-search-for-web",
     summary="Search AWB by exact match across all records for web table",
 )
 async def search_awb_across_all(
-    db: AsyncSession = Depends(get_db),   # ✅ FIX
-    awb_no: str = Query(...),             # ✅ also better
+    db: AsyncSession = Depends(get_db),
+    awb_no: str = Query(...),
 ):
-
     awb_no = awb_no.strip()
-
     if not awb_no:
         raise HTTPException(status_code=400, detail="AWB number is required.")
 
-    # ── Normalize: strip non-digits, pad to 11 ────────────────────────────────
+    # ── Normalize ─────────────────────────────────────────────────────────────
     cleaned_awb = awb_no.replace("-", "").replace(" ", "")
     if len(cleaned_awb) == 10:
         cleaned_awb = "0" + cleaned_awb
     if len(cleaned_awb) != 11:
         raise HTTPException(status_code=400, detail=f"Invalid AWB number: {awb_no}")
-    
-    # 2. Database Query
-    # Since awb_no is indexed and has a UniqueConstraint, this will be very fast.
-    stmt = select(ExportCarMessageAwbMaster).where(
-        ExportCarMessageAwbMaster.awb_no == cleaned_awb
-    )
-    result = await db.execute(stmt)
-    awb_record = result.scalars().first()
 
-    # 3. Return Response
-    if not awb_record:
-        raise HTTPException(
-            status_code=404, 
-            detail=f"AWB {cleaned_awb} not found."
+    # ── 1. Fetch AWB master ────────────────────────────────────────────────────
+    awb_record = (
+        await db.execute(
+            select(ExportCarMessageAwbMaster)
+            .where(ExportCarMessageAwbMaster.awb_no == cleaned_awb)
         )
+    ).scalars().first()
+
+    if not awb_record:
+        raise HTTPException(status_code=404, detail=f"AWB {cleaned_awb} not found.")
+
+    # ── 2. Fetch flight bookings + header in ONE join query ────────────────────
+    # No selectinload needed — explicit join, full control
+    flight_rows = (
+        await db.execute(
+            select(ExportFlightBookingDetail, ExportFlightBookingHeader)
+            .join(
+                ExportFlightBookingHeader,
+                ExportFlightBookingDetail.flight_header_id == ExportFlightBookingHeader.id
+            )
+            .where(ExportFlightBookingDetail.awb_master_id == awb_record.id)
+        )
+    ).all()  # returns list of (detail_row, header_row) tuples
+
+    # ── 3. Count scanned pcs ──────────────────────────────────────────────────
+    scanned_pcs: int = (
+        await db.execute(
+            select(func.count())
+            .where(ExportAwbSkidItemSequence.awb_master_id == awb_record.id)
+        )
+    ).scalar_one()
+
+    # ── 4. Shape response ─────────────────────────────────────────────────────
+    flight_bookings = [
+        {
+            "flight_no":           header.flight_no,
+            "flight_date":         header.flight_date.isoformat(),
+            "flight_dpt_datetime": header.flight_dpt_datetime.isoformat(),
+            "flight_is_active":    header.is_active,
+            "booked_pcs":          detail.booked_pcs,
+        }
+        for detail, header in flight_rows
+    ]
+
+    total_booked_pcs = sum(d["booked_pcs"] for d in flight_bookings)
 
     return {
         "status": "success",
-        "data": awb_record
+        "data": {
+        # ✅ Spreads all AWB columns flat — exactly like before
+        **model_to_dict(awb_record),
+
+        # ✅ New fields just sit alongside
+        "scanned_pcs":      scanned_pcs,
+        "total_booked_pcs": total_booked_pcs,
+        "flight_bookings":  flight_bookings,
+    },
     }
+# @router.get(
+#     "/car-message/awb-search-for-web",
+#     summary="Search AWB by exact match across all records for web table",
+# )
+# async def search_awb_across_all(
+#     db: AsyncSession = Depends(get_db),   # ✅ FIX
+#     awb_no: str = Query(...),             # ✅ also better
+# ):
+
+#     awb_no = awb_no.strip()
+
+#     if not awb_no:
+#         raise HTTPException(status_code=400, detail="AWB number is required.")
+
+#     # ── Normalize: strip non-digits, pad to 11 ────────────────────────────────
+#     cleaned_awb = awb_no.replace("-", "").replace(" ", "")
+#     if len(cleaned_awb) == 10:
+#         cleaned_awb = "0" + cleaned_awb
+#     if len(cleaned_awb) != 11:
+#         raise HTTPException(status_code=400, detail=f"Invalid AWB number: {awb_no}")
+    
+#     # 2. Database Query
+#     # Since awb_no is indexed and has a UniqueConstraint, this will be very fast.
+#     stmt = select(ExportCarMessageAwbMaster).where(
+#         ExportCarMessageAwbMaster.awb_no == cleaned_awb
+#     )
+#     result = await db.execute(stmt)
+#     awb_record = result.scalars().first()
+
+#     # 3. Return Response
+#     if not awb_record:
+#         raise HTTPException(
+#             status_code=404, 
+#             detail=f"AWB {cleaned_awb} not found."
+#         )
+
+#     return {
+#         "status": "success",
+#         "data": awb_record
+#     }
 
 
 
@@ -1550,4 +1636,32 @@ async def trace_sequence_route(
     return await trace_sequence_full_info(
         db=db,
         sequence_no=sequence_no.strip().upper(),
+    )
+
+
+
+# ========= Uld loading report shift wise ===============
+@router.get("/loading-report/shift-wise")
+async def loading_report(
+    from_dt: datetime = Query(..., description="Start datetime (ISO 8601), e.g. 2024-06-01T00:00:00"),
+    to_dt: datetime   = Query(..., description="End datetime   (ISO 8601), e.g. 2024-06-01T23:59:59"),
+    db: AsyncSession  = Depends(get_db),
+):
+    """
+    Returns a streamed Excel (.xlsx) file containing all ULD loading records
+    whose loaded_at timestamp falls within [from_dt, to_dt].
+ 
+    Columns: Flight No | Flight Date | AWB No | Sequence No | Scanned By |
+             ULD No | Loaded By | Loaded At (IST)
+    """
+    filename = (
+        f"loading_report_{from_dt.strftime('%Y%m%d_%H%M')}_{to_dt.strftime('%Y%m%d_%H%M')}.xlsx"
+    )
+ 
+    stream = await generate_loading_report_excel_shift_wise(db, from_dt, to_dt)
+ 
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
