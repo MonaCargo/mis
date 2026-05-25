@@ -959,7 +959,7 @@ async def change_uld_carrier(
 
 
 # ========================= crfeate uld based on fixed patterns ==================================
-# 2026-12-05 16:25:00+05:30
+
 @router.post(
     "/create-uld-or-container/based-on-pattern",
     status_code=status.HTTP_201_CREATED,

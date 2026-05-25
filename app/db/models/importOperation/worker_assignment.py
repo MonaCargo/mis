@@ -241,6 +241,11 @@ class WorkerAssignmentShipment(Base):
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
+    # truck-in truck-out datetime from imp_truck report 
+    truck_in_datetime  = Column(DateTime(timezone=True), nullable=True, index=True)
+    truck_out_datetime = Column(DateTime(timezone=True), nullable=True)
+    truck_no = Column(String(100), nullable=True)
+
     __table_args__ = (
         # 🔑 for OC-merge events
         UniqueConstraint(
