@@ -246,6 +246,8 @@ class WorkerAssignmentShipment(Base):
     truck_out_datetime = Column(DateTime(timezone=True), nullable=True)
     truck_no = Column(String(100), nullable=True)
 
+    dlv_zone_from_irr = Column(String(50), nullable=True)  # This come from delivery zone in irr reports
+
     __table_args__ = (
         # 🔑 for OC-merge events
         UniqueConstraint(

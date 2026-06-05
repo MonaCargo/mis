@@ -34,7 +34,7 @@ from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.models.exportOperation.export_uld_loading_sheet_form import ExportLoadingSheetForm, ExportLoadingSheetFormHistoryLog
 from app.db.models.exportOperation.export_uld_master import ExportUldMaster
 from app.db.models.user import User
-from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AwbChangeRecord, AwbDaySummary, AwbLoadingStatusItem, AwbLookupError, AwbManualCreateRequest, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightBookingDetailResponse, FlightBookingDetailWithAwbResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, ScanItemIntoUldRequest, ScanItemIntoUldResponse, ScanItemResult, ScanningDaySummary, SkidDaySummary, UldAssignmentDataResponse, UldAssignmentDetailResponse, UldAssignmentResponse, UldLoadingStatusItem, UldMasterResponse, UldVerifyForLoadingResponse
+from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AwbChangeRecord, AwbCheckerInfoResponse, AwbDaySummary, AwbFlightInfoForAWBchecker, AwbLoadingStatusItem, AwbLookupError, AwbManualCreateRequest, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightBookingDetailResponse, FlightBookingDetailWithAwbResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, ScanItemIntoUldRequest, ScanItemIntoUldResponse, ScanItemResult, ScanningDaySummary, SkidDaySummary, UldAssignmentDataResponse, UldAssignmentDetailResponse, UldAssignmentResponse, UldLoadingStatusItem, UldMasterResponse, UldVerifyForLoadingResponse
 from app.services.exportOperation.car_message_flow_audit_log import write_car_message_flow_audit
 from app.utils.common.car_message_flow_audit_utils import CarMessageFlowModule, CarMessageFlowStep
 from app.utils.common.helperFunction import get_utc_now
@@ -672,6 +672,7 @@ async def get_available_awbs_for_flight_booking_dropdown(
 
     # ── Subquery 1: booked pcs per AWB across active flights ───────
     booked_subq = _booked_pcs_subquery()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=15)
 
     # ── Subquery 2: scanned pcs per AWB ───────────────────────────
     scanned_subq = (
@@ -711,8 +712,9 @@ async def get_available_awbs_for_flight_booking_dropdown(
         .outerjoin(scanned_subq, ExportCarMessageAwbMaster.id == scanned_subq.c.awb_master_id)  # ✅ outerjoin so AWBs with 0 scanned still appear (filtered below)
         .where(
             # ExportCarMessageAwbMaster.status == "RCS",
-            ExportCarMessageAwbMaster.status.in_(FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING),            ExportCarMessageAwbMaster.pcs.isnot(None),
-
+            ExportCarMessageAwbMaster.status.in_(FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING),   
+                              ExportCarMessageAwbMaster.pcs.isnot(None),
+                     ExportCarMessageAwbMaster.car_message_datetime_combo >= cutoff,   # ✅ last 15 days only
              # ✅ ultra-fast bypasses scanned gate {ULTRA_FAST OR HAVE AT LEAST SCANNED ONE PCS}
             or_(
                 ExportCarMessageAwbMaster.is_ultra_fast == True,
@@ -10001,7 +10003,7 @@ async def _fetch_loading_rows(
 
     return [
         {
-            # "Flight No":          r.flight_no,
+            "Flight No":          r.flight_no,
             "Flight Date": r.flight_date if r.flight_date else "",
             "Flight Date":        r.flight_date.strftime("%d-%b-%Y") if r.flight_date else "",
             # "Flight Departure":   _to_ist(r.flight_dpt_datetime),
@@ -10119,3 +10121,114 @@ async def generate_loading_report_excel_shift_wise(
 
 
 
+
+
+
+
+# =============================✌️ AWB Checker INFO on Flight booking AWB selection time =======================
+
+async def get_awb_checker_info(awb_no: str, db: AsyncSession) -> AwbCheckerInfoResponse:
+    awb_no = awb_no.strip()
+
+    # ── 1. AWB master ─────────────────────────────────────────────
+    result = await db.execute(
+        select(ExportCarMessageAwbMaster)
+        .where(ExportCarMessageAwbMaster.awb_no == awb_no)
+    )
+    awb: ExportCarMessageAwbMaster | None = result.scalar_one_or_none()
+
+    if not awb:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"AWB {awb_no} not found",
+        )
+
+    total_pcs: int = awb.manual_pcs or awb.pcs or 0
+
+    # ── 2. Scanned pcs ────────────────────────────────────────────
+    scanned_result = await db.execute(
+        select(func.count(ExportAwbSkidItemSequence.id))
+        .where(ExportAwbSkidItemSequence.awb_master_id == awb.id)
+    )
+    scanned_pcs: int = scanned_result.scalar() or 0
+
+    # ── 3. Flight bookings for this AWB ───────────────────────────
+    flights_result = await db.execute(
+        select(ExportFlightBookingDetail, ExportFlightBookingHeader)
+        .join(
+            ExportFlightBookingHeader,
+            ExportFlightBookingDetail.flight_header_id == ExportFlightBookingHeader.id,
+        )
+        .where(ExportFlightBookingDetail.awb_master_id == awb.id)
+        .order_by(ExportFlightBookingHeader.flight_date.asc())
+    )
+    flight_rows = flights_result.all()   # list of (detail, header) tuples
+
+    total_booked_pcs: int = sum(d.booked_pcs for d, _ in flight_rows)
+
+    # ── 4. Loaded pcs per flight ──────────────────────────────────
+    loaded_result = await db.execute(
+        select(
+            ExportSequenceItemUldLoading.flight_header_id,
+            func.count(ExportSequenceItemUldLoading.id).label("loaded_pcs"),
+        )
+        .where(ExportSequenceItemUldLoading.awb_master_id == awb.id)
+        .group_by(ExportSequenceItemUldLoading.flight_header_id)
+    )
+    loaded_by_flight: dict[int, int] = {
+        row.flight_header_id: row.loaded_pcs
+        for row in loaded_result.all()
+    }
+    total_loaded_pcs: int = sum(loaded_by_flight.values())
+
+    # ── 5. Per-flight list ────────────────────────────────────────
+    flights: list[AwbFlightInfoForAWBchecker] = [
+        AwbFlightInfoForAWBchecker(
+            flight_header_id=header.id,
+            flight_no=header.flight_no,
+            flight_date=header.flight_date,
+            flight_dpt_datetime=header.flight_dpt_datetime,
+            booked_pcs=detail.booked_pcs,
+            loaded_pcs=loaded_by_flight.get(header.id, 0),
+            is_flight_active=header.is_active,
+        )
+        for detail, header in flight_rows
+    ]
+
+    # ── 6. Availability verdict ───────────────────────────────────
+    reasons: list[str] = []
+
+    if not awb.is_ultra_fast:
+        if awb.status != "RCS":
+            reasons.append(
+                f"Status is '{awb.status or 'unknown'}' — must be RCS before booking"
+            )
+        if scanned_pcs < total_pcs:
+            reasons.append(
+                f"Only {scanned_pcs} of {total_pcs} pieces scanned — all must be scanned"
+            )
+
+    remaining_pcs = total_pcs - total_booked_pcs
+    if remaining_pcs <= 0:
+        reasons.append("All pieces already booked — no remaining pieces")
+
+    # ── 7. Status datetime ────────────────────────────────────────
+    status_datetime = awb.rcs_datetime if awb.status == "RCS" else awb.updated_at
+
+    return AwbCheckerInfoResponse(
+        awb_no=awb.awb_no,
+        formatted_awb=awb.awb_no,
+        origin=awb.origin,
+        destination=awb.destination,
+        is_ultra_fast=awb.is_ultra_fast,
+        is_manually_created=awb.is_manually_created,
+        status=awb.status,
+        status_datetime=status_datetime,
+        total_pcs=total_pcs,
+        scanned_pcs=scanned_pcs,
+        total_booked_pcs=total_booked_pcs,
+        total_loaded_pcs=total_loaded_pcs,
+        is_available=len(reasons) == 0,
+        unavailable_reasons=reasons,
+        flights=flights,
+    )
