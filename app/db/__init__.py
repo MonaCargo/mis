@@ -34,8 +34,16 @@ from app.db.models.exportOperation.export_transipment_report import ExportTransh
 from app.db.models.exportOperation.uld_master_logs import ExportUldMasterOperationLogs
 from app.db.models.exportOperation.export_uld_loading_sheet_form import ExportLoadingSheetForm
 from app.db.models.exportOperation.export_uld_loading_sheet_form import ExportLoadingSheetFormHistoryLog
+from app.db.models.importOperation.imp_truck_in_out_module import ImportTruckInStaging , ImportTruckVisit, ImportGatePass, ImportGatePassAssignment, ImportGatePassLoading
+from app.db.models.app_config.app_config import AppConfig ,AppConfigLog 
 
 __all__ = [
+
+
+"AppConfig", "AppConfigLog",
+
+    "ImportTruckInStaging","ImportTruckVisit", "ImportGatePass", "ImportGatePassAssignment", "ImportGatePassLoading"
+    ,
     # 'WorkerAssignment',
     'ExportLoadingSheetForm',
    'ExportLoadingSheetFormHistoryLog',
