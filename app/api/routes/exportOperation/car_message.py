@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 import io
 import math
@@ -16,11 +16,11 @@ from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileU
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
 from app.db.session import get_db
-from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, AwbLookupError, AwbManualCreateRequest, AwbManualCreateResponse, CarMessageExcelExportRequest, CreateFlightBookingFromPdfResponse, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse, UltraFastScanRequest
+from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, AwbCheckerInfoResponse, AwbLookupError, AwbManualCreateRequest, AwbManualCreateResponse, CarMessageExcelExportRequest, CreateFlightBookingFromPdfResponse, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse, UltraFastScanRequest, UpdateFlightDptDatetime
 from app.schemas.exportOperation.uld_master import AddUldsRequest
 from app.schemas.user import UserRead
 from app.services.exportOperation.base_master import ultra_fast_scan_and_load
-from app.services.exportOperation.car_message import CategoryLiteral, assign_ulds_to_flight_mobile, build_car_message_excel, close_per_uld__per_flight_service, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, generate_loading_report_excel_shift_wise, get_available_awbs_for_flight_booking_dropdown, get_awb_data_filtered, get_awb_data_for_export, get_awb_missing_sequence_status, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_dashboard_drilldown_detail_v2, get_dashboard_stats_v2, get_flight_awb_breakdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_history, get_flight_particular_flight_detail, get_flight_uld_loading_status, get_flights_by_date, get_latest_uld_assignment_service, get_loading_sheet_form_history_service, get_loading_sheet_form_service, get_loading_sheet_report_service, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, get_uld_sequences_of_particular_flight, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, save_loading_sheet_form_service, scan_item_into_uld, trace_sequence_full_info, unlock_per_uld_service, upsert_flight_booking_from_pdf, verify_uld_for_loading
+from app.services.exportOperation.car_message import CategoryLiteral, assign_ulds_to_flight_mobile, build_car_message_excel, close_per_uld__per_flight_service, create_flight_booking, create_manual_awb_service, create_uld_assignment, edit_flight_booking, edit_uld_assignment, enrich_awb_from_wh_inventory, extract_carrier_for_uld_filter, generate_flight_date_report, generate_loading_report_excel_shift_wise, get_available_awbs_for_flight_booking_dropdown, get_awb_checker_info, get_awb_data_filtered, get_awb_data_for_export, get_awb_missing_sequence_status, get_car_message_dashboard_stats, get_dashboard_drilldown_detail, get_dashboard_drilldown_detail_v2, get_dashboard_stats_v2, get_flight_awb_breakdown, get_flight_booking_by_flight_no_and_date, get_flight_full_detail, get_flight_history, get_flight_particular_flight_detail, get_flight_uld_loading_status, get_flights_by_date, get_latest_uld_assignment_service, get_loading_sheet_form_history_service, get_loading_sheet_form_service, get_loading_sheet_report_service, get_uld_assignment_by_flight, get_uld_master_list, get_uld_master_list_eligeble_for_assignment, get_uld_sequences_of_particular_flight, mark_awb_ultra_fast, retrieve_skid_from_location, save_export_car_message_awbs, save_loading_sheet_form_service, scan_item_into_uld, trace_sequence_full_info, unlock_per_uld_service, upsert_flight_booking_from_pdf, verify_uld_for_loading
 from app.services.export_slot_file_upload_service import get_utc_now
 from app.utils.exportOperation.car_message import clean_car_message
 from app.utils.exportOperation.extract_flight_planning_data import extract_flight_planning
@@ -1665,3 +1665,100 @@ async def loading_report(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+
+
+
+
+# =============================✌️ AWB Checker INFO on Flight booking AWB selection time =======================
+
+@router.get(
+    "/check-individual-awb-for-flight-booking",
+    response_model=AwbCheckerInfoResponse,
+    summary="AWB status, piece counts and per-flight booking breakdown",
+)
+async def check_awb_availability(
+    awb_no: str = Query(
+        ...,
+        min_length=11,
+        max_length=11,
+        pattern=r"^\d{11}$",
+        description="11-digit numeric AWB number",
+        example="09830280051",
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+) -> AwbCheckerInfoResponse:
+    return await get_awb_checker_info(awb_no=awb_no, db=db)
+
+
+
+
+
+
+
+
+@router.put("/flight-booking/update-departure-datetime/{header_id}")
+async def update_flight_dpt_datetime(
+    header_id: int,
+    payload: UpdateFlightDptDatetime,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+
+    def to_utc(dt: datetime) -> datetime:
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc)
+        ist_offset = timedelta(hours=5, minutes=30)
+        return (dt - ist_offset).replace(tzinfo=timezone.utc)
+
+    result = await db.execute(
+        select(ExportFlightBookingHeader).where(
+            ExportFlightBookingHeader.id == header_id,
+            ExportFlightBookingHeader.is_active == True,
+        )
+    )
+    header = result.scalar_one_or_none()
+
+    if not header:
+        raise HTTPException(status_code=404, detail="Flight booking not found")
+
+    now = get_utc_now()
+
+    # Always normalize input to aware UTC (handles both naive-IST and aware input)
+    new_dpt_utc = to_utc(payload.flight_dpt_datetime)
+
+    # Block editing if already departed
+    # if header.flight_dpt_datetime <= now:
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail="Flight has already departed — departure time cannot be edited",
+    #     )
+
+    # New departure cannot be in the past
+    if new_dpt_utc <= now:
+        raise HTTPException(
+            status_code=400,
+            detail="New departure time cannot be in the past",
+        )
+
+    # ✅ Must be within 3 days of booking time (compare UTC vs UTC)
+    max_allowed = header.booked_at + timedelta(days=3)
+    if new_dpt_utc > max_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Departure must be within 3 days of booking (by {max_allowed.isoformat()})",
+        )
+
+    header.flight_dpt_datetime = new_dpt_utc
+    header.updated_at = now
+
+    await db.commit()
+    await db.refresh(header)
+
+    return {
+        "success": True,
+        "message": "Departure datetime updated successfully",
+        "flight_dpt_datetime": header.flight_dpt_datetime.isoformat(),
+    }

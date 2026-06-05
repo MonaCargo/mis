@@ -31,8 +31,8 @@ import pandas as pd
 IST_OFFSET = timedelta(hours=5, minutes=30)
 UTC        = timezone.utc
 
-_SKIP_ROWS = 2   # Excel export always has 2 junk rows before the real header
-_DT_FMT    = "%d-%m-%Y %H:%M"
+_SKIP_ROWS = 5   # Excel export always has 5 junk rows before the real header
+_DT_FMT    = "%d-%b-%Y %H:%M"
 
 _RAW_COLS = [
     "gp_no", "date", "awb_no", "hawb_no", "pcs",
@@ -135,7 +135,8 @@ def _read_raw(source: Union[str, bytes, io.IOBase]) -> pd.DataFrame:
             source.seek(0)
             df = pd.read_csv(source, **read_kwargs)
 
-    df = df.iloc[:, : len(_RAW_COLS)].copy()
+    # df = df.iloc[:, : len(_RAW_COLS)].copy() 
+    df = df.iloc[:, 2 : 2 + len(_RAW_COLS)].copy()   # skip the 2 empty leading cols
     df.columns = _RAW_COLS[: df.shape[1]]
 
     # Drop leftover header row if skiprows landed on a blank line

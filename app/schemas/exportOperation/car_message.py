@@ -629,3 +629,63 @@ class CarMessageExcelExportRequest(BaseModel):
     startDate: Optional[date]
     endDate: Optional[date]
     status: str = "all"
+
+
+
+
+
+# =====✌️ AWB Checker Schema INFO on Flight booking AWB selection time =========
+
+# ── Per-flight breakdown ───────────────────────────────────────────
+class AwbFlightInfoForAWBchecker(BaseModel):
+    flight_header_id: int
+    flight_no: str
+    flight_date: date
+    flight_dpt_datetime: datetime          # UTC; frontend converts to IST
+
+    booked_pcs: int                        # pcs booked in THIS flight
+    loaded_pcs: int                        # pcs of this AWB loaded into a ULD on this flight
+
+    is_flight_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+# ── Top-level summary + per-flight list ───────────────────────────
+class AwbCheckerInfoResponse(BaseModel):
+    # Basic identity
+    awb_no: str
+    formatted_awb: str                     # e.g. "098-30280051"
+    origin: Optional[str]
+    destination: Optional[str]
+    is_ultra_fast: bool
+    is_manually_created: bool
+
+    # Status
+    status: Optional[str]
+    status_datetime: Optional[datetime]    # rcs_datetime when status=RCS, else updated_at
+
+    # Piece summary
+    total_pcs: int                         # pcs from AWB master (or manual_pcs)
+    scanned_pcs: int                       # distinct items in ExportAwbSkidItemSequence
+    total_booked_pcs: int                  # sum across all flights
+    total_loaded_pcs: int                  # sum across all flights (ULD loading)
+
+    # Availability verdict (same logic as available-AWB list)
+    is_available: bool
+    unavailable_reasons: list[str]
+
+    # Per-flight breakdown
+    flights: list[AwbFlightInfoForAWBchecker]
+
+    class Config:
+        from_attributes = True
+
+
+
+
+
+class UpdateFlightDptDatetime(BaseModel):
+    flight_dpt_datetime: datetime   # client sends ISO UTC, e.g. "2026-06-01T10:30:00Z"
+

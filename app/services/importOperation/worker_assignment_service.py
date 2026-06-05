@@ -1627,6 +1627,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.routes.domesticOperation.domestic_xray_report import convert_ist_day_to_utc_range
 from app.db.models.importOperation.damage_report import DamageReason, DamageReport, DamageReportReason
+from app.db.models.importOperation.imp_truck_in_out_module import ImportGatePass, ImportGatePassAssignment, ImportTruckVisit
 from app.db.models.user import User
 from app.services.exportOperation.car_message import ist_date_to_utc_range
 from app.services.importOperation.audit_log_worker_assignment import log_worker_assignment_audit
@@ -2869,8 +2870,9 @@ async def process_worker_assignment(db: AsyncSession, req):
             # 🆕 MERGED PATCH — segregation + boe_no in ONE update trip
             patch_segregation = existing_irr_event.segregation_datetime is None and seg_combo
             patch_boe_no      = existing_irr_event.boe_no is None and irr.boe_num
+            patch_dlv_zone     = existing_irr_event.dlv_zone_from_irr is None and irr.dlv_zone  # 🆕
 
-            if patch_segregation or patch_boe_no:
+            if patch_segregation or patch_boe_no or patch_dlv_zone:  # 🆕 add patch_dlv_zone:
                 await db.execute(
                     update(WorkerAssignmentShipment)
                     .where(WorkerAssignmentShipment.id == existing_irr_event.id)
@@ -2884,6 +2886,10 @@ async def process_worker_assignment(db: AsyncSession, req):
                         boe_no=case(
                             (WorkerAssignmentShipment.boe_no.is_(None), irr.boe_num),
                             else_=WorkerAssignmentShipment.boe_no
+                        ),
+                          dlv_zone_from_irr=case(           # 🆕
+                         (WorkerAssignmentShipment.dlv_zone_from_irr.is_(None), irr.dlv_zone),
+                            else_=WorkerAssignmentShipment.dlv_zone_from_irr
                         ),
                         updated_at=now
                     )
@@ -3001,6 +3007,10 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.boe_no.is_(None), irr.boe_num),
                             else_=WorkerAssignmentShipment.boe_no
                         ),
+                       dlv_zone_from_irr=case(
+                        (WorkerAssignmentShipment.dlv_zone_from_irr.is_(None), irr.dlv_zone),
+                        else_=WorkerAssignmentShipment.dlv_zone_from_irr
+                    ),
                         updated_at=now
                     )
                 )
@@ -3075,6 +3085,12 @@ async def process_worker_assignment(db: AsyncSession, req):
                             (WorkerAssignmentShipment.boe_no.is_(None), irr.boe_num),
                             else_=WorkerAssignmentShipment.boe_no
                         ),
+
+                        dlv_zone_from_irr=case(
+                        (WorkerAssignmentShipment.dlv_zone_from_irr.is_(None), irr.dlv_zone),
+                        else_=WorkerAssignmentShipment.dlv_zone_from_irr
+                    ),
+
                         updated_at=now
                     )
                 )
@@ -3146,6 +3162,12 @@ async def process_worker_assignment(db: AsyncSession, req):
                     release_zone=irr.dlv_zone,
                     segregation_datetime=seg_combo,
                     boe_no=irr.boe_num, 
+                    dlv_zone_from_irr=case(
+                    ( 
+                        WorkerAssignmentShipment.dlv_zone_from_irr.is_(None),
+                      irr.dlv_zone),
+                    else_=WorkerAssignmentShipment.dlv_zone_from_irr
+                ),
                     updated_at=now
                 )
             )
@@ -3175,6 +3197,9 @@ async def process_worker_assignment(db: AsyncSession, req):
                 segregation_datetime=seg_combo,   # 🆕
                 boe_no=irr.boe_num,  #   🆕
                 from_irr_table=True,
+
+               dlv_zone_from_irr=irr.dlv_zone,   # 🆕
+
                 created_at=now,
                 updated_at=now
             )
@@ -4191,6 +4216,79 @@ async def get_paginated_worker_assignments_data_list(
     # records = result.scalars().all()
     rows = result.all()
 
+    # ─────────────────────────────────────────────────────────────────────
+    # ✌️NON-COSYS truck-in-out visits for this page's GPs (batched — 2 queries max)
+    # ─────────────────────────────────────────────────────────────────────
+    page_gp_nos = [
+        s.gate_pass_no for (s, h) in rows
+        if s.gate_pass_no and s.gate_pass_no.strip()
+    ]
+
+    cosys_by_gp: Dict[str, list] = {}
+    if page_gp_nos:
+        cosys_rows = (await db.execute( 
+            select(
+                ImportGatePass.gate_pass_no,
+                ImportTruckVisit.id.label("visit_id"),
+                ImportTruckVisit.visit_type,
+                ImportTruckVisit.truck_number,
+                ImportTruckVisit.driver_name,
+                ImportTruckVisit.driver_contact,
+                ImportTruckVisit.truck_in_date_time,
+                ImportTruckVisit.truck_out_date_time,
+                ImportTruckVisit.truck_in_by,
+                ImportTruckVisit.truck_out_by,
+                ImportTruckVisit.is_truck_in,
+                ImportTruckVisit.is_truck_out,
+                ImportTruckVisit.token_no,
+                ImportTruckVisit.queue_no,
+                ImportGatePassAssignment.is_active.label("assignment_active"),
+            )
+            .join(ImportGatePassAssignment,
+                  ImportGatePassAssignment.gate_pass_id == ImportGatePass.id)
+            .join(ImportTruckVisit,
+                  ImportTruckVisit.id == ImportGatePassAssignment.truck_visit_id)
+            .where(ImportGatePass.gate_pass_no.in_(page_gp_nos))
+            .order_by(ImportTruckVisit.truck_in_date_time.desc().nullslast())
+        )).all()
+
+        # Resolve in-by / out-by emp_ids → names in ONE query
+        emp_ids = set()
+        for r in cosys_rows:
+            if r.truck_in_by:
+                emp_ids.add(r.truck_in_by)
+            if r.truck_out_by:
+                emp_ids.add(r.truck_out_by)
+
+        name_map: Dict[str, str] = {}
+        if emp_ids:
+            users = (await db.execute(
+                select(User.emp_id, User.name).where(User.emp_id.in_(emp_ids))
+            )).all()
+            name_map = {u.emp_id: u.name for u in users}
+
+        # Group visits per GP (already newest-first from ORDER BY)
+        for r in cosys_rows:
+            is_by_hand = (r.visit_type == "BY_HAND")
+            cosys_by_gp.setdefault(r.gate_pass_no, []).append({
+                "non_cosys_visit_id":          r.visit_id,
+                "non_cosys_is_by_hand":        is_by_hand,
+                "non_cosys_truck_no":          r.truck_number,        # None for by-hand
+                "non_cosys_driver_name":       r.driver_name,
+                "non_cosys_driver_contact":    r.driver_contact,
+                "non_cosys_truck_in":          r.truck_in_date_time,
+                "non_cosys_truck_out":         r.truck_out_date_time,
+                "non_cosys_truck_in_by":       r.truck_in_by,
+                "non_cosys_truck_in_by_name":  name_map.get(r.truck_in_by),
+                "non_cosys_truck_out_by":      r.truck_out_by,
+                "non_cosys_truck_out_by_name": name_map.get(r.truck_out_by),
+                "non_cosys_is_truck_in":       bool(r.is_truck_in),
+                "non_cosys_is_truck_out":      bool(r.is_truck_out),
+                "non_cosys_token_no":          r.token_no,
+                "non_cosys_queue_no":          r.queue_no,
+                "non_cosys_assignment_active": bool(r.assignment_active),
+            })
+# =================================================================================
     # records = [
     #     WorkerAssignmentResponseForWorker.from_orm(shipment, header)
     #     for shipment, header in rows
@@ -4255,6 +4353,9 @@ async def get_paginated_worker_assignments_data_list(
             "truck_no":shipment.truck_no,
             "truck_in_datetime":shipment.truck_in_datetime,
             "truck_out_datetime":shipment.truck_out_datetime,
+
+             # ── NON-COSYS truck-in-out module visits (list — a GP can be on many) ──
+            "non_cosys_truck_visits": cosys_by_gp.get(shipment.gate_pass_no, []),
 
 
         })

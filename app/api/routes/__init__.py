@@ -28,6 +28,9 @@ from .exportOperation.export_base_master import router as export_base_master_rou
 from .exportOperation.export_fileupload_meta_log import router as export_fileupload_meta_log_router
 from .exportOperation.export_import_tp_report_for_car import router as export_impotrt_xray_tp_report_router
 from .exportOperation.car_message_awb_history import router as export_car_message_awb_history_router
+from .importOperation.imp_truck_in_out_module import router as imp_truck_in_out_router
+
+from .app_config.app_config_route import router as app_config_router
 from .exportOperation.export_transipment_import_segrigation import router as export_transipment_import_segrigation_router
 
 
@@ -68,6 +71,9 @@ api_v1_router.include_router(irregularity_report, prefix="/import", tags=["irreg
 api_v1_router.include_router(oc_merge_gatepass, prefix="/import", tags=["oc-merge-gatepass-report"])
 api_v1_router.include_router(all_import_logs_route, prefix="/import", tags=["logs report of imports"])
 
+
+api_v1_router.include_router(imp_truck_in_out_router, prefix="/import/truck-in-out", tags=["Import Truck IN OUT Module"])
+
 # ---> Fast Track TEMP IRM OC MERGE
 api_v1_router.include_router(temp_irm_oc_merge_creation, prefix="/import", tags=["Fast Track TEMP IRM OC MERGE"])
 # ---> 
@@ -84,3 +90,10 @@ api_v1_router.include_router(damage_report,prefix='/import',tags=["damage-report
 
 # =============================== DOMESTIC OPERATION ==========================================================
 api_v1_router.include_router(domestic_xray_report_route,prefix='/domestic',tags=['Domestic X-ray'])
+
+
+
+
+# ====App Config============================ 
+
+api_v1_router.include_router(app_config_router, prefix="/app/config", tags=["App Config"])
