@@ -13,6 +13,7 @@ from app.schemas.importOperation.imp_truck_in_out_module import (
     CancelQueueRequest,
     CancelQueueResponse,
     CcClearChargesRequest,
+    ConfirmGpCompleteRequest,
     GatePassCheckRequest,
     GatePassCheckResponse,
     GatePassReassignRequest,
@@ -57,7 +58,8 @@ router = APIRouter()
 
 @router.post("/check-gate-pass", response_model=GatePassCheckResponse)
 async def check_gate_pass(
-    request: GatePassCheckRequest, db: AsyncSession = Depends(get_db)
+    request: GatePassCheckRequest, db: AsyncSession = Depends(get_db),
+     current_user = Depends(verify_token_and_get_user),
 ):
     """
     Validate a gate pass against IRR Report table.
@@ -116,18 +118,23 @@ async def list_queued_trucks(
 async def add_to_staging(
     request: TruckStagingRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(verify_token_and_get_user),
+    current_user=Depends(verify_token_and_get_user),
     # session_id: str = "default-session"  # In real app, derive from user/session context
 ):
     """
     Add a truck + gate pass entry into staging table.
     """
-    return await ImportTruckStagingService.add_to_staging(db, request,current_user.emp_id)
+    return await ImportTruckStagingService.add_to_staging(
+        db, request, current_user.emp_id
+    )
 
 
 @router.delete("/remove/{entry_id}")
 async def remove_from_staging(
-    entry_id: int, truck_number: str, db: AsyncSession = Depends(get_db), current_user = Depends(verify_token_and_get_user)
+    entry_id: int,
+    truck_number: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
 ):
     return await ImportTruckStagingService.remove_from_staging(
         db, entry_id, truck_number, current_user.emp_id
@@ -152,13 +159,13 @@ async def list_staging_entries(
 )
 async def commit_truck(
     truck_number: str,
-    emp_id: str,
+    current_user = Depends(verify_token_and_get_user),
     db: AsyncSession = Depends(get_db),
     device_id: str = None,
     is_queued: bool = False,  # ← NEW query param
 ):
     return await ImportTruckVisitService.commit_staging_to_truck_visit(
-        db, truck_number, emp_id, device_id, is_queued
+        db, truck_number, current_user.emp_id, device_id, is_queued
     )
 
 
@@ -166,10 +173,12 @@ async def commit_truck(
     "/by-hand-pickup-in",
     response_model=ByHandPickupResponse,
     description="Create a by-hand pickup entry directly. No truck number, no queue, no staging — direct check-in for cargo carried by hand.",
+   
 )
 async def by_hand_pickup_in(
     request: ByHandPickupRequest,
     db: AsyncSession = Depends(get_db),
+     current_user = Depends(verify_token_and_get_user),
 ):
     """
     Create a by-hand pickup entry. No truck, no queue, direct check-in.
@@ -179,7 +188,7 @@ async def by_hand_pickup_in(
         person_name=request.person_name,
         person_contact=request.person_contact,
         gate_pass_nos=request.gate_pass_nos,
-        emp_id=request.emp_id,
+        emp_id=current_user.emp_id,
         device_id=request.device_id,
         remarks=request.remarks,
     )
@@ -189,6 +198,7 @@ async def by_hand_pickup_in(
 async def gate_pass_out(
     request: GatePassOutRequest,
     db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
 ):
     """
     Record pcs loaded for a specific gate pass (Gate Pass OUT).
@@ -198,14 +208,29 @@ async def gate_pass_out(
         truck_visit_id=request.truck_visit_id,
         gate_pass_no=request.gate_pass_no,
         loaded_pcs=request.loaded_pcs,
-        emp_id=request.emp_id,
+        emp_id=current_user.emp_id
     )
+
+
+@router.post("/confirm-gp-complete")
+async def confirm_gp_complete(
+    request: ConfirmGpCompleteRequest,   # { truck_visit_id: int, gate_pass_no: str }
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
+):
+    emp_id = current_user.get("emp_id") if isinstance(current_user, dict) else current_user.emp_id
+    return await ImportGatePassOutService.confirm_gp_complete_on_truck(
+        db=db, truck_visit_id=request.truck_visit_id,
+        gate_pass_no=request.gate_pass_no, emp_id=emp_id,
+    )
+
 
 
 @router.post("/truck-out", response_model=TruckOutResponse)
 async def truck_out(
     request: TruckOutRequest,
     db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
 ):
     """
     Mark a truck visit as OUT.
@@ -214,14 +239,16 @@ async def truck_out(
     return await ImportTruckOutService.truck_out(
         db=db,
         truck_visit_id=request.truck_visit_id,
-        emp_id=request.emp_id,
+        emp_id=current_user.emp_id,
         device_id=request.device_id,
     )
 
 
 @router.post("/reassign-gatepass", response_model=GatePassReassignResponse)
 async def reassign_gate_pass(
-    request: GatePassReassignRequest, db: AsyncSession = Depends(get_db),current_user = Depends(verify_token_and_get_user)
+    request: GatePassReassignRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
 ):
     return await ImportGatePassReassignService.reassign_gate_pass(
         db=db,
@@ -250,10 +277,20 @@ async def promote_queue(
     )
 
 
-@router.post("/cancel-queue", response_model=CancelQueueResponse)
-async def cancel_queue(request: CancelQueueRequest, db: AsyncSession = Depends(get_db)):
+@router.post(
+    "/cancel-queue",
+    response_model=CancelQueueResponse,
+)
+async def cancel_queue(
+    request: CancelQueueRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user)
+    ):
     return await ImportTruckQueueService.cancel_queue(
-        db, request.truck_visit_id, request.emp_id, request.remarks
+        db,
+          request.truck_visit_id, 
+       current_user.emp_id,
+        request.remarks
     )
 
 
@@ -311,6 +348,7 @@ async def truck_out_search(
 async def add_more_gp(
     request: AddMoreGpRequest,
     db: AsyncSession = Depends(get_db),
+     current_user=Depends(verify_token_and_get_user),
 ):
     """
     Add more gate passes to an already-checked-in truck (before truck out).
@@ -320,7 +358,7 @@ async def add_more_gp(
         db=db,
         truck_visit_id=request.truck_visit_id,
         gate_pass_nos=[item.gate_pass_no for item in request.gate_passes],
-        emp_id=request.emp_id,
+        emp_id=current_user.emp_id,
         remarks=request.remarks,
     )
 
@@ -345,7 +383,9 @@ async def customer_care_search(
 
 @router.post("/save-gp-storage-charge")
 async def save_gp_storage_charge(
-    request: SaveGpChargeRequest, db: AsyncSession = Depends(get_db)
+    request: SaveGpChargeRequest, 
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
 ):
     return await ImportTruckOutService.save_gp_storage_charge_from_customer(
         db,
@@ -354,18 +394,33 @@ async def save_gp_storage_charge(
         storage_charge=request.storage_charge,
         challan_no=request.challan_no,
         remarks=request.remarks,
-        emp_id=request.emp_id,
+        emp_id=current_user.emp_id
     )
 
 
 @router.post("/customer-care-clear-charges")
 async def customer_care_clear_charges(
-    request: CcClearChargesRequest, db: AsyncSession = Depends(get_db)
+    request: CcClearChargesRequest, db: AsyncSession = Depends(get_db),
+    current_user=Depends(verify_token_and_get_user),
 ):
     return await ImportCustomercareService.customer_care_clear_charges(
-        db, 
-        truck_visit_id=request.truck_visit_id,
-        emp_id=request.emp_id
+        db, truck_visit_id=request.truck_visit_id, emp_id=current_user.emp_id
+    )
+
+
+@router.get("/queue-list-view")
+async def queue_list_view(
+    target_date: date = None,
+    status: str = None,  # optional: "QUEUED" | "CANCELLED"; omit = both
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    View-only queue list (QUEUED + CANCELLED by default).
+    target_date omitted → all dates, newest first.
+    """
+    statuses = [status.strip().upper()] if status else ["QUEUED", "CANCELLED"]
+    return await ImportTruckQueueService.list_queues_view(
+        db, target_date=target_date, statuses=statuses
     )
 
 
@@ -497,6 +552,18 @@ async def get_activity_log(
             "refers_to": "ImportGatePassAssignment.id",
             "table": "import_gate_pass_assignment",
             "description": "The assignment row created when GP was added to an already-checked-in truck.",
+        },
+        "GP_STORAGE_CHARGE_SET": {
+            "entity_type": "gp_assignment",
+            "refers_to": "ImportGatePassAssignment.id",
+            "table": "import_gate_pass_assignment",
+            "description": "Storage charge + challan first recorded for this GP/visit.",
+        },
+        "GP_STORAGE_CHARGE_UPDATED": {
+            "entity_type": "gp_assignment",
+            "refers_to": "ImportGatePassAssignment.id",
+            "table": "import_gate_pass_assignment",
+            "description": "Storage charge/challan/remarks corrected. See 'changes' for old→new values.",
         },
         "GP_REASSIGNED": {
             "entity_type": "gp_assignment",

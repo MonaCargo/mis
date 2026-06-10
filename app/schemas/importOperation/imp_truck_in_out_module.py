@@ -25,7 +25,8 @@ class GatePassCheckResponse(BaseModel):
     gate_pass_no: Optional[str] = None
     agent: Optional[str] = None
     consignee: Optional[str] = None
-    pcs: Optional[int] = None
+    pcs: Optional[int] = None    # it represent available pcs for booking
+    total_pcs:Optional[int] = None
     grg_wt: Optional[float] = None
     issued_date: Optional[datetime] = None
     gate_pass_released_by: Optional[str] = None
@@ -36,6 +37,7 @@ class GatePassCheckResponse(BaseModel):
     drop_dlv_zone: Optional[str] = None
     lift_out_zone: Optional[str] = None    
     dlv_zone_from_irr: Optional[str] = None     
+    Info:Optional[str] = None
 
 
 class TruckStagingRequest(BaseModel):
@@ -401,3 +403,9 @@ class CcTruckOutRequest(BaseModel):
 class CcClearChargesRequest(BaseModel):
     truck_visit_id: int
     emp_id: Optional[str] = None
+
+
+
+class ConfirmGpCompleteRequest(BaseModel):
+    truck_visit_id: int
+    gate_pass_no: str
