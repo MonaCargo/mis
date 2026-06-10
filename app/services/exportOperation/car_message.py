@@ -7,7 +7,7 @@ import re
 from typing import Dict, Literal, Optional
 from fastapi import status
 from zoneinfo import ZoneInfo
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import aliased, joinedload
 from fastapi import HTTPException
 import openpyxl
 import pytz
@@ -672,7 +672,7 @@ async def get_available_awbs_for_flight_booking_dropdown(
 
     # ── Subquery 1: booked pcs per AWB across active flights ───────
     booked_subq = _booked_pcs_subquery()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=15)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=450)
 
     # ── Subquery 2: scanned pcs per AWB ───────────────────────────
     scanned_subq = (
@@ -8305,6 +8305,8 @@ async def get_dashboard_drilldown_detail_v2(
     # ALL AWBs
     # ═════════════════════════════════════════════════════════════════════
     if detail_type == "all_awbs":
+        UltraUser  = aliased(User)
+        ManualUser = aliased(User)
  
         stmt = _apply_source_filter_on_stmt(
             select(
@@ -8318,9 +8320,26 @@ async def get_dashboard_drilldown_detail_v2(
                 ExportCarMessageAwbMaster.rcs_datetime,
                 ExportCarMessageAwbMaster.car_message_datetime_combo,
 
-                 ExportCarMessageAwbMaster.is_ultra_fast,
+                ExportCarMessageAwbMaster.is_ultra_fast,
                 ExportCarMessageAwbMaster.is_manually_created,
-            ).where(
+                ExportCarMessageAwbMaster.created_at,  # used as manual-created time
+                 ExportCarMessageAwbMaster.is_ultra_fast_marked_by,
+                ExportCarMessageAwbMaster.is_ultra_fast_marked_at,
+                ExportCarMessageAwbMaster.manual_created_by,
+                UltraUser.name.label("ultra_by_name"),
+                ManualUser.name.label("manual_by_name"),
+            )
+             .join(
+        UltraUser,
+        UltraUser.emp_id == ExportCarMessageAwbMaster.is_ultra_fast_marked_by,
+        isouter=True,
+    )
+    .join(
+        ManualUser,
+        ManualUser.emp_id == ExportCarMessageAwbMaster.manual_created_by,
+        isouter=True,
+    )
+            .where(
                 ExportCarMessageAwbMaster.car_message_datetime_combo >= day_start_utc,
                 ExportCarMessageAwbMaster.car_message_datetime_combo <= day_end_utc,
             ).order_by(ExportCarMessageAwbMaster.awb_no),
@@ -8350,6 +8369,13 @@ async def get_dashboard_drilldown_detail_v2(
 
                     "rcs_datetime": _to_ist_str(r.rcs_datetime),
                     "car_message_datetime": _to_ist_str(r.car_message_datetime_combo),
+                    "ultra_fast_by": r.is_ultra_fast_marked_by,
+
+                    "ultra_fast_by_name": r.ultra_by_name or None,
+                    "ultra_fast_at": _to_ist_str(r.is_ultra_fast_marked_at),
+                    "manual_created_by": r.manual_created_by,
+                    "manual_created_by_name": r.manual_by_name or None,
+                    "manual_created_at": _to_ist_str(r.created_at) if r.is_manually_created else None,
                 }
                 for r in rows
             ],
@@ -10198,19 +10224,71 @@ async def get_awb_checker_info(awb_no: str, db: AsyncSession) -> AwbCheckerInfoR
     # ── 6. Availability verdict ───────────────────────────────────
     reasons: list[str] = []
 
-    if not awb.is_ultra_fast:
-        if awb.status != "RCS":
-            reasons.append(
-                f"Status is '{awb.status or 'unknown'}' — must be RCS before booking"
-            )
-        if scanned_pcs < total_pcs:
-            reasons.append(
-                f"Only {scanned_pcs} of {total_pcs} pieces scanned — all must be scanned"
-            )
+    # if not awb.is_ultra_fast:
+    #     if awb.status != "RCS":
+    #         reasons.append(
+    #             f"Status is '{awb.status or 'unknown'}' — must be RCS before booking"
+    #         )
+    #     if scanned_pcs < total_pcs:
+    #         reasons.append(
+    #             f"Only {scanned_pcs} of {total_pcs} pieces scanned — all must be scanned"
+    #         )
 
-    remaining_pcs = total_pcs - total_booked_pcs
-    if remaining_pcs <= 0:
-        reasons.append("All pieces already booked — no remaining pieces")
+    # ── 6. Availability verdict ───────────────────────────────────
+    # reasons: list[str] = []
+
+    # if not awb.is_ultra_fast:
+    #     if awb.status not in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:
+    #         reasons.append(
+    #             f"Status '{awb.status or 'unknown'}' is not eligible for booking "
+    #             f"— must be one of {', '.join(sorted(FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING))}"
+    #         )
+      
+    # if awb.is_ultra_fast:
+    #     available_pcs = total_pcs - total_booked_pcs
+    # else:
+    #     available_pcs = scanned_pcs - total_booked_pcs
+
+    # if not awb.is_ultra_fast and scanned_pcs <= 0:
+    #     reasons.append("No pieces scanned yet — at least one piece must be scanned before booking")
+    # elif available_pcs <= 0:
+    #     if total_booked_pcs >= scanned_pcs and scanned_pcs < total_pcs:
+    #         # everything scanned so far is booked, but more pcs still need scanning
+    #         reasons.append(
+    #             f"All {scanned_pcs} scanned piece(s) are already booked — "
+    #             f"scan the remaining {total_pcs - scanned_pcs} piece(s) to book more"
+    #         )
+    #     else:
+    #         reasons.append("All available pieces already booked — no remaining pieces")
+
+    # ── 6. Availability verdict ───────────────────────────────────
+    reasons: list[str] = []
+
+    # ultra-fast OR manually-created → no scan required, load directly
+    skip_scan = awb.is_ultra_fast or awb.is_manually_created
+
+    if awb.status not in FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING:
+        reasons.append(
+            f"Status '{awb.status or 'unknown'}' is not eligible for booking "
+            f"— must be one of {', '.join(sorted(FINAL_STATUSES_FROM_WH_INVENTRY_FLT_BOOKING))}"
+        )
+
+    # available pcs: skip-scan AWBs use total_pcs, normal AWBs use scanned_pcs
+    if skip_scan:
+        available_pcs = total_pcs - total_booked_pcs
+    else:
+        available_pcs = scanned_pcs - total_booked_pcs
+
+    if not skip_scan and scanned_pcs <= 0:
+        reasons.append("No pieces scanned yet — at least one piece must be scanned before booking")
+    elif available_pcs <= 0:
+        if not skip_scan and total_booked_pcs >= scanned_pcs and scanned_pcs < total_pcs:
+            reasons.append(
+                f"All {scanned_pcs} scanned piece(s) are already booked — "
+                f"scan the remaining {total_pcs - scanned_pcs} piece(s) to book more"
+            )
+        else:
+            reasons.append("All available pieces already booked — no remaining pieces for booking")
 
     # ── 7. Status datetime ────────────────────────────────────────
     status_datetime = awb.rcs_datetime if awb.status == "RCS" else awb.updated_at
