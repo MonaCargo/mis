@@ -15,6 +15,7 @@ from app.db.models.exportOperation.car_message import ExportAwbSkidItemSequence,
 from app.db.models.exportOperation.export_fileupload_meta_log import ExportFileUploadMetaLog
 from app.db.models.exportOperation.export_location_master import ExportLocationsMaster
 from app.db.models.exportOperation.export_skid_master import ExportSkidMaster
+from app.db.models.user import User
 from app.db.session import get_db
 from app.schemas.exportOperation.car_message import AvailableAwbForFlightBookingResponse, AvailableAwbForFlightBookingResponseList, AwbCheckerInfoResponse, AwbLookupError, AwbManualCreateRequest, AwbManualCreateResponse, CarMessageExcelExportRequest, CreateFlightBookingFromPdfResponse, CreateFlightBookingRequest, CreateFlightBookingResponse, CreateUldAssignmentRequest, DashboardStatsResponse, EditFlightBookingRequest, EditFlightBookingResponse, EditUldAssignmentRequest, FlightBookingAwbItem, FlightBookingByFlightResponse, FlightUldLoadingStatusResponse, PdfUpsertResponse, RetrieveSkidFromLocationRequest, ScanItemIntoUldRequest, ScanItemIntoUldResponse, UldAssignmentDataResponse, UldAssignmentResponse, UldMasterResponse, UldVerifyForLoadingResponse, UltraFastScanRequest, UpdateFlightDptDatetime
 from app.schemas.exportOperation.uld_master import AddUldsRequest
@@ -1287,6 +1288,20 @@ async def search_awb_across_all(
         )
     ).scalar_one()
 
+    # ── 3b. Resolve user names for ultrafast / manual ──────────────────────────
+    emp_ids = [
+        e for e in (awb_record.is_ultra_fast_marked_by, awb_record.manual_created_by)
+        if e
+    ]
+    name_by_emp: dict[str, str] = {}
+    if emp_ids:
+        user_rows = (
+            await db.execute(
+                select(User.emp_id, User.name).where(User.emp_id.in_(emp_ids))
+            )
+        ).all()
+        name_by_emp = {emp_id: name for emp_id, name in user_rows}
+
     # ── 4. Shape response ─────────────────────────────────────────────────────
     flight_bookings = [
         {
@@ -1311,8 +1326,19 @@ async def search_awb_across_all(
         "scanned_pcs":      scanned_pcs,
         "total_booked_pcs": total_booked_pcs,
         "flight_bookings":  flight_bookings,
+
+        # resolved names
+            "ultra_fast_by_name": (
+                name_by_emp.get(awb_record.is_ultra_fast_marked_by)
+                if awb_record.is_ultra_fast_marked_by else None
+            ),
+            "manual_created_by_name": (
+                name_by_emp.get(awb_record.manual_created_by)
+                if awb_record.manual_created_by else None
+            ),
     },
     }
+
 # @router.get(
 #     "/car-message/awb-search-for-web",
 #     summary="Search AWB by exact match across all records for web table",

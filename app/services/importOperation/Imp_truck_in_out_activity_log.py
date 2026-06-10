@@ -67,7 +67,7 @@ async def log_activity_of_imp_truck_in_out(
             snapshot_before=snapshot_before,
             snapshot_after=snapshot_after,
             changes=changes,
-            performed_by=performed_by or "SYSTEM",
+            performed_by=performed_by or "-",
             performed_by_role=performed_by_role,
             device_id=device_id,
             ip_address=ip_address,
