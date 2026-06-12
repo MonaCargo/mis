@@ -186,7 +186,7 @@ class UldValidationResult:
 
 ULD_PREFIXES = [
     "AKE", "AMF", "ALF", "AAP", "AMP", "FLA", "RKN", "RAP", "PLB",
-    "PMC", "PKC", "PAG", "PAJ", "PLA",
+    "PMC", "PKC", "PAG", "PAJ", "PLA","AAF",
 ]
 
 # Sort longest first so AKE is matched before AK, etc.
