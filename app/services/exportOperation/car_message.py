@@ -672,7 +672,7 @@ async def get_available_awbs_for_flight_booking_dropdown(
 
     # ── Subquery 1: booked pcs per AWB across active flights ───────
     booked_subq = _booked_pcs_subquery()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=450)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=15)
 
     # ── Subquery 2: scanned pcs per AWB ───────────────────────────
     scanned_subq = (

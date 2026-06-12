@@ -561,7 +561,7 @@ import math
 import traceback
 from typing import List, Optional
 from zoneinfo import ZoneInfo
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Body, Depends, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.params import File
 from fastapi.responses import StreamingResponse
 import pandas as pd
@@ -572,6 +572,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependency import require_roles, verify_token_and_get_user
 from sqlalchemy.exc import SQLAlchemyError
 # from app.db.models.importOperation.worker_assignment import WorkerAssignment
+from app.db.models.importOperation.import_gp_mismatch_log import ImportGpMismatchLog
 from app.db.models.importOperation.worker_assignment import WorkerAssignmentShipment
 from app.db.models.user import User
 from app.db.session import get_db
@@ -592,6 +593,8 @@ from app.schemas.importOperation.worker_assignment import (
     WorkerAssignmentSearchRequest,
 )
 from app.schemas.user import UserListResponse, UserRead
+from app.services.importOperation.import_pick_location import ImportLocationPickupService
+from app.services.importOperation.import_shipment_hold import ImportShipmentHoldService
 from app.services.importOperation.worker_assignment_service import (
     add_drop_dlv_zone_by_assigned_worker,
     add_loading_in_lift_by_assigned_worker,
@@ -629,6 +632,7 @@ from app.services.importOperation.worker_assignment_service import (
     get_top_performers,
     get_worker_assignment_lists_by_emp_id,
     get_worker_shipment_details_by_empid_which_assigned_not_dropatlift,
+    ist_day_to_utc_range,
     mark_final_delivery_by_assigned_worker,
     mark_shipment_need_tracer,
     process_worker_assignment,
@@ -2633,3 +2637,285 @@ async def _batched_update_truck_datetimes(
  
  
 
+
+# ===================== Pick Location =========================
+
+
+def get_user_info(request: Request, current_user: User) -> dict:
+    """Extract user information for pick/unpick + audit fields."""
+    return {
+        "emp_id": current_user.emp_id,
+        "role": current_user.role,
+        "ip_address": request.client.host if request.client else None,
+        "device_id": request.headers.get("X-Device-ID"),
+        "user_agent": request.headers.get("User-Agent"),
+    }
+
+
+@router.post(
+    "/pick-from-location",
+    description="Flag a location as picked (imp_tracer / imp_gp_user). "
+                "Re-picking an already-picked location is an idempotent no-op.",
+)
+async def pick_location(
+    request: Request,
+    assignment_shipment_id: int = Form(...),
+    oc_no: str = Form(...),
+    location: str = Form(...),
+    device_id: str = Form(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    user_info = get_user_info(request, current_user)
+
+    print(request,"-",assignment_shipment_id,"-",oc_no,"-",location)
+
+    # Prefer device_id from the form if sent, else fall back to the header value
+    if device_id:
+        user_info["device_id"] = device_id
+
+    service = ImportLocationPickupService(db)
+    row = await service.pick_location(
+        assignment_shipment_id=assignment_shipment_id,
+        oc_no=oc_no,
+        location=location,
+        user_info=user_info,
+    )
+
+    return {
+        "success": True,
+        "message": "Location picked successfully",
+        "id": row.id,
+        "assignment_shipment_id": row.assignment_shipment_id,
+        "location": row.location,
+        "is_picked": row.is_picked,
+        "picked_by": row.picked_by,
+        "picked_datetime": row.picked_datetime,
+    }
+
+
+@router.post(
+    "/unpick-from-location",
+    description="Undo a location pickup (super_admin only). "
+                "Keeps picked_by/picked_datetime as history.",
+)
+async def unpick_location(
+    request: Request,
+    assignment_shipment_id: int = Form(...),
+    location: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    user_info = get_user_info(request, current_user)
+
+    service = ImportLocationPickupService(db)
+    row = await service.unpick_location(
+        assignment_shipment_id=assignment_shipment_id,
+        location=location,
+        user_info=user_info,
+    )
+
+    return {
+        "success": True,
+        "message": "Location unpicked successfully",
+        "id": row.id,
+        "assignment_shipment_id": row.assignment_shipment_id,
+        "location": row.location,
+        "is_picked": row.is_picked,
+        "unpicked_by": row.unpicked_by,
+        "unpicked_datetime": row.unpicked_datetime,
+    }
+
+
+
+# ============== Gp mismatch log api ============================
+
+
+@router.get("/gp-mismatch/logs")
+async def get_gp_mismatch_logs(
+    start_date: date = Query(..., description="IST date YYYY-MM-DD"),
+    end_date: date = Query(..., description="IST date YYYY-MM-DD"),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    """
+    List GP mismatch logs whose GP-issued date OR integration date
+    falls within the selected IST date range.
+    Both dates are always supplied by the frontend (IST).
+    """
+    # IST day → UTC window. Single-day helper called twice:
+    # start of the first day, end of the last day.
+    utc_start, _ = ist_day_to_utc_range(start_date)
+    _, utc_end   = ist_day_to_utc_range(end_date)
+
+    # date lies in EITHER gp_issued OR integration
+    in_gp_issued = and_(
+        ImportGpMismatchLog.gp_issued_datetime.isnot(None),
+        ImportGpMismatchLog.gp_issued_datetime >= utc_start,
+        ImportGpMismatchLog.gp_issued_datetime < utc_end,
+    )
+    in_integrate = and_(
+        ImportGpMismatchLog.integrate_date_time.isnot(None),
+        ImportGpMismatchLog.integrate_date_time >= utc_start,
+        ImportGpMismatchLog.integrate_date_time < utc_end,
+    )
+
+    stmt = (
+        select(ImportGpMismatchLog)
+        .where(or_(in_gp_issued, in_integrate))
+        .order_by(ImportGpMismatchLog.created_at.desc())
+    )
+
+    rows = (await db.execute(stmt)).scalars().all()
+
+    return {
+        "success": True,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "total": len(rows),
+        "logs": [
+            {
+                "id": r.id,
+                "assignment_header_id": r.assignment_header_id,
+                "awb_no": r.awb_no,
+                "hawb": r.hawb,
+                "existing_gate_pass": r.existing_gate_pass,
+                "incoming_gate_pass": r.incoming_gate_pass,
+                "gp_issued_datetime": r.gp_issued_datetime,
+                "integrate_date_time": r.integrate_date_time,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ],
+    }
+
+
+
+
+
+
+
+# ============================= ✌️Hold relates routes ===============
+
+def get_user_info(request: Request, current_user: User) -> dict:
+    return {
+        "emp_id": current_user.emp_id,
+        "role": current_user.role,
+        "ip_address": request.client.host if request.client else None,
+        "device_id": request.headers.get("X-Device-ID"),
+        "user_agent": request.headers.get("User-Agent"),
+    }
+
+
+def _serialize(h) -> dict:
+    return {
+        "id": h.id,
+        "hold_type": h.hold_type,
+        "awb_no": h.awb_no,
+        "hawb": h.hawb,
+        "oc_no": h.oc_no,
+        "boe_no": h.boe_no,
+        "gate_pass_no": h.gate_pass_no,
+        "assignment_header_id": h.assignment_header_id,
+        "is_active": h.is_active,
+        "reason": h.reason,
+        "held_by": h.held_by,
+        "held_datetime": h.held_datetime,
+        "released_by": h.released_by,
+        "released_datetime": h.released_datetime,
+        "release_reason": h.release_reason,
+        "created_at": h.created_at,
+        "updated_at": h.updated_at,
+    }
+
+
+@router.post(
+    "/hold-shipment/create",
+    description="Place a hold by AWB_HAWB / OC / BOE / GP "
+                "(super_admin or imp_tracer).",
+)
+async def create_hold(
+    request: Request,
+    hold_type: str = Form(...),                  # AWB_HAWB / OC / BOE / GP
+    awb_no: Optional[str] = Form(None),
+    hawb: Optional[str] = Form(None),
+    oc_no: Optional[str] = Form(None),
+    boe_no: Optional[str] = Form(None),
+    gate_pass_no: Optional[str] = Form(None),
+    reason: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    user_info = get_user_info(request, current_user)
+    service = ImportShipmentHoldService(db)
+
+    row = await service.create_hold(
+        hold_type=hold_type,
+        awb_no=awb_no,
+        hawb=hawb,
+        oc_no=oc_no,
+        boe_no=boe_no,
+        gate_pass_no=gate_pass_no,
+        reason=reason,
+        user_info=user_info,
+    )
+
+    return {
+        "success": True,
+        "message": "Shipment hold created",
+        "hold": _serialize(row),
+    }
+
+
+@router.post(
+    "/{hold_id}/release-hold-shipment",
+    description="Release a hold (super_admin only). Keeps the record as history.",
+)
+async def release_hold(
+    hold_id: int,
+    request: Request,
+    release_reason: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    user_info = get_user_info(request, current_user)
+    service = ImportShipmentHoldService(db)
+
+    row = await service.release_hold(
+        hold_id=hold_id,
+        release_reason=release_reason,
+        user_info=user_info,
+    )
+
+    return {
+        "success": True,
+        "message": "Shipment hold released",
+        "hold": _serialize(row),
+    }
+
+
+@router.get(
+    "/list-all-the-hold-and-released-shipments",
+    description="List holds. query_type = hold (active) / released / all."
+                "Optional IST date range on held_datetime.",
+)
+async def list_holds(
+    query_type: str = Query("hold", description="hold / released / all"),
+    start_date: Optional[date] = Query(None, description="IST YYYY-MM-DD"),
+    end_date: Optional[date] = Query(None, description="IST YYYY-MM-DD"),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    service = ImportShipmentHoldService(db)
+    rows = await service.list_holds(
+        query_type=query_type,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    return {
+        "success": True,
+        "query_type": query_type,
+        "total": len(rows),
+        "holds": [_serialize(r) for r in rows],
+    }

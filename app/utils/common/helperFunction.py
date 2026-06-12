@@ -55,3 +55,34 @@ def convert_ist_day_to_utc_range_helper(date_str: str):
         start_ist.astimezone(pytz.UTC),
         end_ist.astimezone(pytz.UTC)
     )
+
+
+
+
+
+
+import pytz
+from datetime import datetime, date as date_type
+
+# def ist_day_to_utc_range(d):
+#     """IST calendar day → (utc_start, utc_end). Accepts 'YYYY-MM-DD' str or a date."""
+#     ist = pytz.timezone("Asia/Kolkata")
+#     if isinstance(d, str):
+#         d = datetime.strptime(d, "%Y-%m-%d")
+#     elif isinstance(d, date_type):
+#         d = datetime(d.year, d.month, d.day)
+#     start_ist = ist.localize(d.replace(hour=0, minute=0, second=0, microsecond=0))
+#     end_ist = ist.localize(d.replace(hour=23, minute=59, second=59, microsecond=999999))
+#     return start_ist.astimezone(pytz.UTC), end_ist.astimezone(pytz.UTC)
+
+def ist_day_to_utc_range(date_str: str):
+    if not date_str:
+        return None, None
+
+    ist = pytz.timezone("Asia/Kolkata")
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+
+    start_ist = ist.localize(d.replace(hour=0, minute=0, second=0))
+    end_ist = ist.localize(d.replace(hour=23, minute=59, second=59, microsecond=999999))
+
+    return start_ist.astimezone(pytz.UTC), end_ist.astimezone(pytz.UTC)

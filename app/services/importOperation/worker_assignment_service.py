@@ -1628,9 +1628,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.routes.domesticOperation.domestic_xray_report import convert_ist_day_to_utc_range
 from app.db.models.importOperation.damage_report import DamageReason, DamageReport, DamageReportReason
 from app.db.models.importOperation.imp_truck_in_out_module import ImportGatePass, ImportGatePassAssignment, ImportTruckVisit
+from app.db.models.importOperation.import_gp_mismatch_log import ImportGpMismatchLog
+from app.db.models.importOperation.import_shipment_hold import ImportShipmentHold
 from app.db.models.user import User
 from app.services.exportOperation.car_message import ist_date_to_utc_range
 from app.services.importOperation.audit_log_worker_assignment import log_worker_assignment_audit
+from app.services.importOperation.import_shipment_hold import assert_not_on_hold
 from app.utils.common.enums import DamageStatusInWorkerAssignmnet, WorkerAssignmentAuditSource
 from app.utils.common.helperFunction import convert_ist_day_to_utc_range_helper, detect_origin_source, get_utc_now
 from sqlalchemy.orm import aliased,selectinload
@@ -1642,7 +1645,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.db.models.importOperation.oc_merge_gatepass import OcMergeGatePass
 from app.db.models.importOperation.import_release_report import IrrReport
-from app.db.models.importOperation.worker_assignment import WorkerAssignmentHeader, WorkerAssignmentShipment
+from app.db.models.importOperation.worker_assignment import ImportLocationPickup, WorkerAssignmentHeader, WorkerAssignmentShipment
 from app.schemas.importOperation.worker_assignment import WorkerAssignmentRequest, WorkerAssignmentResponseForWorker, WorkerAssignmentResponseForWorkerLists
 
 
@@ -3106,6 +3109,23 @@ async def process_worker_assignment(db: AsyncSession, req):
                     f"Info : received for OC shipment with existing gate_pass_no '{oc_event.gate_pass_no}' "
                     f"get different gate pass no '{irr.gate_pass_no}' on awb '{irr.awb}' and hawb '{irr.hwb}'"
                 )
+                # Here we save all gp mismatch data in a table and show for visibility
+            await db.execute(
+                pg_insert(ImportGpMismatchLog)
+                .values(
+                    assignment_header_id=header_id,
+                    awb_no=irr.awb,
+                    hawb=irr.hwb,
+                    existing_gate_pass=oc_event.gate_pass_no,
+                    incoming_gate_pass=irr.gate_pass_no,
+                    gp_issued_datetime=gp_combo,                 # available here
+                    integrate_date_time=oc_event.integrate_date_time,  # OC event's integrate time
+                    created_at=now,
+                )
+                .on_conflict_do_nothing(
+                    constraint="uq_gp_mismatch_awb_existing_incoming"
+                )
+            )
             errors.append({
                 "type":               "GP_MISMATCH",
                 "awb":                irr.awb,
@@ -3445,6 +3465,35 @@ async def get_worker_assignment_lists_by_emp_id(
     
     rows = (await db.execute(stmt)).all()
 
+    # ─────────────────────────────────────────────────────────────────────
+    # 📍 PICKED LOCATIONS for this page's shipments (one query, grouped)
+    # ─────────────────────────────────────────────────────────────────────
+    shipment_ids = [s.id for (s, h, d) in rows]
+
+    pickups_by_shipment: dict[int, list] = {}
+    if shipment_ids:
+        pickup_rows = (await db.execute(
+            select(ImportLocationPickup)
+            .where(
+                ImportLocationPickup.assignment_shipment_id.in_(shipment_ids),
+                ImportLocationPickup.is_picked == True, # Only active picks (not send unpicked )
+            )
+            .order_by(ImportLocationPickup.picked_datetime.desc())
+        )).scalars().all()
+
+        for p in pickup_rows:
+            pickups_by_shipment.setdefault(
+                p.assignment_shipment_id, []
+            ).append({
+                "id": p.id,
+                "location": p.location,
+                "is_picked": p.is_picked,
+                "picked_by": p.picked_by,
+                "picked_datetime": p.picked_datetime,
+                "unpicked_by": p.unpicked_by,
+                "unpicked_datetime": p.unpicked_datetime,
+            })
+
     # ----------------------------------------------------
     # 3️⃣ Shape response (flat JSON)
     # ----------------------------------------------------
@@ -3493,6 +3542,8 @@ async def get_worker_assignment_lists_by_emp_id(
         "updated_at": shipment.updated_at,
 
         "damages": damages_list,
+                    # 📍 picked locations for this shipment
+            "picked_locations": pickups_by_shipment.get(shipment.id, []),
 
         })
 
@@ -3683,6 +3734,8 @@ async def assign_user_to_worker_assignment(
 
         if not shipment:
             raise HTTPException(404, "Shipment does not belong to this OC")
+        # 🔒 hold guard
+        await assert_not_on_hold(db, shipment, header)
 
         old_value = shipment.assigned_person
         now = get_utc_now()
@@ -3934,6 +3987,9 @@ async def add_drop_dlv_zone_by_assigned_worker(
                 status_code=404,
                 detail="Shipment does not belong to this OC"
             )
+
+        # 🔒 HOLD GUARD — block if shipment is on hold
+        await assert_not_on_hold(db, shipment, header)
 
         # ─────────────────────────────────────────────
         # 3️⃣ Business validations
@@ -4217,6 +4273,50 @@ async def get_paginated_worker_assignments_data_list(
     rows = result.all()
 
     # ─────────────────────────────────────────────────────────────────────
+    # 🔒(New addon) ACTIVE SHIPMENT HOLDS (≈30 rows) — load once, match in memory
+    # ─────────────────────────────────────────────────────────────────────
+    hold_oc: set = set()
+    hold_boe: set = set()
+    hold_gp: set = set()
+    hold_awb_hawb: set = set()   # (awb_no, hawb_or_empty)
+
+    hold_rows = (await db.execute(
+        select(
+            ImportShipmentHold.hold_type,
+            ImportShipmentHold.awb_no,
+            ImportShipmentHold.hawb,
+            ImportShipmentHold.oc_no,
+            ImportShipmentHold.boe_no,
+            ImportShipmentHold.gate_pass_no,
+        ).where(ImportShipmentHold.is_active == True)
+    )).all()
+
+    for h in hold_rows:
+        if h.hold_type == "OC" and h.oc_no:
+            hold_oc.add(h.oc_no.strip())
+        elif h.hold_type == "BOE" and h.boe_no:
+            hold_boe.add(h.boe_no.strip())
+        elif h.hold_type == "GP" and h.gate_pass_no:
+            hold_gp.add(h.gate_pass_no.strip())
+        elif h.hold_type == "AWB_HAWB" and h.awb_no:
+            hold_awb_hawb.add((h.awb_no.strip(), (h.hawb or "").strip()))
+
+    def _is_on_hold(shipment, header) -> bool:
+        # OC / AWB+HAWB → header level (locks all part shipments)
+        if header.oc_no and header.oc_no.strip() in hold_oc:
+            return True
+        if header.awb_no and (
+            header.awb_no.strip(), (header.hawb or "").strip()
+        ) in hold_awb_hawb:
+            return True
+        # BOE / GP → this shipment row only
+        if shipment.boe_no and shipment.boe_no.strip() in hold_boe:
+            return True
+        if shipment.gate_pass_no and shipment.gate_pass_no.strip() in hold_gp:
+            return True
+        return False
+
+    # ─────────────────────────────────────────────────────────────────────
     # ✌️NON-COSYS truck-in-out visits for this page's GPs (batched — 2 queries max)
     # ─────────────────────────────────────────────────────────────────────
     page_gp_nos = [
@@ -4303,6 +4403,7 @@ async def get_paginated_worker_assignments_data_list(
     # Then use it:
     records = []
     for shipment, header in rows:
+        is_hold = _is_on_hold(shipment, header)   # 🔒 add this line
         records.append({
              # 🔥 REQUIRED IDS
             "header_id": header.id,
@@ -4356,6 +4457,8 @@ async def get_paginated_worker_assignments_data_list(
 
              # ── NON-COSYS truck-in-out module visits (list — a GP can be on many) ──
             "non_cosys_truck_visits": cosys_by_gp.get(shipment.gate_pass_no, []),
+
+              "is_hold": is_hold,   # 🔒 add this field
 
 
         })
@@ -7867,6 +7970,9 @@ async def add_loading_in_lift_by_assigned_worker(
 
         origin_source = detect_origin_source(header, shipment)
 
+        # 🔒 HOLD GUARD — block if shipment is on hold
+        await assert_not_on_hold(db, shipment, header)
+
         # ─────────────────────────────
         # 4️⃣ Update
         # ─────────────────────────────
@@ -7997,6 +8103,8 @@ async def add_unloading_from_lift_by_assigned_worker(
 
         origin_source = detect_origin_source(header, shipment)
 
+        # 🔒 HOLD GUARD — block if shipment is on hold
+        await assert_not_on_hold(db, shipment, header)
         # ─────────────────────────────
         # 4️⃣ Update
         # ─────────────────────────────
@@ -9413,6 +9521,7 @@ from typing import Dict, Any
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
 async def get_full__all_damage_grouped_by_shipment_for_tracer(
