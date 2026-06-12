@@ -290,3 +290,70 @@ class WorkerAssignmentShipment(Base):
     )
 
 
+
+
+
+
+# ✌️===================================  Shipment Pickup from location Table  ==============================***/
+
+class ImportLocationPickup(Base):
+    __tablename__ = "import_location_pickup"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # ===============================
+    # LINK TO SHIPMENT IDENTITY
+    # ===============================
+    assignment_shipment_id = Column(
+        Integer,
+        ForeignKey("import_worker_assignment_shipment.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    # denormalized (same pattern as damage report)
+    assignment_header_id = Column(
+        Integer,
+        ForeignKey("import_worker_assignment_header.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    # single location token, e.g. "IF_31_D/1"
+    location = Column(String(50), nullable=False)
+
+    # ===============================
+    # PICK STATE
+    # ===============================
+    is_picked = Column(Boolean, default=True, nullable=False, index=True)
+
+    picked_by = Column(String(20), nullable=True)        # emp_id
+    picked_datetime = Column(DateTime(timezone=True), nullable=True)
+    device_id = Column(String(100), nullable=True)
+
+    # ===============================
+    # UNPICK (ADMIN ONLY)
+    # ===============================
+    unpicked_by = Column(String(20), nullable=True)      # admin emp_id
+    unpicked_datetime = Column(DateTime(timezone=True), nullable=True)
+
+    # ===============================
+    # AUDIT
+    # ===============================
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        # one row per (shipment, location) → flip flag, never duplicate
+        UniqueConstraint(
+            "assignment_shipment_id",
+            "location",
+            name="uq_location_pickup_shipment_location"
+        ),
+
+        Index(
+            "idx_location_pickup_shipment_picked",
+            "assignment_shipment_id",
+            "is_picked",
+        ),
+    )

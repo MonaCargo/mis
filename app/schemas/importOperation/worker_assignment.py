@@ -214,6 +214,8 @@ class WorkerAssignmentResponseForWorker(BaseModel):
 
      # ✅ NEW FIELD (It contain all damges on different location in shipment)
     damages: List[DamageInfo] = []
+    picked_locations : List[Any] = []
+
 
 
     class Config:
