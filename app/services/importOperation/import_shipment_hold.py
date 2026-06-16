@@ -24,8 +24,8 @@ RELEASE_HOLD_ROLES = {"super_admin"}
 
 
 
-# put this outside the class, top-level in the same file
-async def assert_not_on_hold(db, shipment, header):
+# put this outside the class, top-level in the same file (by default is raise error not boolean return for that need to make false the flag "raise_if_held" )
+async def assert_not_on_hold(db, shipment, header,raise_if_held=True):
     held = (await db.execute(
         select(ImportShipmentHold.id).where(
             ImportShipmentHold.is_active == True,
@@ -43,8 +43,11 @@ async def assert_not_on_hold(db, shipment, header):
         ).limit(1)
     )).first()
 
-    if held:
+    # if held:
+    on_hold = held is not None
+    if on_hold and raise_if_held:
         raise HTTPException(423, "Shipment is on hold. Operation not allowed.")
+    return on_hold
     
 
 class ImportShipmentHoldService:
