@@ -37,7 +37,9 @@ class GatePassCheckResponse(BaseModel):
     drop_dlv_zone: Optional[str] = None
     lift_out_zone: Optional[str] = None    
     dlv_zone_from_irr: Optional[str] = None     
+    is_hold:bool = False
     Info:Optional[str] = None
+
 
 
 class TruckStagingRequest(BaseModel):

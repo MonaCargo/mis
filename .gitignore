@@ -64,3 +64,8 @@ static/pdfs/
 logs/
 
 alembic_backup/
+
+
+
+# pre-commit local cache
+.pre-commit-cache/
