@@ -1,6 +1,6 @@
 # app/db/models/importOperation/gp_mismatch_log.py
 from sqlalchemy import (
-    Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, Index
+    Boolean, Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, Index
 )
 from app.db.base import Base
 
@@ -28,6 +28,17 @@ class ImportGpMismatchLog(Base):
     integrate_date_time = Column(DateTime(timezone=True), nullable=True)  # OC integrate time
 
     created_at = Column(DateTime(timezone=True), nullable=False)
+
+        # 🆕 COMPLETION TRACKING
+    is_complete   = Column(Boolean, nullable=False, server_default="false")
+    # completed_by  = Column(
+    #     Integer,
+    #     ForeignKey("users.id", ondelete="SET NULL"),  # adjust table name to your users table
+    #     nullable=True
+    # )
+
+    completed_by = Column(String(20),nullable=True)
+    completed_at  = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint(

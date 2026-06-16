@@ -39,6 +39,7 @@ from app.services.export_slot_file_upload_service import get_utc_now
 from app.services.importOperation.Imp_truck_in_out_activity_log import (
     log_activity_of_imp_truck_in_out,
 )
+from app.services.importOperation.import_shipment_hold import assert_not_on_hold
 
 # from app.utils.common.helperFunction import save_to_dial_ftp
 
@@ -602,6 +603,11 @@ class ImportTruckInOutService:
 
         shipment, header = was_row
 
+        # ── Active hold check — INFORM only (do not block) ──
+        is_hold = await assert_not_on_hold(
+            db, shipment, header, raise_if_held=False
+        )
+
         # 4️⃣ Build message (uses computed values, not the cached field)
         message = "Gate pass is valid"
         if existing_gate_pass and loaded_global > 0:
@@ -631,6 +637,7 @@ class ImportTruckInOutService:
             drop_dlv_zone=shipment.drop_dlv_zone,
             lift_out_zone=shipment.unloading_from_lift_zone,
             dlv_zone_from_irr=shipment.dlv_zone_from_irr,
+            is_hold=is_hold,   # ← ADD
             Info = "Here pcs represent remaining pcs if this gatepass used or load somewhere else also"
         )
 
@@ -1085,7 +1092,45 @@ class ImportTruckStagingService:
     ) -> TruckStagingResponse:
         """
         Add a truck + gate pass entry into staging table.
+        Server-side gates before insert:
+          1. Hold check — block (423) if the shipment is on an active hold.
+          2. Delivery check — block (400) if neither GP end time nor final
+             delivery is present (GP end time preferred).
         """
+
+        # ── Resolve the GP's shipment + header (needed for both gates) ──
+        was_row = (await db.execute(
+            select(WorkerAssignmentShipment, WorkerAssignmentHeader)
+            .join(
+                WorkerAssignmentHeader,
+                WorkerAssignmentShipment.assignment_header_id
+                == WorkerAssignmentHeader.id,
+            )
+            .where(WorkerAssignmentShipment.gate_pass_no == request.gate_pass_no)
+        )).first()
+
+        if was_row:
+            shipment, header = was_row
+
+            # ── 1. Hold check — block if held ──
+            await assert_not_on_hold(db, shipment, header)
+
+            # ── 2. Delivery check — prefer GP end time, fall back to final delivery ──
+            delivery_ref = (
+                shipment.gate_pass_end_datetime
+                or shipment.final_delivery_datetime
+            )
+            if not delivery_ref:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Gate pass {request.gate_pass_no} cannot be staged — "
+                        f"GP end time is not present (and no final delivery as fallback). "
+                        f"Record the GP end time first."
+                    ),
+                )
+
+
         staging_entry = ImportTruckInStaging(
             session_id="default-session",  # Placeholder; replace with session_id
             truck_number=request.truck_number,
@@ -5218,26 +5263,58 @@ class ImportAddMoreGpService:
 
                     # GP exists, has pcs_remaining, no active assignment → reusable
                     # Window check needs final_delivery from the source shipment
-                    existing_final_delivery = None
+
+                    # ------ old --------
+                    # existing_final_delivery = None
+                    # if existing_gp.worker_assignment_shipment_id:
+                    #     existing_final_delivery = (
+                    #         await db.execute(
+                    #             select(
+                    #                 WorkerAssignmentShipment.final_delivery_datetime
+                    #             ).where(
+                    #                 WorkerAssignmentShipment.id
+                    #                 == existing_gp.worker_assignment_shipment_id
+                    #             )
+                    #         )
+                    #     ).scalar_one_or_none()
+
+                    # # Final delivery must be completed or present
+                    # if not existing_final_delivery:
+                    #     results.append(
+                    #         {
+                    #             "gate_pass_no": gp_no,
+                    #             "success": False,
+                    #             "message": "Final delivery not completed yet for this gate pass.",
+                    #         }
+                    #     )
+                    #     continue
+
+                    # ------- New ------------
+
+                    existing_delivery_ref = None
                     if existing_gp.worker_assignment_shipment_id:
-                        existing_final_delivery = (
+                        row = (
                             await db.execute(
                                 select(
-                                    WorkerAssignmentShipment.final_delivery_datetime
+                                    WorkerAssignmentShipment.gate_pass_end_datetime,
+                                    WorkerAssignmentShipment.final_delivery_datetime,
                                 ).where(
                                     WorkerAssignmentShipment.id
                                     == existing_gp.worker_assignment_shipment_id
                                 )
                             )
-                        ).scalar_one_or_none()
+                        ).first()
+                        if row:
+                            gp_end, final_del = row
+                            existing_delivery_ref = gp_end or final_del
 
-                    # Final delivery must be completed or present
-                    if not existing_final_delivery:
+                    # Must have GP end time OR final delivery
+                    if not existing_delivery_ref:
                         results.append(
                             {
                                 "gate_pass_no": gp_no,
                                 "success": False,
-                                "message": "Final delivery not completed yet for this gate pass.",
+                                "message": "Neither GP end time nor final delivery recorded yet for this gate pass.",
                             }
                         )
                         continue
@@ -5252,6 +5329,27 @@ class ImportAddMoreGpService:
                     #         }
                     #     )
                     #     continue
+
+                    # ── Hold check (existing GP) ──
+                    if existing_gp.worker_assignment_shipment_id:
+                        hold_row = (await db.execute(
+                            select(WorkerAssignmentShipment, WorkerAssignmentHeader)
+                            .join(
+                                WorkerAssignmentHeader,
+                                WorkerAssignmentShipment.assignment_header_id
+                                == WorkerAssignmentHeader.id,
+                            )
+                            .where(WorkerAssignmentShipment.id == existing_gp.worker_assignment_shipment_id)
+                        )).first()
+                        if hold_row:
+                            sh, hd = hold_row
+                            if await assert_not_on_hold(db, sh, hd, raise_if_held=False):
+                                results.append({
+                                    "gate_pass_no": gp_no,
+                                    "success": False,
+                                    "message": "Shipment is on hold — cannot add.",
+                                })
+                                continue
 
                     to_create.append(
                         {
@@ -5288,6 +5386,15 @@ class ImportAddMoreGpService:
 
                 shipment, header = was_row
 
+                # ── Hold check (new GP) ──
+                if await assert_not_on_hold(db, shipment, header,raise_if_held=False):
+                    results.append({
+                        "gate_pass_no": gp_no,
+                        "success": False,
+                        "message": "Shipment is on hold — cannot add.",
+                    })
+                    continue
+
                 # if not shipment.no_of_pc or shipment.no_of_pc <= 0:
                 #     results.append({
                 #         "gate_pass_no": gp_no,
@@ -5315,12 +5422,27 @@ class ImportAddMoreGpService:
                     continue
 
                 # Final delivery must be completed or present
-                if not shipment.final_delivery_datetime:
+                # if not shipment.final_delivery_datetime:
+                #     results.append(
+                #         {
+                #             "gate_pass_no": gp_no,
+                #             "success": False,
+                #             "message": "Final delivery not completed yet for this gate pass.",
+                #         }
+                #     )
+                #     continue
+
+                # Must have GP end time OR final delivery
+                delivery_ref = (
+                    shipment.gate_pass_end_datetime
+                    or shipment.final_delivery_datetime
+                )
+                if not delivery_ref:
                     results.append(
                         {
                             "gate_pass_no": gp_no,
                             "success": False,
-                            "message": "Final delivery not completed yet for this gate pass.",
+                            "message": "Neither GP end time nor final delivery recorded yet for this gate pass.",
                         }
                     )
                     continue

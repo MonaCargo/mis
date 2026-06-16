@@ -593,6 +593,7 @@ from app.schemas.importOperation.worker_assignment import (
     WorkerAssignmentSearchRequest,
 )
 from app.schemas.user import UserListResponse, UserRead
+from app.services.export_slot_file_upload_service import get_utc_now
 from app.services.importOperation.import_pick_location import ImportLocationPickupService
 from app.services.importOperation.import_shipment_hold import ImportShipmentHoldService
 from app.services.importOperation.worker_assignment_service import (
@@ -2731,6 +2732,48 @@ async def unpick_location(
 # ============== Gp mismatch log api ============================
 
 
+@router.patch("/gp-mismatch/logs/{log_id}/complete")
+async def toggle_gp_mismatch_complete(
+    log_id: int,
+    is_complete: bool = Body(..., embed=True),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    """
+    Mark a GP mismatch log as complete / incomplete.
+    Records who completed it and when.
+    """
+    log = (await db.execute(
+        select(ImportGpMismatchLog).where(ImportGpMismatchLog.id == log_id)
+    )).scalar_one_or_none()
+
+    if not log:
+        raise HTTPException(status_code=404, detail="GP mismatch log not found")
+
+    if is_complete:
+        log.is_complete  = True
+        log.completed_by = current_user.emp_id
+        log.completed_at = get_utc_now()
+    else:
+        # un-completing → clear attribution
+        log.is_complete  = False
+        log.completed_by = None
+        log.completed_at = None
+
+    await db.commit()
+    await db.refresh(log)
+
+    return {
+        "success": True,
+        "id": log.id,
+        "is_complete": log.is_complete,
+        "completed_by": log.completed_by,
+        "completed_at": log.completed_at,
+    }
+
+
+
+
 @router.get("/gp-mismatch/logs")
 async def get_gp_mismatch_logs(
     start_date: date = Query(..., description="IST date YYYY-MM-DD"),
@@ -2761,36 +2804,59 @@ async def get_gp_mismatch_logs(
     )
 
     stmt = (
-        select(ImportGpMismatchLog)
+        select(ImportGpMismatchLog, User.name.label("completed_by_name"))
+        .outerjoin(User, User.emp_id == ImportGpMismatchLog.completed_by)
         .where(or_(in_gp_issued, in_integrate))
         .order_by(ImportGpMismatchLog.created_at.desc())
     )
 
-    rows = (await db.execute(stmt)).scalars().all()
+    # rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt)).all()   # ✅ named tuples
 
     return {
         "success": True,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "total": len(rows),
+        # "logs": [
+        #     {
+        #         "id": r.id,
+        #         "assignment_header_id": r.assignment_header_id,
+        #         "awb_no": r.awb_no,
+        #         "hawb": r.hawb,
+        #         "existing_gate_pass": r.existing_gate_pass,
+        #         "incoming_gate_pass": r.incoming_gate_pass,
+        #         "gp_issued_datetime": r.gp_issued_datetime,
+        #         "integrate_date_time": r.integrate_date_time,
+        #         "is_complete": r.is_complete,
+        #         "completed_by": r.completed_by,
+        #         "completed_at": r.completed_at,
+        #           "completed_by_name": r.completed_by_name, 
+        #         "created_at": r.created_at,
+        #         "created_at": r.created_at,
+        #     }
+        #     for r in rows
+        # ],
+        
         "logs": [
-            {
-                "id": r.id,
-                "assignment_header_id": r.assignment_header_id,
-                "awb_no": r.awb_no,
-                "hawb": r.hawb,
-                "existing_gate_pass": r.existing_gate_pass,
-                "incoming_gate_pass": r.incoming_gate_pass,
-                "gp_issued_datetime": r.gp_issued_datetime,
-                "integrate_date_time": r.integrate_date_time,
-                "created_at": r.created_at,
-            }
-            for r in rows
-        ],
+    {
+        "id": r.ImportGpMismatchLog.id,
+        "assignment_header_id": r.ImportGpMismatchLog.assignment_header_id,
+        "awb_no": r.ImportGpMismatchLog.awb_no,
+        "hawb": r.ImportGpMismatchLog.hawb,
+        "existing_gate_pass": r.ImportGpMismatchLog.existing_gate_pass,
+        "incoming_gate_pass": r.ImportGpMismatchLog.incoming_gate_pass,
+        "gp_issued_datetime": r.ImportGpMismatchLog.gp_issued_datetime,
+        "integrate_date_time": r.ImportGpMismatchLog.integrate_date_time,
+        "is_complete": r.ImportGpMismatchLog.is_complete,
+        "completed_by": r.ImportGpMismatchLog.completed_by,
+        "completed_by_name": r.completed_by_name,
+        "completed_at": r.ImportGpMismatchLog.completed_at,
+        "created_at": r.ImportGpMismatchLog.created_at,
     }
-
-
-
+    for r in rows
+],
+    }
 
 
 
