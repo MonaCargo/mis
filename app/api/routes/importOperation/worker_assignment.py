@@ -639,6 +639,9 @@ from app.services.importOperation.worker_assignment_service import (
     process_worker_assignment,
     search_in_worker_assignments,
     update_drop_dlv_zone,
+    run_auto_assignment,
+    get_imp_gp_user_presence_list,
+    get_worker_assigned_shipments_drilldown
 )
 from app.services.user_service import get_active_import_tracer
 from app.utils.common.get_request_ip import get_request_ip
@@ -2985,3 +2988,62 @@ async def list_holds(
         "total": len(rows),
         "holds": [_serialize(r) for r in rows],
     }
+
+
+
+
+# ---------------------------------
+@router.post("/auto-assign-shipments")
+async def auto_assign_route(
+    lookback_hours: int = Query(AUTO_ASSIGN_DEFAULT_LOOKBACK_HOURS=24, ge=1, le=168),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    return await run_auto_assignment(
+        db=db,
+        changed_by=current_user.emp_id,
+        lookback_hours=lookback_hours,
+    )
+
+@router.get(
+    "/imp-gp-users/presence-with-active-shipment",
+    summary="List active imp_gp_user workers with login/activity status + active shipment count",
+)
+async def get_imp_gp_user_presence(
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    data, AUTO_ASSIGN_ACTIVITY_WINDOW_MIN = await get_imp_gp_user_presence_list(db)
+    return {
+        "success": True,
+        "activity_window_min": AUTO_ASSIGN_ACTIVITY_WINDOW_MIN,
+        "total": len(data),
+        "data": data
+    }
+
+
+@router.get(
+    "/imp-gp-users/{emp_id}/assigned-shipments-in-activity-track",
+    summary="Drill-down: shipments assigned to a worker (by drop status + time window)",
+)
+async def get_worker_assigned_shipments(
+    emp_id: str,
+    drop_status: str = Query("not_dropped", description="not_dropped | dropped | all"),
+    window: str = Query("24h", description="24h | 48h | 1week | all"),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserRead = Depends(verify_token_and_get_user),
+):
+    allowed_drop = {"not_dropped", "dropped", "all"}
+    allowed_window = {"24h", "48h", "1week", "all"}
+
+    if drop_status not in allowed_drop:
+        raise HTTPException(400, f"Invalid drop_status. Allowed: {sorted(allowed_drop)}")
+    if window not in allowed_window:
+        raise HTTPException(400, f"Invalid window. Allowed: {sorted(allowed_window)}")
+
+    return await get_worker_assigned_shipments_drilldown(
+        db=db,
+        emp_id=emp_id,
+        drop_status=drop_status,
+        window=window,
+    )

@@ -689,3 +689,5 @@ class AwbCheckerInfoResponse(BaseModel):
 class UpdateFlightDptDatetime(BaseModel):
     flight_dpt_datetime: datetime   # client sends ISO UTC, e.g. "2026-06-01T10:30:00Z"
 
+class UpdateAwbPiecesRequest(BaseModel):
+    pcs: int = Field(..., description="New pieces count. Must be greater than or equal to current.")

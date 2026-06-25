@@ -348,6 +348,7 @@ async def process_seg_tranship_to_car_master(
     All results upsert into export_car_message_awb_master.
     Current month processes last so it wins on AWB conflict.
     """
+    print("✌️✌️✌️✌️✌️✌️✌️✌️✌️✌️✌️✌️")
     # Validate format
     try:
         from datetime import datetime

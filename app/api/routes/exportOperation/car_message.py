@@ -27,6 +27,12 @@ from app.utils.exportOperation.car_message import clean_car_message
 from app.utils.exportOperation.extract_flight_planning_data import extract_flight_planning
 from app.utils.exportOperation.wh_inventry_pdf_data_extract import extract_export_inventory
 from app.db.session import engine
+from app.schemas.exportOperation.car_message import UpdateAwbPiecesRequest
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from app.services.exportOperation.car_message_flow_audit_log import write_car_message_flow_audit
+from app.utils.common.car_message_flow_audit_utils import CarMessageFlowModule, CarMessageFlowStep
+
 
 router = APIRouter(
     prefix="/car-message-awb",
@@ -1787,4 +1793,287 @@ async def update_flight_dpt_datetime(
         "success": True,
         "message": "Departure datetime updated successfully",
         "flight_dpt_datetime": header.flight_dpt_datetime.isoformat(),
+    }
+
+
+
+# ========== report of booked flights ==============================
+
+@router.get("/flight-booking/report-download")
+async def download_flight_booking_report(
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Excel report for all flights with flight_date between start_date and end_date
+    (inclusive). Flights ordered newest date first, then by departure time.
+    Flight details repeat on every AWB row.
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+
+    def _to_ist(dt):
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST)
+
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
+
+    stmt = (
+        select(
+            ExportFlightBookingHeader.id.label("header_id"),
+            ExportFlightBookingHeader.flight_no,
+            ExportFlightBookingHeader.flight_date,
+            ExportFlightBookingHeader.flight_dpt_datetime,
+            ExportFlightBookingHeader.is_active,
+            ExportFlightBookingHeader.booked_by,
+            User.name.label("booked_by_name"),
+            ExportFlightBookingDetail.booked_pcs,
+            ExportCarMessageAwbMaster.awb_no,
+            ExportCarMessageAwbMaster.origin,
+            ExportCarMessageAwbMaster.destination,
+            ExportCarMessageAwbMaster.pcs.label("awb_total_pcs"),
+            ExportCarMessageAwbMaster.gross_wt,
+        )
+        .outerjoin(User, User.emp_id == ExportFlightBookingHeader.booked_by)
+        .outerjoin(
+            ExportFlightBookingDetail,
+            ExportFlightBookingDetail.flight_header_id == ExportFlightBookingHeader.id,
+        )
+        .outerjoin(
+            ExportCarMessageAwbMaster,
+            ExportCarMessageAwbMaster.id == ExportFlightBookingDetail.awb_master_id,
+        )
+        .where(ExportFlightBookingHeader.flight_date >= start_date)
+        .where(ExportFlightBookingHeader.flight_date <= end_date)
+        .where(ExportFlightBookingHeader.is_active.is_(True))
+        .order_by(
+            ExportFlightBookingHeader.flight_date.desc(),
+            ExportFlightBookingHeader.flight_dpt_datetime.desc(),
+            ExportCarMessageAwbMaster.awb_no.asc(),
+        )
+    )
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No flights found for this date range")
+
+    # ── Group rows by flight header, preserving the query order ────────
+    grouped = []          # list of (header_row, [awb_rows...])
+    seen = {}             # header_id -> index in grouped
+    for r in rows:
+        if r.header_id not in seen:
+            seen[r.header_id] = len(grouped)
+            grouped.append((r, []))
+        if r.awb_no:      # skip the placeholder AWB cols from an empty outerjoin
+            grouped[seen[r.header_id]][1].append(r)
+
+    # ── Build workbook ────────────────────────────────────────────────
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Flight Booking Report"
+
+    NCOLS = 8  # A..H
+
+    title_font = Font(name="Arial", bold=True, size=14)
+    range_font = Font(name="Arial", bold=True, size=11)
+    header_font = Font(name="Arial", bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", start_color="1F4E78")
+    cell_font = Font(name="Arial")
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    last_col_letter = ws.cell(row=1, column=NCOLS).column_letter
+
+    # Row 1: title (merged)
+    ws.merge_cells(f"A1:{last_col_letter}1")
+    c = ws["A1"]
+    c.value = "Flight Booking Report"
+    c.font = title_font
+    c.alignment = center
+
+    # Row 2: date range (merged)
+    ws.merge_cells(f"A2:{last_col_letter}2")
+    c = ws["A2"]
+    c.value = f"{start_date.strftime('%d-%b-%Y')}  to  {end_date.strftime('%d-%b-%Y')}"
+    c.font = range_font
+    c.alignment = center
+
+    # Row 3: blank spacer
+
+    # Row 4: header
+    headers = [
+        "Flight No", "Flight Date", "Departure (IST)",
+        "Booked By (Emp ID)", "Booked By (Name)",
+        "AWB No", "Total Pcs", "Booked Pcs",
+    ]
+    head_row = 4
+    for col, h in enumerate(headers, start=1):
+        cc = ws.cell(row=head_row, column=col, value=h)
+        cc.font = header_font
+        cc.fill = header_fill
+        cc.alignment = center
+        cc.border = border
+
+    # ── Data ───────────────────────────────────────────────────────────
+    DATE_FMT = "dd-mmm-yyyy"
+    DATETIME_FMT = "dd-mmm-yyyy hh:mm"
+
+    cur = head_row + 1
+    for header_r, awb_list in grouped:
+        dep_ist = _to_ist(header_r.flight_dpt_datetime)
+        dep_val = dep_ist.replace(tzinfo=None) if dep_ist else None  # openpyxl: no tz-aware
+        flight_date_val = header_r.flight_date  # already a date object
+
+        def write_flight_row(awb=None):
+            # flight columns — repeated on every row
+            ws.cell(row=cur, column=1, value=header_r.flight_no).font = cell_font
+
+            c2 = ws.cell(row=cur, column=2, value=flight_date_val)
+            c2.font = cell_font
+            if flight_date_val:
+                c2.number_format = DATE_FMT
+
+            c3 = ws.cell(row=cur, column=3, value=dep_val)
+            c3.font = cell_font
+            if dep_val:
+                c3.number_format = DATETIME_FMT
+
+            ws.cell(row=cur, column=4, value=header_r.booked_by or "").font = cell_font
+            ws.cell(row=cur, column=5, value=header_r.booked_by_name or "").font = cell_font
+
+            # AWB columns
+            ws.cell(row=cur, column=6, value=(awb.awb_no if awb else "") or "").font = cell_font
+
+            total_pcs_cell = ws.cell(row=cur, column=7)
+            if awb and awb.awb_total_pcs is not None:
+                total_pcs_cell.value = int(awb.awb_total_pcs)
+                total_pcs_cell.number_format = "0"
+            total_pcs_cell.font = cell_font
+
+            pcs_cell = ws.cell(row=cur, column=8)
+            if awb and awb.booked_pcs is not None:
+                pcs_cell.value = int(awb.booked_pcs)
+                pcs_cell.number_format = "0"
+            pcs_cell.font = cell_font
+
+            # borders + alignment for all 8 columns
+            for col in range(1, NCOLS + 1):
+                cell = ws.cell(row=cur, column=col)
+                cell.border = border
+                cell.alignment = left if col <= 5 else center
+
+        if not awb_list:
+            write_flight_row(None)
+            cur += 1
+            continue
+
+        for a in awb_list:
+            write_flight_row(a)
+            cur += 1
+
+    # ── Column widths + freeze ─────────────────────────────────────────
+    widths = [12, 13, 18, 18, 22, 14, 11, 11]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[ws.cell(row=head_row, column=i).column_letter].width = w
+    # ws.freeze_panes = "A5"
+
+    # ── Stream out ─────────────────────────────────────────────────────
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    fname = f"flight_booking_report_{start_date.isoformat()}_to_{end_date.isoformat()}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+
+@router.patch("/{awb_no}/update-pieces")
+async def update_awb_pieces(
+    awb_no: str,
+    payload: UpdateAwbPiecesRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user)
+):
+    # 1. Fetch AWB record
+    stmt = select(ExportCarMessageAwbMaster).where(ExportCarMessageAwbMaster.awb_no == awb_no)
+    result = await db.execute(stmt)
+    awb_record = result.scalars().first()
+
+    if not awb_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"AWB {awb_no} not found"
+        )
+
+    # 2. Rule check
+    if awb_record.source == "CAR_MESSAGE" or awb_record.source is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Shipments with source file as 'CAR_MESSAGE' (or missing source) cannot be edited."
+        )
+
+    # 3. Validation: new pieces >= current pieces
+    current_pcs = awb_record.pcs if awb_record.pcs is not None else 0
+    if payload.pcs < current_pcs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"New pieces ({payload.pcs}) cannot be less than current pieces ({current_pcs})."
+        )
+
+    # ── capture OLD value BEFORE mutating ──────────────────────
+    old_pcs = current_pcs   # already holds the pre-update value
+
+    # 4. Apply update
+    awb_record.pcs = payload.pcs
+    awb_record.updated_at = datetime.now(timezone.utc)
+    awb_record.updated_pieces_by = current_user.emp_id
+    awb_record.updated_pcs_at = get_utc_now()
+
+   
+    # ── write audit log (individual AWB op → no flight id) ─────
+    await write_car_message_flow_audit(
+        db=db,
+        awb_reference_id=awb_record.id,        # ← PK is `id`
+        flight_reference_id=None,              # individual op, no flight
+        module=CarMessageFlowModule.AWB_MASTER,
+        flow_step=CarMessageFlowStep.AWB_MASTER,
+        record_id=awb_record.id,               # ← same `id`
+        action="UPDATE_AWB_PIECES",
+        performed_by=current_user.emp_id,
+        changes={
+            "pcs": {"old": old_pcs, "new": payload.pcs}
+        },
+        note=f"Pieces updated for AWB {awb_no}",
+    )
+
+    # 5. Commit (record change + audit log together)
+    try:
+        await db.commit()
+        await db.refresh(awb_record)
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error while updating pieces."
+        )
+
+    return {
+        "status": "success",
+        "message": f"Successfully updated pieces for AWB {awb_no}",
+        "data": {
+            "awb_no": awb_record.awb_no,
+            "pcs": awb_record.pcs
+        }
     }

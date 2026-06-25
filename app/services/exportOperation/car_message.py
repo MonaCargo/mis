@@ -6721,6 +6721,9 @@ async def get_awb_data_filtered(
                 ExportCarMessageAwbMaster.manual_creation_remarks,
                 ExportCarMessageAwbMaster.manual_pcs,
                 ExportCarMessageAwbMaster.source,
+                ExportCarMessageAwbMaster.updated_pieces_by,
+                ExportCarMessageAwbMaster.updated_pcs_at,
+                ExportCarMessageAwbMaster.tp_pcs_from_report,
 
         )
         .where(and_(*conditions))
@@ -10310,3 +10313,5 @@ async def get_awb_checker_info(awb_no: str, db: AsyncSession) -> AwbCheckerInfoR
         unavailable_reasons=reasons,
         flights=flights,
     )
+
+
