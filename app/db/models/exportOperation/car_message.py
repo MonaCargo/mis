@@ -106,7 +106,9 @@ class ExportCarMessageAwbMaster(Base):
 
     xray_type = Column(String(30), nullable=True)
     source = Column(String(30), nullable=True)
- 
+    updated_pieces_by = Column(String(20), nullable=True)
+    updated_pcs_at = Column(DateTime(timezone=True), nullable=True)
+    tp_pcs_from_report = Column(Integer, nullable=True)
 
 
 # ✌️ AWB AND SKID MAPPING TABLES
