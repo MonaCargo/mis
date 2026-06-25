@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import pytz
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select,case
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -311,6 +311,7 @@ async def _process_segregation(db, month_current, month_prev, emp_id):
             "origin"                     : item["origin"],
             "destination"                : item["destination"],
             "pcs"                        : item["pcs"],
+            "tp_pcs_from_report"         : item["pcs"], # ← always raw report pcs for history
             "gross_wt"                   : item["gross_wt"],
             "chg_wt"                     : item["chg_wt"],
             "nog"                        : item["nog"],
@@ -330,7 +331,17 @@ async def _process_segregation(db, month_current, month_prev, emp_id):
         stmt = stmt.on_conflict_do_update(
             constraint="uq_awb_car_msg",
             set_={
-                "pcs"        : stmt.excluded.pcs,
+                # "pcs"        : stmt.excluded.pcs,
+                            "pcs": case(
+                (
+                    func.coalesce(
+                        func.trim(ExportCarMessageAwbMaster.updated_pieces_by), ''
+                    ) != '',
+                    ExportCarMessageAwbMaster.pcs,        # manual override → keep existing
+                ),
+                else_=stmt.excluded.pcs,
+            ),
+            "tp_pcs_from_report": stmt.excluded.tp_pcs_from_report,  # if you want it here too
                 "gross_wt"   : stmt.excluded.gross_wt,
                 "chg_wt"     : stmt.excluded.chg_wt,
                 "nog"        : stmt.excluded.nog,
@@ -567,6 +578,7 @@ async def _process_transhipment(db, month_current, month_prev, emp_id):
             "origin"                     : item["origin"],
             "destination"                : item["destination"],
             "pcs"                        : item["pcs"],
+            "tp_pcs_from_report"         : item["pcs"], # ← always raw report pcs for history
             "gross_wt"                   : item["gross_wt"],
             "chg_wt"                     : item["chg_wt"],
             "nog"                        : None,
@@ -587,7 +599,17 @@ async def _process_transhipment(db, month_current, month_prev, emp_id):
         stmt = stmt.on_conflict_do_update(
             constraint="uq_awb_car_msg",
             set_={
-                "pcs"        : stmt.excluded.pcs,
+                # "pcs"        : stmt.excluded.pcs,
+                 "pcs": case(
+                (
+                    func.coalesce(
+                        func.trim(ExportCarMessageAwbMaster.updated_pieces_by), ''
+                    ) != '',
+                    ExportCarMessageAwbMaster.pcs,        # manual override → keep existing
+                ),
+                else_=stmt.excluded.pcs,
+            ),
+             "tp_pcs_from_report": stmt.excluded.tp_pcs_from_report,  # ← always overwrite
                 "gross_wt"   : stmt.excluded.gross_wt,
                 "chg_wt"     : stmt.excluded.chg_wt,
                 "shc"        : stmt.excluded.shc,

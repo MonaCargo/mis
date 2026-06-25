@@ -90,6 +90,7 @@ from app.services.user_service import (
 )
 from app.utils.common.clean_bulck_user_excel import parse_user_excel
 from app.utils.common.get_request_ip import get_request_ip
+from app.utils.common.helperFunction import get_utc_now
 
 router = APIRouter(prefix="", tags=["Users"])
 
@@ -395,3 +396,30 @@ async def update_user_role(
         ip_address=ip_address,
         user_agent=user_agent,
     )
+
+
+
+
+
+@router.post("/users/heartbeat/activity")
+async def update_last_active(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token_and_get_user),
+):
+    emp_id = current_user.emp_id
+    if not emp_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload: emp_id missing")
+
+    result = await db.execute(select(User).where(User.emp_id == emp_id))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.last_active_at = get_utc_now()
+    await db.commit()
+
+    return {
+        "success": True,
+        "emp_id": emp_id,
+        "last_active_at": user.last_active_at,
+    }

@@ -10,6 +10,8 @@ class CarMessageFlowModule:
     ULD_CLOSE_OPEN      = "ULD_CLOSE_OPEN"
     SKID_RETRIEVAL      = "SKID_RETRIEVAL"          # ← separate from location
     BASE_DROP           = "BASE_DROP"  
+
+    RECONCILIATION      = "RECONCILIATION"
     # CARGO_MANIFEST    = "CARGO_MANIFEST"
     # DEPARTURE_CTRL    = "DEPARTURE_CTRL"
     # FLIGHT_CLOSE      = "FLIGHT_CLOSE"
@@ -26,6 +28,8 @@ class CarMessageFlowStep:
     SKID_RETRIEVAL          = "STEP_SKID_RETRIEVAL"     # ← separate from location
     BASE_DROP               = "STEP_BASE_DROP"  
     ULD_CLOSE_OPEN      = "ULD_CLOSE_OPEN"
+
+    RECONCILIATION      = "STEP_RECONCILIATION"
     # CARGO_MANIFEST    = "STEP_CARGO_MANIFEST"
     # DEPARTURE_CTRL    = "STEP_DEPARTURE_CTRL"
     # FLIGHT_CLOSE      = "STEP_FLIGHT_CLOSE"
@@ -42,6 +46,7 @@ FLOW_DISPLAY_ORDER = [
     CarMessageFlowStep.ULD_ASSIGNMENT,
     CarMessageFlowStep.SKID_RETRIEVAL,      # ← after location
     CarMessageFlowStep.BASE_DROP,  
+    CarMessageFlowStep.RECONCILIATION,  
     # "STEP_CARGO_MANIFEST",
     # "STEP_DEPARTURE_CTRL",
     # "STEP_FLIGHT_CLOSE",

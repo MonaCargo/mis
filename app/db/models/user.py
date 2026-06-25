@@ -17,3 +17,8 @@ class User(Base):
        # ✅ NEW: Timestamp columns  (⚠️confirm timezone handling with your DB)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+   # -------------------------------------=================================== 
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    last_logout_at = Column(DateTime(timezone=True), nullable=True)
+    last_active_at = Column(DateTime(timezone=True), nullable=True)
