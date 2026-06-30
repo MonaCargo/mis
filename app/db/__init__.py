@@ -35,6 +35,7 @@ from app.db.models.exportOperation.uld_master_logs import ExportUldMasterOperati
 from app.db.models.exportOperation.export_uld_loading_sheet_form import ExportLoadingSheetForm
 from app.db.models.importOperation.import_gp_mismatch_log import ImportGpMismatchLog
 from app.db.models.importOperation.import_shipment_hold import ImportShipmentHold
+from app.db.models.digital_reports.segrigation_report import DigitalReportImportSegFlight,DigitalReportImportSegAwb
 from app.db.models.exportOperation.export_uld_loading_sheet_form import ExportLoadingSheetFormHistoryLog
 from app.db.models.importOperation.imp_truck_in_out_module import ImportTruckInStaging , ImportTruckVisit, ImportGatePass, ImportGatePassAssignment, ImportGatePassLoading
 from app.db.models.app_config.app_config import AppConfig ,AppConfigLog 
@@ -43,6 +44,9 @@ __all__ = [
 
 "ImportGpMismatchLog",
 "ImportShipmentHold",
+
+"DigitalReportImportSegFlight",
+"DigitalReportImportSegAwb",
 
 "AppConfig", "AppConfigLog",
 

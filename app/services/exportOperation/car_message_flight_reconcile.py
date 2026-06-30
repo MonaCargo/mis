@@ -348,7 +348,7 @@ async def _deactivate_all_zero_flight(
 # ===================================================================
 logger = logging.getLogger("reconcile")
 
-RECONCILE_WINDOW_DAYS = 1
+RECONCILE_WINDOW_DAYS = 2
 _ADVISORY_LOCK_KEY = 778421900001   # unique to THIS job; auto_assign must not reuse it
 IST = ZoneInfo("Asia/Kolkata") 
 
