@@ -29,6 +29,7 @@ from .exportOperation.export_fileupload_meta_log import router as export_fileupl
 from .exportOperation.export_import_tp_report_for_car import router as export_impotrt_xray_tp_report_router
 from .exportOperation.car_message_awb_history import router as export_car_message_awb_history_router
 from .importOperation.imp_truck_in_out_module import router as imp_truck_in_out_router
+from .digital_reports.import_dept.segrigation_report import router as digital_reports_import_router
 
 from .app_config.app_config_route import router as app_config_router
 from .exportOperation.export_transipment_import_segrigation import router as export_transipment_import_segrigation_router
@@ -97,3 +98,7 @@ api_v1_router.include_router(domestic_xray_report_route,prefix='/domestic',tags=
 # ====App Config============================ 
 
 api_v1_router.include_router(app_config_router, prefix="/app/config", tags=["App Config"])
+
+
+# ====== Digital reports
+api_v1_router.include_router(digital_reports_import_router, prefix="/digital-reports", tags=["DIGITAL REPORTS"])

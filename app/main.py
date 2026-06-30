@@ -42,7 +42,7 @@ async def _start_scheduler():
     scheduler.add_job(
         run_reconcile_job,
         trigger="interval",
-        seconds=1800,
+        seconds=600,
         id="reconcile_departed_flight_bookings",
         max_instances=1,
         coalesce=True,
