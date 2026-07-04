@@ -1,6 +1,9 @@
 
 
 
+
+
+
 """
 utils/seg_cleaner.py
 
@@ -29,7 +32,7 @@ import io
 import re
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -210,6 +213,68 @@ def _safe_str(value) -> str | None:
     return s if s and s.lower() not in ("nan", "none", "") else None
 
 
+# Known date/datetime string formats — ALL day-first (Indian DD-MM-YYYY source).
+# Tried in order via strptime, which does NOT guess. Mirrors the proven approach
+# used in the OC report cleaner. ISO (%Y-%m-%d) is unambiguous and included too.
+_DT_FORMATS = (
+    "%d-%b-%Y %H:%M:%S",   # 25-Jan-2025 14:30:45
+    "%d-%b-%Y %H:%M",      # 25-Jan-2025 14:30
+    "%d-%b-%Y",            # 25-Jan-2025
+    "%d-%m-%Y %H:%M:%S",   # 25-01-2025 14:30:45
+    "%d-%m-%Y %H:%M",      # 25-01-2025 14:30
+    "%d-%m-%Y",            # 25-01-2025
+    "%d-%m-%y %H:%M:%S",   # 01-06-26 01:04:00
+    "%d-%m-%y %H:%M",      # 01-06-26 1:04
+    "%d-%m-%y",            # 01-06-26
+    "%Y-%m-%d %H:%M:%S",   # 2025-01-25 14:30:45 (ISO, unambiguous)
+    "%Y-%m-%d %H:%M",      # 2025-01-25 14:30
+    "%Y-%m-%d",            # 2025-01-25
+    "%d/%m/%Y %H:%M:%S",   # 25/01/2025 14:30:45
+    "%d/%m/%Y %H:%M",      # 25/01/2025 14:30
+    "%d/%m/%Y",            # 25/01/2025
+)
+
+
+def _parse_dt_cell(value):
+    """
+    Robust, type-aware datetime parse for one cell. No blanket guessing.
+
+    - Real datetime / Timestamp / date  → trusted as-is (Excel true dates arrive
+      this way even under dtype=object, and are already unambiguous — never flip).
+    - String (e.g. "01-06-2026 14:07")  → matched against an explicit list of
+      DAY-FIRST formats via strptime (same strategy as the OC report cleaner).
+      strptime never guesses month-first, so "01-06-2026" → 1 June, deterministically.
+    - Blank / NaN / None                → None.
+
+    Returns a pandas Timestamp (or None). IST→UTC conversion happens later.
+    """
+    # 1) true datetime-like values — trust, never reparse
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return pd.Timestamp(value)
+    if isinstance(value, date):
+        return pd.Timestamp(value)
+    # 2) null / blank
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "nat"):
+        return None
+    # 3) string → try each known day-first format explicitly (no guessing)
+    for fmt in _DT_FORMATS:
+        try:
+            return pd.Timestamp(datetime.strptime(s, fmt))
+        except ValueError:
+            continue
+    # 4) last-resort fallback: pandas with dayfirst=True (still day-first,
+    #    never month-first) so unusual-but-valid strings aren't silently lost
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1 — Read file bytes into raw DataFrame
 # ─────────────────────────────────────────────────────────────────────────────
@@ -269,11 +334,8 @@ def _parse_raw(raw: pd.DataFrame) -> pd.DataFrame:
     def _is_real_date(val) -> bool:
         if val is None or (isinstance(val, float) and math.isnan(val)):
             return False
-        try:
-            pd.to_datetime(str(val))
-            return True
-        except Exception:
-            return False
+        parsed = _parse_dt_cell(val)
+        return parsed is not None and pd.notna(parsed)
 
     mask = (
         raw.iloc[:, 3].apply(_is_pos_int)
@@ -314,14 +376,22 @@ def _apply_types(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     df["awb_no"] = df["awb_no"].apply(normalize_awb_no)
 
     # ── flight_date → plain Python date (no timezone) ─────────────────────────
-    df["flight_date"] = pd.to_datetime(df["flight_date"], errors="coerce").dt.date
+    # Robust per-cell parse via _parse_dt_cell:
+    #   • true Excel dates (datetime/Timestamp) pass through unchanged — never flip
+    #   • text values ("01-06-2026") are parsed EXPLICITLY day-first (Indian format)
+    # This is deterministic, not a column-wide guess.
+    df["flight_date"] = df["flight_date"].apply(
+        lambda v: (lambda t: t.date() if t is not None and pd.notna(t) else None)(
+            _parse_dt_cell(v)
+        )
+    )
 
-    # ── Datetime columns: naive IST → UTC-aware ───────────────────────────────
+    # ── Datetime columns: robust parse, then naive IST → UTC-aware ────────────
     for col in DATETIME_COLS:
         if col in df.columns:
-            df[col] = (
-                pd.to_datetime(df[col], errors="coerce")
-                .apply(lambda x: _ist_to_utc(x) if pd.notna(x) else None)
+            parsed = df[col].apply(_parse_dt_cell)
+            df[col] = parsed.apply(
+                lambda x: _ist_to_utc(x) if x is not None and pd.notna(x) else None
             )
 
     # ── Int columns — dtype=object prevents pandas float64 upcasting ──────────
