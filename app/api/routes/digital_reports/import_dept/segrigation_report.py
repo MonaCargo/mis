@@ -1,16 +1,19 @@
 """
-routers/digital_reports/import_dept/seg_import_router.py
-
 Segregation Import upload endpoint.
 
 POST /api/digital-reports/import/segregation/upload
 """
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
+from typing import Optional
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile,status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
+from app.schemas.digital_reports.import_dept.operation_productivity_schema import ImportProductivityDashboardResponse, TruckInOutUploadResponse
+from app.services.digital_reports.import_dpt.operation_productivity_report.import_truck_in_out import DigitalReportImpTruckInOutService
+from app.services.digital_reports.import_dpt.operation_productivity_report.operation_productivity_service import  ProductivityImportShiftService
 from app.services.digital_reports.import_dpt.segrigation_report import generate_seg_report, process_seg_upload
 from app.utils.digital_reports.import_dept.excel_report_builder.import_segrigation_excel_buider import build_csv, build_csv_detailed, build_excel, build_excel_detailed   # adjust to your project's DB dependency
 
@@ -129,7 +132,7 @@ GET /api/digital-reports/import/segregation/report
   &format=xlsx          (default) | csv
 """
 
-from datetime import datetime, timezone, date
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 
@@ -207,6 +210,10 @@ async def download_seg_report(
         default=True,
         description="Include per-flight breakdown. Always true for the UI table.",
     ),
+    show_zeros: bool = Query(
+        default=True,
+        description="If any col box have value zero then show it to empty (null) in the report. Only applicable for file formats (xlsx/csv).",
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -235,7 +242,8 @@ async def download_seg_report(
         return JSONResponse(content=_jsonify(report))
 
     # ── File formats: 404 when there's nothing to export ─────────────────────
-    if report["grand_total"]["awb_count"] == 0:
+    # if report["grand_total"]["awb_count"] == 0:
+    if report["grand_total"]["mawb_count"] == 0:
         raise HTTPException(
             status_code=404,
             detail=f"No data found for the range {from_dt} to {to_dt}.",
@@ -244,11 +252,11 @@ async def download_seg_report(
     date_tag = f"{from_datetime.strftime('%Y%m%d')}_{to_datetime.strftime('%Y%m%d')}"
 
     if fmt == "csv":
-        content    = build_csv_detailed(report) if detailed else build_csv(report)
+        content    = build_csv_detailed(report,show_zeros=show_zeros) if detailed else build_csv(report,show_zeros=show_zeros)
         media_type = "text/csv"
         filename   = f"seg_import_report_{date_tag}.csv"
     else:  # xlsx
-        content    = build_excel_detailed(report) if detailed else build_excel(report)
+        content    = build_excel_detailed(report,show_zeros=show_zeros) if detailed else build_excel(report,show_zeros=show_zeros)
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         filename   = f"seg_import_report_{date_tag}.xlsx"
 
@@ -260,3 +268,81 @@ async def download_seg_report(
             "Content-Length":      str(len(content)),
         },
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =======================✌️✌️✌️✌️✌️  Import Productivity dashboard Report routes ========================
+"""
+Import Operations Productivity Dashboard API.
+
+GET /api/import-dashboard?from_ist=2026-06-01T00:00:00&to_ist=2026-06-29T00:00:00
+
+Dates are interpreted as IST. `to_ist` is exclusive. Defaults to "today in IST"
+(00:00 -> next 00:00) when omitted.
+"""
+
+@router.post(
+    "/import/upload/imp-truck-in-out",
+    response_model=TruckInOutUploadResponse,
+    summary="Upload Import Truck IN/OUT report",
+    description=(
+        "Upload route for the Import Truck IN/OUT report."
+        "Accepts the COSYS **Import Truck IN/OUT** Excel or CSV export. "
+        "Parses, cleans, converts all timestamps to UTC, and inserts into "
+        "`dr_imp_truck_in_out` in batches of 600 rows.\n\n"
+        "Duplicate `gp_no` rows are silently skipped (ON CONFLICT DO NOTHING).\n\n"
+
+        "(useful for re-uploads of the same date)."
+    ),
+)
+async def upload_imp_truck_in_out(
+    file: UploadFile = File(
+        ...,
+        description="COSYS Import Truck IN/OUT export (.xlsx, .csv)"
+    ),
+   
+    db: AsyncSession = Depends(get_db),
+):
+    result = await DigitalReportImpTruckInOutService.upload(
+        file=file,
+        db=db,
+
+    )
+
+    if result["status"] == "failed":
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=result,
+        )
+
+    return result
+
+
+
+
+# ---------->>>>>
+IST = timezone(timedelta(hours=5, minutes=30))
+@router.get("/import/operation-productivity", response_model=ImportProductivityDashboardResponse)
+async def get_import_dashboard(
+    report_date: Optional[date] = Query(
+        None,
+        description="IST calendar date. Operating day = 06:00 IST that day to 06:00 IST next day. Defaults to yesterday IST.",
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> ImportProductivityDashboardResponse:
+    if report_date is None:
+        report_date = (datetime.now(IST) - timedelta(days=1)).date()
+ 
+    service = ProductivityImportShiftService(db)
+    return await service.build(report_date)

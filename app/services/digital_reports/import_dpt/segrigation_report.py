@@ -329,6 +329,644 @@ async def process_seg_upload(file: UploadFile, db: AsyncSession) -> dict:
 
 
 
+# """
+# services/digital_reports/import_dept/seg_report_service.py
+
+# Generates the Segregation Import pivot report from stored DB data.
+# Returns aggregated data dict — the router calls build_excel() or build_csv() on top.
+
+# Performance notes (24000 AWBs / 2100 flights for 1 month):
+#   - 1 DB query with JOIN — no Python loops over DB rows
+#   - All aggregation done in pandas (vectorised)
+#   - AWB dedup (same awb_no under same flight+date) handled in groupby before pivot
+#   - MT conversion done in the same aggregation pass
+# """
+
+
+
+# from datetime import datetime, timedelta, timezone, date
+# from zoneinfo import ZoneInfo
+
+# import pandas as pd
+# from sqlalchemy import select, and_
+# from sqlalchemy.ext.asyncio import AsyncSession
+
+# from app.db.models.digital_reports.segrigation_report import (
+#     DigitalReportImportSegFlight,
+#     DigitalReportImportSegAwb,
+# )
+
+# IST = ZoneInfo("Asia/Kolkata")
+# UTC = timezone.utc
+
+# MAX_DAYS = 31
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Airline master  (hardcoded as per requirement)
+# # ─────────────────────────────────────────────────────────────────────────────
+
+# # (airline_code, airline_name, type)  type: PAX | CAO
+# # Source of truth: airline_name_code_and_category.xlsx (hardcoded here).
+# # Category (PAX/CAO) ALWAYS comes from this list — never from the segregation
+# # report's flight_status column.
+# _AIRLINE_MASTER: list[tuple[str, str, str]] = [
+#     ("AI",  "AIR INDIA ( DELHI )",          "PAX"),   # AI + dest=DEL
+#     ("AI",  "AIR INDIA ( TP )",             "PAX"),   # AI + dest≠DEL — handled in code
+#     ("DR",  "AIR SHAGOON",                  "CAO"),
+#     ("D7",  "AIRASIA X BERHAD",             "PAX"),
+#     ("NH",  "ALL NIPPON AIRWAYS",           "PAX"),
+#     ("B2",  "BELAVIA-BELARUSIAN",           "PAX"),
+#     ("B3",  "BHUTAN",                       "PAX"),
+#     ("BG",  "BIMAN BANGLADESH",             "PAX"),
+#     ("BZ",  "BLUE DART",                    "PAX"),
+#     ("X6",  "CHALLENGE AIR CARGO",          "CAO"),
+#     ("CH",  "CHALLENGE AIR CARGO",          "CAO"),
+#     ("GI",  "CHINA CENTRAL LONG HAO",       "CAO"),
+#     ("MS",  "EGYPT AIR",                    "PAX"),
+#     ("EK",  "EMIRATES",                     "PAX"),
+#     ("EY",  "ETIHAD  AIRWAYS",              "PAX"),
+#     ("AY",  "FINNAIR",                      "PAX"),
+#     ("RH",  "HONG KONG AIR CARGO",          "CAO"),
+#     ("MR",  "HUNNU AIR",                    "PAX"),
+#     ("AZ",  "ITA AIRWAYS",                  "PAX"),
+#     ("RQ",  "KAM AIR",                      "CAO"),
+#     ("LH",  "LUFTHANSA",                    "PAX"),
+#     ("W5",  "MAHAN AIR",                    "PAX"),
+#     ("C6",  "MY FREIGHTER",                 "CAO"),
+#     ("8M",  "MYANMAR AIRWAYS",              "PAX"),
+#     ("6P",  "PRADHAAN AIR EXPRESS PVT LTD", "PAX"),
+#     ("OV",  "SALAM AIR",                    "PAX"),
+#     ("7L",  "SILK WAY WEST",                "CAO"),
+#     ("SQ",  "SINGAPORE",                    "PAX"),
+#     ("SH",  "SOLITAIR AVIATION SERVICE",    "CAO"),
+#     ("SZ",  "SOMON AIR",                    "PAX"),
+#     ("SG",  "SPICE JET",                    "PAX"),
+#     ("UL",  "SRI LANKAN",                   "PAX"),
+#     ("Y8",  "SUPARNA",                      "CAO"),
+#     ("LX",  "SWISS",                        "PAX"),
+#     ("XJ",  "THAI AIRASIA X",               "PAX"),
+#     ("TG",  "THAI AIRWAYS",                 "PAX"),
+#     ("HT",  "TIANJIN AIR CARGO",            "CAO"),
+#     ("VJ",  "VIETJET AIR",                  "PAX"),
+#     ("VN",  "VIETNAM",                      "PAX"),
+#     ("YG",  "YTO CARGO",                    "CAO"),
+#     ("JG",  "JIANGSU JINGDONG CARGO",       "CAO"),
+#     ("PXX", "PO Mail",                      "PAX"),   # flight_no carrier code starts with P
+#     ("TS",  "AIR TRANSAT",                  "CAO"),
+#     ("VG",  "FLY VAAYU",                    "CAO"),
+# ]
+
+# # Others bucket (any code not in master) — Passenger per master file
+# _OTHERS_NAME = "OTHERS"
+# _OTHERS_TYPE = "PAX"
+
+# # Fast lookup: code → (name, type)  [AI handled separately]
+# _CODE_TO_INFO: dict[str, tuple[str, str]] = {}
+# for _code, _name, _type in _AIRLINE_MASTER:
+#     if _code == "AI":
+#         continue   # AI resolved at row level (Delhi vs TP)
+#     if _code not in _CODE_TO_INFO:
+#         _CODE_TO_INFO[_code] = (_name, _type)
+
+# # Ordered list for report rows (dedup AI into 2 rows)
+# _REPORT_AIRLINE_ORDER: list[tuple[str, str, str]] = []
+# _seen: set[tuple[str, str]] = set()
+# for _code, _name, _type in _AIRLINE_MASTER:
+#     if (_code, _name) not in _seen:
+#         _REPORT_AIRLINE_ORDER.append((_code, _name, _type))
+#         _seen.add((_code, _name))
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Helpers
+# # ─────────────────────────────────────────────────────────────────────────────
+
+# def _extract_airline_code(flight_no: str) -> str:
+#     """
+#     Airline code from flight number:
+#     - If the carrier code (alphabetic prefix) starts with 'P' → PXX (PO Mail).
+#       e.g. "PXX1234", "POM123", "P51234" all → PXX.
+#     - Otherwise → first 2 chars as the IATA carrier code.
+#     """
+#     if not flight_no:
+#         return ""
+#     fn = str(flight_no).strip().upper()
+#     if fn and fn[0] == "P":
+#         return "PXX"
+#     return fn[:2]
+
+
+# def _resolve_airline(flight_no: str, dest: str) -> tuple[str, str, str]:
+#     """
+#     Returns (airline_key, airline_name, airline_type).
+#     airline_key is used for grouping: 'AI_DEL', 'AI_TP', code, or 'Others'.
+#     Category (PAX/CAO) always comes from the master list above.
+#     """
+#     code = _extract_airline_code(flight_no)
+
+#     if code == "AI":
+#         if str(dest).strip().upper() == "DEL":
+#             return ("AI_DEL", "AIR INDIA ( DELHI )", "PAX")
+#         return ("AI_TP", "AIR INDIA ( TP )", "PAX")
+
+#     if code in _CODE_TO_INFO:
+#         name, typ = _CODE_TO_INFO[code]
+#         return (code, name, typ)
+
+#     return ("Others", _OTHERS_NAME, _OTHERS_TYPE)   # unknown → Others → PAX bucket
+
+
+# def _validate_range(from_dt: datetime, to_dt: datetime) -> None:
+#     if to_dt <= from_dt:
+#         raise ValueError("to_datetime must be after from_datetime.")
+#     delta = to_dt - from_dt
+#     if delta > timedelta(days=MAX_DAYS):
+#         raise ValueError(
+#             f"Date range exceeds {MAX_DAYS} days. "
+#             f"Selected range is {delta.days} day(s). "
+#             f"Please select a range of {MAX_DAYS} days or less."
+#         )
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # DB fetch — 1 query via JOIN
+# # ─────────────────────────────────────────────────────────────────────────────
+
+# async def _fetch_raw(
+#     db: AsyncSession,
+#     from_dt: datetime,
+#     to_dt: datetime,
+# ) -> pd.DataFrame:
+#     """
+#     Single JOIN query: seg_flights + seg_awbs filtered by flt_com_dat_tim range.
+#     Returns flat DataFrame with all columns needed for aggregation.
+#     """
+#     F = DigitalReportImportSegFlight
+#     A = DigitalReportImportSegAwb
+
+#     stmt = (
+#         select(
+#             F.flight_no,
+#             A.dest,                 # AWB-level dest (AI Delhi/TP split needs per-AWB dest)
+#             F.flt_com_dat_tim,
+#             A.awb_no,
+#             A.pcs,
+#             A.gross_wgt,
+#             A.chg_wgt,
+#         )
+#         .join(A, A.flight_id == F.id)
+#         .where(
+#             and_(
+#                 F.flt_com_dat_tim >= from_dt,
+#                 F.flt_com_dat_tim <= to_dt,
+#             )
+#         )
+#     )
+
+#     result = await db.execute(stmt)
+#     rows = result.fetchall()
+
+#     if not rows:
+#         return pd.DataFrame(columns=[
+#             "flight_no", "dest", "flt_com_dat_tim", "awb_no", "pcs", "gross_wgt", "chg_wgt"
+#         ])
+
+#     df = pd.DataFrame(rows, columns=[
+#         "flight_no", "dest", "flt_com_dat_tim", "awb_no", "pcs", "gross_wgt", "chg_wgt"
+#     ])
+#     return df
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Aggregation — all vectorised, single pass
+# # ─────────────────────────────────────────────────────────────────────────────
+
+# def _aggregate(df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     Input : flat AWB rows (one row per AWB record)
+#     Output: aggregated rows with one row per (airline_key, airline_name, type, date)
+#             columns: flight_count, awb_count, pcs, gross_wgt_mt
+
+#     Steps (all vectorised):
+#     1. Extract airline_key, airline_name, airline_type per row
+#     2. Extract report_date from flt_com_dat_tim
+#     3. Dedup AWBs: same awb_no under same (flight_no, report_date) → sum pcs+wgt, count as 1
+#     4. Aggregate per (airline_key, airline_name, airline_type, report_date)
+#     5. Convert gross_wgt kg → MT in the same groupby
+#     """
+#     if df.empty:
+#         return pd.DataFrame()
+
+#     # ── Steps 1+2: enrich (airline resolution, report_date, numeric casts) ───
+#     df = _enrich(df)
+
+#     # ── Departure count: distinct (flight_no, flt_com_dat_tim) per (airline, date) ──
+#     # A flight that operates twice in a day = 2 departures = flight_count 2.
+#     dep = df.copy()
+#     dep["_dep_key"] = (
+#         dep["flight_no"].astype(str) + "|" + dep["flt_com_dat_tim"].astype(str)
+#     )
+#     dep_count = (
+#         dep.groupby(["airline_key", "report_date"], sort=False)["_dep_key"]
+#         .nunique()
+#         .reset_index(name="flight_count")
+#     )
+
+#     # ── Step 3: AWB dedup within (flight_no, report_date) ────────────────────
+#     # Same awb_no on same flight+date → sum pcs and gross_wgt, count AWB once
+#     awb_dedup = (
+#         df.groupby(
+#             ["airline_key", "airline_name", "airline_type",
+#              "report_date", "flight_no", "awb_no"],
+#             sort=False,
+#         )
+#         .agg(
+#             pcs       = ("pcs",       "sum"),
+#             gross_wgt = ("gross_wgt", "sum"),
+#             chg_wgt   = ("chg_wgt",   "sum"),
+#         )
+#         .reset_index()
+#     )
+
+#     # ── Step 4+5: aggregate per (airline, date) — awb count, pcs, wgt MT ──────
+#     agg = (
+#         awb_dedup.groupby(
+#             ["airline_key", "airline_name", "airline_type", "report_date"],
+#             sort=False,
+#         )
+#         .agg(
+#             awb_count     = ("awb_no",     "nunique"),
+#             pcs           = ("pcs",        "sum"),
+#             gross_wgt_mt  = ("gross_wgt",  lambda x: round(x.sum() / 1000, 3)),
+#             chg_wgt_mt    = ("chg_wgt",    lambda x: round(x.sum() / 1000, 3)),
+#         )
+#         .reset_index()
+#     )
+
+#     # Merge in the departure-based flight_count
+#     agg = agg.merge(dep_count, on=["airline_key", "report_date"], how="left")
+#     agg["flight_count"] = agg["flight_count"].fillna(0).astype(int)
+
+#     return agg
+
+
+# def _aggregate_flights(df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     Flight-level aggregation for the DETAILED report format.
+
+#     Output: one row per (airline_key, airline_name, type, report_date, flight_no)
+#             columns: flight_count, awb_count, pcs, gross_wgt_mt, chg_wgt_mt
+
+#     Same dedup rule as _aggregate, but the final groupby keeps flight_no, so each
+#     individual flight number gets its own per-date metrics. A flight that ran twice
+#     in one day (two flt_com_dat_tim in range, same date) collapses into one row with
+#     summed pcs/weight; flight_count for that cell = number of departures (distinct
+#     flt_com_dat_tim values) — so twice-in-a-day = 2.
+
+#     Assumes df already has airline_* + report_date columns added by _enrich —
+#     so this is called on the SAME enriched df.
+#     """
+#     if df.empty:
+#         return pd.DataFrame()
+
+#     # ── Departure count per (flight_no, date): distinct flt_com_dat_tim ──────
+#     dep_count = (
+#         df.groupby(
+#             ["airline_key", "report_date", "flight_no"], sort=False
+#         )["flt_com_dat_tim"]
+#         .nunique()
+#         .reset_index(name="flight_count")
+#     )
+
+#     # AWB dedup within (flight_no, report_date) — identical to _aggregate Step 3
+#     awb_dedup = (
+#         df.groupby(
+#             ["airline_key", "airline_name", "airline_type",
+#              "report_date", "flight_no", "awb_no"],
+#             sort=False,
+#         )
+#         .agg(
+#             pcs       = ("pcs",       "sum"),
+#             gross_wgt = ("gross_wgt", "sum"),
+#             chg_wgt   = ("chg_wgt",   "sum"),
+#         )
+#         .reset_index()
+#     )
+
+#     # Final groupby KEEPS flight_no → one row per flight per date
+#     flt_agg = (
+#         awb_dedup.groupby(
+#             ["airline_key", "airline_name", "airline_type", "report_date", "flight_no"],
+#             sort=False,
+#         )
+#         .agg(
+#             awb_count     = ("awb_no",     "nunique"),
+#             pcs           = ("pcs",        "sum"),
+#             gross_wgt_mt  = ("gross_wgt",  lambda x: round(x.sum() / 1000, 3)),
+#             chg_wgt_mt    = ("chg_wgt",    lambda x: round(x.sum() / 1000, 3)),
+#         )
+#         .reset_index()
+#     )
+
+#     # Merge in departure-based flight_count
+#     flt_agg = flt_agg.merge(
+#         dep_count, on=["airline_key", "report_date", "flight_no"], how="left"
+#     )
+#     flt_agg["flight_count"] = flt_agg["flight_count"].fillna(0).astype(int)
+
+#     return flt_agg
+
+
+# def _enrich(df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     Shared enrichment: add airline_key/name/type + report_date + numeric casts.
+#     Used by both _aggregate and _aggregate_flights so they operate on the same df.
+#     """
+#     if df.empty:
+#         return df
+
+#     resolved = df[["flight_no", "dest"]].apply(
+#         lambda r: pd.Series(_resolve_airline(r["flight_no"], r["dest"])),
+#         axis=1,
+#     )
+#     resolved.columns = ["airline_key", "airline_name", "airline_type"]
+#     df = pd.concat([df, resolved], axis=1)
+
+#     # Bucket by IST calendar date. flt_com_dat_tim is stored as UTC; a flight at
+#     # 26-Jun 02:00 IST is 25-Jun 20:30 UTC, so we must convert to IST before
+#     # taking .date(), otherwise it lands in the wrong (previous) day column.
+#     _ts = pd.to_datetime(df["flt_com_dat_tim"], utc=True)
+#     df["report_date"] = _ts.dt.tz_convert(IST).dt.date
+#     df["pcs"]       = pd.to_numeric(df["pcs"],       errors="coerce").fillna(0)
+#     df["gross_wgt"] = pd.to_numeric(df["gross_wgt"], errors="coerce").fillna(0)
+#     df["chg_wgt"]   = pd.to_numeric(df["chg_wgt"],   errors="coerce").fillna(0)
+#     return df
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Build report dict
+# # ─────────────────────────────────────────────────────────────────────────────
+
+# def _empty_metrics() -> dict:
+#     return {"flight_count": 0, "awb_count": 0, "pcs": 0, "gross_wgt_mt": 0.0, "chg_wgt_mt": 0.0}
+
+
+# def _build_report(
+#     agg: pd.DataFrame,
+#     dates: list[date],
+#     flt_agg: pd.DataFrame | None = None,
+# ) -> dict:
+#     """
+#     Reshapes flat aggregated DataFrame into the nested report dict:
+#     {
+#       dates: [...],
+#       pax:   { airlines: [...], totals: {date: metrics, grand_total: metrics} },
+#       cao:   { same },
+#       grand_total: { date: metrics, grand_total: metrics }
+#     }
+#     Each airline entry:
+#     {
+#       airline_key, airline_name, airline_type,
+#       per_date: {date_str: metrics},
+#       grand_total: metrics,
+#       flights: [ {flight_no, per_date, grand_total}, ... ]   # only if flt_agg given
+#     }
+#     """
+#     date_strs = [d.isoformat() for d in dates]
+
+#     # Index agg by (airline_key, report_date) for O(1) lookup
+#     if not agg.empty:
+#         agg_idx = agg.set_index(["airline_key", "report_date"])
+#     else:
+#         agg_idx = pd.DataFrame()
+
+#     # Build per-airline → per-flight lookup for the detailed format
+#     # flights_by_airline[airline_key] = ordered list of flight_no
+#     # flt_idx[(airline_key, flight_no, report_date)] = metrics
+#     flights_by_airline: dict[str, list[str]] = {}
+#     flt_idx = {}
+#     if flt_agg is not None and not flt_agg.empty:
+#         for _, r in flt_agg.iterrows():
+#             akey = r["airline_key"]
+#             fno  = r["flight_no"]
+#             flt_idx[(akey, fno, r["report_date"])] = {
+#                 "flight_count": int(r["flight_count"]),
+#                 "awb_count":    int(r["awb_count"]),
+#                 "pcs":          int(r["pcs"]),
+#                 "gross_wgt_mt": float(r["gross_wgt_mt"]),
+#                 "chg_wgt_mt":   float(r["chg_wgt_mt"]),
+#             }
+#             flights_by_airline.setdefault(akey, [])
+#             if fno not in flights_by_airline[akey]:
+#                 flights_by_airline[akey].append(fno)
+
+#     def _get(airline_key: str, d: date) -> dict:
+#         if agg_idx.empty:
+#             return _empty_metrics()
+#         try:
+#             row = agg_idx.loc[(airline_key, d)]
+#             # loc can return Series (one row) or DataFrame (multiple) — handle both
+#             if isinstance(row, pd.DataFrame):
+#                 row = row.iloc[0]
+#             return {
+#                 "flight_count": int(row["flight_count"]),
+#                 "awb_count":    int(row["awb_count"]),
+#                 "pcs":          int(row["pcs"]),
+#                 "gross_wgt_mt": float(row["gross_wgt_mt"]),
+#                 "chg_wgt_mt":   float(row["chg_wgt_mt"]),
+#             }
+#         except KeyError:
+#             return _empty_metrics()
+
+#     def _sum_metrics(metrics_list: list[dict]) -> dict:
+#         return {
+#             "flight_count": sum(m["flight_count"] for m in metrics_list),
+#             "awb_count":    sum(m["awb_count"]    for m in metrics_list),
+#             "pcs":          sum(m["pcs"]           for m in metrics_list),
+#             "gross_wgt_mt": round(sum(m["gross_wgt_mt"] for m in metrics_list), 3),
+#             "chg_wgt_mt":   round(sum(m["chg_wgt_mt"]   for m in metrics_list), 3),
+#         }
+
+#     def _build_flights(key: str) -> list[dict]:
+#         """Build the per-flight rows for one airline (detailed format only)."""
+#         if key not in flights_by_airline:
+#             return []
+#         out = []
+#         for fno in flights_by_airline[key]:
+#             per_date: dict[str, dict] = {}
+#             for d, ds in zip(dates, date_strs):
+#                 per_date[ds] = flt_idx.get((key, fno, d), _empty_metrics())
+#             out.append({
+#                 "flight_no":   fno,
+#                 "per_date":    per_date,
+#                 "grand_total": _sum_metrics(list(per_date.values())),
+#             })
+#         return out
+
+#     def _build_group(type_filter: str) -> dict:
+#         airlines_out = []
+
+#         for code, name, atype in _REPORT_AIRLINE_ORDER:
+#             if atype != type_filter:
+#                 continue
+#             # Determine the lookup key
+#             if code == "AI" and name == "AIR INDIA ( DELHI )":
+#                 key = "AI_DEL"
+#             elif code == "AI" and name == "AIR INDIA ( TP )":
+#                 key = "AI_TP"
+#             else:
+#                 key = code
+
+#             per_date: dict[str, dict] = {}
+#             for d, ds in zip(dates, date_strs):
+#                 per_date[ds] = _get(key, d)
+
+#             grand_total = _sum_metrics(list(per_date.values()))
+
+#             # Only include airline if it has any data
+#             if grand_total["flight_count"] > 0:
+#                 airlines_out.append({
+#                     "airline_code":  code,
+#                     "airline_name":  name,
+#                     "airline_type":  atype,
+#                     "per_date":      per_date,
+#                     "grand_total":   grand_total,
+#                     "flights":       _build_flights(key),
+#                 })
+
+#         # Also add Others — belongs under PAX per master file (OTHERS = Passenger)
+#         others_per_date: dict[str, dict] = {}
+#         for d, ds in zip(dates, date_strs):
+#             others_per_date[ds] = _get("Others", d)
+#         others_total = _sum_metrics(list(others_per_date.values()))
+#         if others_total["flight_count"] > 0 and type_filter == _OTHERS_TYPE:
+#             airlines_out.append({
+#                 "airline_code":  "",
+#                 "airline_name":  _OTHERS_NAME,
+#                 "airline_type":  _OTHERS_TYPE,
+#                 "per_date":      others_per_date,
+#                 "grand_total":   others_total,
+#                 "flights":       _build_flights("Others"),
+#             })
+
+#         # Group totals = sum of all airline rows per date
+#         group_per_date: dict[str, dict] = {}
+#         for ds in date_strs:
+#             group_per_date[ds] = _sum_metrics(
+#                 [a["per_date"][ds] for a in airlines_out]
+#             )
+#         group_grand = _sum_metrics(list(group_per_date.values()))
+
+#         return {
+#             "airlines":    airlines_out,
+#             "per_date":    group_per_date,
+#             "grand_total": group_grand,
+#         }
+
+#     pax = _build_group("PAX")
+#     cao = _build_group("CAO")
+
+#     # Grand total per date = PAX + CAO
+#     grand_per_date: dict[str, dict] = {}
+#     for ds in date_strs:
+#         grand_per_date[ds] = _sum_metrics([
+#             pax["per_date"].get(ds, _empty_metrics()),
+#             cao["per_date"].get(ds, _empty_metrics()),
+#         ])
+#     grand_total = _sum_metrics(list(grand_per_date.values()))
+
+#     return {
+#         "dates":       date_strs,
+#         "pax":         pax,
+#         "cao":         cao,
+#         "per_date":    grand_per_date,
+#         "grand_total": grand_total,
+#     }
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Public entry point
+# # ─────────────────────────────────────────────────────────────────────────────
+
+# async def generate_seg_report(
+#     db: AsyncSession,
+#     from_dt: datetime,
+#     to_dt: datetime,
+#     detailed: bool = False,
+# ) -> dict:
+#     """
+#     Main service function called by the router.
+
+#     from_dt / to_dt : timezone-aware datetimes (UTC).
+#     detailed        : if True, also include per-flight breakdown under each airline
+#                       (consumed by build_excel_detailed).
+#     Raises ValueError for invalid / oversized ranges.
+#     Returns the full report dict consumed by the builders.
+#     """
+#     _validate_range(from_dt, to_dt)
+
+#     df = await _fetch_raw(db, from_dt, to_dt)
+
+#     # Enrich once, reuse for both airline-level and flight-level aggregation
+#     enriched = _enrich(df)
+#     agg = _aggregate(df)
+#     flt_agg = _aggregate_flights(enriched) if detailed else None
+
+#     # Build date list (IST calendar days in range, inclusive).
+#     # from_dt/to_dt are UTC-aware; convert to IST first so the columns match
+#     # the IST buckets used in _enrich (otherwise a UTC .date() shows the wrong day).
+#     dates: list[date] = []
+#     cur = from_dt.astimezone(IST).date()
+#     end = to_dt.astimezone(IST).date()
+#     while cur <= end:
+#         dates.append(cur)
+#         cur += timedelta(days=1)
+
+#     report = _build_report(agg, dates, flt_agg)
+#     report["from_dt"]  = from_dt.isoformat()
+#     report["to_dt"]    = to_dt.isoformat()
+#     report["detailed"] = detailed
+#     return report
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 services/digital_reports/import_dept/seg_report_service.py
 
@@ -341,8 +979,6 @@ Performance notes (24000 AWBs / 2100 flights for 1 month):
   - AWB dedup (same awb_no under same flight+date) handled in groupby before pivot
   - MT conversion done in the same aggregation pass
 """
-
-
 
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
@@ -370,8 +1006,8 @@ MAX_DAYS = 31
 # Category (PAX/CAO) ALWAYS comes from this list — never from the segregation
 # report's flight_status column.
 _AIRLINE_MASTER: list[tuple[str, str, str]] = [
-    ("AI",  "AIR INDIA ( DELHI )",          "PAX"),   # AI + dest=DEL
-    ("AI",  "AIR INDIA ( TP )",             "PAX"),   # AI + dest≠DEL — handled in code
+    ("AI",  "AIR INDIA ( DELHI )",          "PAX"),   # AI/IX + dest=DEL
+    ("AI",  "AIR INDIA ( TP )",             "PAX"),   # AI/IX + dest≠DEL — handled in code
     ("DR",  "AIR SHAGOON",                  "CAO"),
     ("D7",  "AIRASIA X BERHAD",             "PAX"),
     ("NH",  "ALL NIPPON AIRWAYS",           "PAX"),
@@ -389,8 +1025,9 @@ _AIRLINE_MASTER: list[tuple[str, str, str]] = [
     ("RH",  "HONG KONG AIR CARGO",          "CAO"),
     ("MR",  "HUNNU AIR",                    "PAX"),
     ("AZ",  "ITA AIRWAYS",                  "PAX"),
-    ("RQ",  "KAM AIR",                      "CAO"),
+    ("RQ",  "KAM AIR",                      "PAX"),   # CHANGED: was CAO → now PAX
     ("LH",  "LUFTHANSA",                    "PAX"),
+    ("LH_CAO", "LUFTHANSA",                 "CAO"),   # LH8370 + code 3S → LH Freighter (same name)
     ("W5",  "MAHAN AIR",                    "PAX"),
     ("C6",  "MY FREIGHTER",                 "CAO"),
     ("8M",  "MYANMAR AIRWAYS",              "PAX"),
@@ -414,27 +1051,43 @@ _AIRLINE_MASTER: list[tuple[str, str, str]] = [
     ("PXX", "PO Mail",                      "PAX"),   # flight_no carrier code starts with P
     ("TS",  "AIR TRANSAT",                  "CAO"),
     ("VG",  "FLY VAAYU",                    "CAO"),
+    ("BONDED", "BONDED TRUCK",              "PAX"),   # flight_no ending in 'T' → under PAX
 ]
 
 # Others bucket (any code not in master) — Passenger per master file
 _OTHERS_NAME = "OTHERS"
 _OTHERS_TYPE = "PAX"
 
-# Fast lookup: code → (name, type)  [AI handled separately]
+# Flight-number-specific overrides (checked before code resolution)
+# AZ0770 → Lufthansa PAX
+_FLIGHT_NO_OVERRIDES: dict[str, tuple[str, str, str]] = {
+    "AZ0770": ("LH", "LUFTHANSA", "PAX"),
+    "LH8370": ("LH_CAO", "LUFTHANSA", "CAO"),
+}
+
+# Codes that mean Air India (share the DEL/TP split)
+_AIR_INDIA_CODES = frozenset({"AI", "IX"})
+
+# Codes that force Lufthansa Freighter (CAO)
+_LH_FREIGHTER_CODES = frozenset({"3S"})
+
+# Fast lookup: code → (name, type)  [AI/IX handled separately]
 _CODE_TO_INFO: dict[str, tuple[str, str]] = {}
 for _code, _name, _type in _AIRLINE_MASTER:
     if _code == "AI":
         continue   # AI resolved at row level (Delhi vs TP)
+    if _code in ("LH_CAO", "BONDED"):
+        continue   # resolved via special rules, not plain code lookup
     if _code not in _CODE_TO_INFO:
         _CODE_TO_INFO[_code] = (_name, _type)
 
 # Ordered list for report rows (dedup AI into 2 rows)
 _REPORT_AIRLINE_ORDER: list[tuple[str, str, str]] = []
-_seen: set[tuple[str, str]] = set()
+_seen: set[tuple[str, str, str]] = set()
 for _code, _name, _type in _AIRLINE_MASTER:
-    if (_code, _name) not in _seen:
+    if (_code, _name, _type) not in _seen:
         _REPORT_AIRLINE_ORDER.append((_code, _name, _type))
-        _seen.add((_code, _name))
+        _seen.add((_code, _name, _type))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -445,7 +1098,6 @@ def _extract_airline_code(flight_no: str) -> str:
     """
     Airline code from flight number:
     - If the carrier code (alphabetic prefix) starts with 'P' → PXX (PO Mail).
-      e.g. "PXX1234", "POM123", "P51234" all → PXX.
     - Otherwise → first 2 chars as the IATA carrier code.
     """
     if not flight_no:
@@ -459,21 +1111,46 @@ def _extract_airline_code(flight_no: str) -> str:
 def _resolve_airline(flight_no: str, dest: str) -> tuple[str, str, str]:
     """
     Returns (airline_key, airline_name, airline_type).
-    airline_key is used for grouping: 'AI_DEL', 'AI_TP', code, or 'Others'.
-    Category (PAX/CAO) always comes from the master list above.
-    """
-    code = _extract_airline_code(flight_no)
+    airline_key groups rows: 'AI_DEL', 'AI_TP', 'BONDED', 'LH_CAO', code, or 'Others'.
+    Category (PAX/CAO) always comes from the master list / rules below.
 
-    if code == "AI":
+    Resolution order (first match wins):
+      1. flight_no ends with 'T'      → Bonded Truck (PAX)
+      2. exact flight_no override     → e.g. AZ0770 → LH PAX, LH8370 → LH CAO
+      3. code is 3S                   → Lufthansa Freighter (CAO)
+      4. code is AI or IX             → Air India, split DEL vs TP
+      5. code in master               → that airline
+      6. otherwise                    → Others (PAX)
+    """
+    fn = str(flight_no).strip().upper() if flight_no else ""
+
+    # 1) Bonded truck — flight number ends in 'T'
+    if fn.endswith("T"):
+        return ("BONDED", "BONDED TRUCK", "PAX")
+
+    # 2) exact flight-number override
+    if fn in _FLIGHT_NO_OVERRIDES:
+        return _FLIGHT_NO_OVERRIDES[fn]
+
+    code = _extract_airline_code(fn)
+
+    # 3) Lufthansa Freighter by code (3S)
+    if code in _LH_FREIGHTER_CODES:
+        return ("LH_CAO", "LUFTHANSA", "CAO")
+
+    # 4) Air India family (AI or IX) — split by destination
+    if code in _AIR_INDIA_CODES:
         if str(dest).strip().upper() == "DEL":
             return ("AI_DEL", "AIR INDIA ( DELHI )", "PAX")
         return ("AI_TP", "AIR INDIA ( TP )", "PAX")
 
+    # 5) known code
     if code in _CODE_TO_INFO:
         name, typ = _CODE_TO_INFO[code]
         return (code, name, typ)
 
-    return ("Others", _OTHERS_NAME, _OTHERS_TYPE)   # unknown → Others → PAX bucket
+    # 6) unknown → Others (PAX)
+    return ("Others", _OTHERS_NAME, _OTHERS_TYPE)
 
 
 def _validate_range(from_dt: datetime, to_dt: datetime) -> None:
@@ -513,6 +1190,7 @@ async def _fetch_raw(
             A.pcs,
             A.gross_wgt,
             A.chg_wgt,
+            A.no_of_houses,         # HAWB source (COSYS Column W)
         )
         .join(A, A.flight_id == F.id)
         .where(
@@ -526,161 +1204,23 @@ async def _fetch_raw(
     result = await db.execute(stmt)
     rows = result.fetchall()
 
+    cols = ["flight_no", "dest", "flt_com_dat_tim", "awb_no",
+            "pcs", "gross_wgt", "chg_wgt", "no_of_houses"]
+
     if not rows:
-        return pd.DataFrame(columns=[
-            "flight_no", "dest", "flt_com_dat_tim", "awb_no", "pcs", "gross_wgt", "chg_wgt"
-        ])
+        return pd.DataFrame(columns=cols)
 
-    df = pd.DataFrame(rows, columns=[
-        "flight_no", "dest", "flt_com_dat_tim", "awb_no", "pcs", "gross_wgt", "chg_wgt"
-    ])
-    return df
+    return pd.DataFrame(rows, columns=cols)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Aggregation — all vectorised, single pass
+# Enrichment (shared)
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _aggregate(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Input : flat AWB rows (one row per AWB record)
-    Output: aggregated rows with one row per (airline_key, airline_name, type, date)
-            columns: flight_count, awb_count, pcs, gross_wgt_mt
-
-    Steps (all vectorised):
-    1. Extract airline_key, airline_name, airline_type per row
-    2. Extract report_date from flt_com_dat_tim
-    3. Dedup AWBs: same awb_no under same (flight_no, report_date) → sum pcs+wgt, count as 1
-    4. Aggregate per (airline_key, airline_name, airline_type, report_date)
-    5. Convert gross_wgt kg → MT in the same groupby
-    """
-    if df.empty:
-        return pd.DataFrame()
-
-    # ── Steps 1+2: enrich (airline resolution, report_date, numeric casts) ───
-    df = _enrich(df)
-
-    # ── Departure count: distinct (flight_no, flt_com_dat_tim) per (airline, date) ──
-    # A flight that operates twice in a day = 2 departures = flight_count 2.
-    dep = df.copy()
-    dep["_dep_key"] = (
-        dep["flight_no"].astype(str) + "|" + dep["flt_com_dat_tim"].astype(str)
-    )
-    dep_count = (
-        dep.groupby(["airline_key", "report_date"], sort=False)["_dep_key"]
-        .nunique()
-        .reset_index(name="flight_count")
-    )
-
-    # ── Step 3: AWB dedup within (flight_no, report_date) ────────────────────
-    # Same awb_no on same flight+date → sum pcs and gross_wgt, count AWB once
-    awb_dedup = (
-        df.groupby(
-            ["airline_key", "airline_name", "airline_type",
-             "report_date", "flight_no", "awb_no"],
-            sort=False,
-        )
-        .agg(
-            pcs       = ("pcs",       "sum"),
-            gross_wgt = ("gross_wgt", "sum"),
-            chg_wgt   = ("chg_wgt",   "sum"),
-        )
-        .reset_index()
-    )
-
-    # ── Step 4+5: aggregate per (airline, date) — awb count, pcs, wgt MT ──────
-    agg = (
-        awb_dedup.groupby(
-            ["airline_key", "airline_name", "airline_type", "report_date"],
-            sort=False,
-        )
-        .agg(
-            awb_count     = ("awb_no",     "nunique"),
-            pcs           = ("pcs",        "sum"),
-            gross_wgt_mt  = ("gross_wgt",  lambda x: round(x.sum() / 1000, 3)),
-            chg_wgt_mt    = ("chg_wgt",    lambda x: round(x.sum() / 1000, 3)),
-        )
-        .reset_index()
-    )
-
-    # Merge in the departure-based flight_count
-    agg = agg.merge(dep_count, on=["airline_key", "report_date"], how="left")
-    agg["flight_count"] = agg["flight_count"].fillna(0).astype(int)
-
-    return agg
-
-
-def _aggregate_flights(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Flight-level aggregation for the DETAILED report format.
-
-    Output: one row per (airline_key, airline_name, type, report_date, flight_no)
-            columns: flight_count, awb_count, pcs, gross_wgt_mt, chg_wgt_mt
-
-    Same dedup rule as _aggregate, but the final groupby keeps flight_no, so each
-    individual flight number gets its own per-date metrics. A flight that ran twice
-    in one day (two flt_com_dat_tim in range, same date) collapses into one row with
-    summed pcs/weight; flight_count for that cell = number of departures (distinct
-    flt_com_dat_tim values) — so twice-in-a-day = 2.
-
-    Assumes df already has airline_* + report_date columns added by _enrich —
-    so this is called on the SAME enriched df.
-    """
-    if df.empty:
-        return pd.DataFrame()
-
-    # ── Departure count per (flight_no, date): distinct flt_com_dat_tim ──────
-    dep_count = (
-        df.groupby(
-            ["airline_key", "report_date", "flight_no"], sort=False
-        )["flt_com_dat_tim"]
-        .nunique()
-        .reset_index(name="flight_count")
-    )
-
-    # AWB dedup within (flight_no, report_date) — identical to _aggregate Step 3
-    awb_dedup = (
-        df.groupby(
-            ["airline_key", "airline_name", "airline_type",
-             "report_date", "flight_no", "awb_no"],
-            sort=False,
-        )
-        .agg(
-            pcs       = ("pcs",       "sum"),
-            gross_wgt = ("gross_wgt", "sum"),
-            chg_wgt   = ("chg_wgt",   "sum"),
-        )
-        .reset_index()
-    )
-
-    # Final groupby KEEPS flight_no → one row per flight per date
-    flt_agg = (
-        awb_dedup.groupby(
-            ["airline_key", "airline_name", "airline_type", "report_date", "flight_no"],
-            sort=False,
-        )
-        .agg(
-            awb_count     = ("awb_no",     "nunique"),
-            pcs           = ("pcs",        "sum"),
-            gross_wgt_mt  = ("gross_wgt",  lambda x: round(x.sum() / 1000, 3)),
-            chg_wgt_mt    = ("chg_wgt",    lambda x: round(x.sum() / 1000, 3)),
-        )
-        .reset_index()
-    )
-
-    # Merge in departure-based flight_count
-    flt_agg = flt_agg.merge(
-        dep_count, on=["airline_key", "report_date", "flight_no"], how="left"
-    )
-    flt_agg["flight_count"] = flt_agg["flight_count"].fillna(0).astype(int)
-
-    return flt_agg
-
 
 def _enrich(df: pd.DataFrame) -> pd.DataFrame:
     """
     Shared enrichment: add airline_key/name/type + report_date + numeric casts.
-    Used by both _aggregate and _aggregate_flights so they operate on the same df.
+    Used by _aggregate and _aggregate_flights so they operate on the same df.
     """
     if df.empty:
         return df
@@ -692,15 +1232,200 @@ def _enrich(df: pd.DataFrame) -> pd.DataFrame:
     resolved.columns = ["airline_key", "airline_name", "airline_type"]
     df = pd.concat([df, resolved], axis=1)
 
-    # Bucket by IST calendar date. flt_com_dat_tim is stored as UTC; a flight at
-    # 26-Jun 02:00 IST is 25-Jun 20:30 UTC, so we must convert to IST before
-    # taking .date(), otherwise it lands in the wrong (previous) day column.
+    # Bucket by IST calendar date. flt_com_dat_tim is stored UTC → convert to IST
+    # before .date(), else a post-18:30-UTC flight lands in the wrong day column.
     _ts = pd.to_datetime(df["flt_com_dat_tim"], utc=True)
-    df["report_date"] = _ts.dt.tz_convert(IST).dt.date
-    df["pcs"]       = pd.to_numeric(df["pcs"],       errors="coerce").fillna(0)
-    df["gross_wgt"] = pd.to_numeric(df["gross_wgt"], errors="coerce").fillna(0)
-    df["chg_wgt"]   = pd.to_numeric(df["chg_wgt"],   errors="coerce").fillna(0)
+    df["report_date"]  = _ts.dt.tz_convert(IST).dt.date
+    df["pcs"]          = pd.to_numeric(df["pcs"],          errors="coerce").fillna(0)
+    df["gross_wgt"]    = pd.to_numeric(df["gross_wgt"],    errors="coerce").fillna(0)
+    df["chg_wgt"]      = pd.to_numeric(df["chg_wgt"],      errors="coerce").fillna(0)
+    df["no_of_houses"] = pd.to_numeric(df["no_of_houses"], errors="coerce").fillna(0)
     return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aggregation — airline level
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _aggregate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Input : flat AWB rows (already enriched or not — we enrich if needed)
+    Output: one row per (airline_key, airline_name, type, report_date) with
+            flight_count, mawb_count, hawb_count, pcs, gross_wgt_mt, chg_wgt_mt
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    if "airline_key" not in df.columns:
+        df = _enrich(df)
+
+    # Departure count: distinct (flight_no, flt_com_dat_tim) per (airline, date)
+    dep = df.copy()
+    dep["_dep_key"] = (
+        dep["flight_no"].astype(str) + "|" + dep["flt_com_dat_tim"].astype(str)
+    )
+    dep_count = (
+        dep.groupby(["airline_key", "report_date"], sort=False)["_dep_key"]
+        .nunique()
+        .reset_index(name="flight_count")
+    )
+
+    # AWB dedup within (flight_no, report_date): same awb_no → sum, count once.
+    # no_of_houses summed the same way (HAWB count per AWB record).
+    awb_dedup = (
+        df.groupby(
+            ["airline_key", "airline_name", "airline_type",
+             "report_date", "flight_no", "awb_no"],
+            sort=False,
+        )
+        .agg(
+            pcs          = ("pcs",          "sum"),
+            gross_wgt    = ("gross_wgt",    "sum"),
+            chg_wgt      = ("chg_wgt",      "sum"),
+            no_of_houses = ("no_of_houses", "sum"),
+        )
+        .reset_index()
+    )
+
+    agg = (
+        awb_dedup.groupby(
+            ["airline_key", "airline_name", "airline_type", "report_date"],
+            sort=False,
+        )
+        .agg(
+            mawb_count   = ("awb_no",       "nunique"),
+            hawb_count   = ("no_of_houses", "sum"),
+            pcs          = ("pcs",          "sum"),
+            gross_wgt_mt = ("gross_wgt",    lambda x: round(x.sum() / 1000, 3)),
+            chg_wgt_mt   = ("chg_wgt",      lambda x: round(x.sum() / 1000, 3)),
+        )
+        .reset_index()
+    )
+
+    agg = agg.merge(dep_count, on=["airline_key", "report_date"], how="left")
+    agg["flight_count"] = agg["flight_count"].fillna(0).astype(int)
+    agg["hawb_count"]   = agg["hawb_count"].fillna(0).astype(int)
+
+    return agg
+
+
+def _aggregate_ai_dedup(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Air India PARENT dedup aggregation.
+
+    Combines AI_DEL + AI_TP into one 'AI_PARENT' summary per report_date:
+      - flight_count = distinct physical departures (flight_no, flt_com_dat_tim)
+        across BOTH DEL and TP → a split flight counts ONCE, not twice.
+      - mawb/hawb/pcs/weights = sum of the AI_DEL + AI_TP aggregated values
+        (these split cleanly by destination, so summing is correct).
+
+    Returns rows keyed airline_key='AI_PARENT'. Empty df if no AI data.
+    """
+    if df.empty or "airline_key" not in df.columns:
+        return pd.DataFrame()
+
+    ai = df[df["airline_key"].isin(["AI_DEL", "AI_TP"])].copy()
+    if ai.empty:
+        return pd.DataFrame()
+
+    # Deduped physical flight count across both DEL and TP
+    ai["_dep_key"] = ai["flight_no"].astype(str) + "|" + ai["flt_com_dat_tim"].astype(str)
+    dep_count = (
+        ai.groupby(["report_date"], sort=False)["_dep_key"]
+        .nunique()
+        .reset_index(name="flight_count")
+    )
+
+    # AWB dedup within (flight_no, report_date, awb_no) — AWBs are unique per
+    # destination, so DEL and TP AWBs never collide; summing gives true totals.
+    awb_dedup = (
+        ai.groupby(["report_date", "flight_no", "awb_no"], sort=False)
+        .agg(
+            pcs          = ("pcs",          "sum"),
+            gross_wgt    = ("gross_wgt",    "sum"),
+            chg_wgt      = ("chg_wgt",      "sum"),
+            no_of_houses = ("no_of_houses", "sum"),
+        )
+        .reset_index()
+    )
+
+    agg = (
+        awb_dedup.groupby(["report_date"], sort=False)
+        .agg(
+            mawb_count   = ("awb_no",       "nunique"),
+            hawb_count   = ("no_of_houses", "sum"),
+            pcs          = ("pcs",          "sum"),
+            gross_wgt_mt = ("gross_wgt",    lambda x: round(x.sum() / 1000, 3)),
+            chg_wgt_mt   = ("chg_wgt",      lambda x: round(x.sum() / 1000, 3)),
+        )
+        .reset_index()
+    )
+
+    agg = agg.merge(dep_count, on=["report_date"], how="left")
+    agg["flight_count"]  = agg["flight_count"].fillna(0).astype(int)
+    agg["hawb_count"]    = agg["hawb_count"].fillna(0).astype(int)
+    agg["airline_key"]   = "AI_PARENT"
+    agg["airline_name"]  = "AIR INDIA"
+    agg["airline_type"]  = "PAX"
+
+    return agg
+
+
+def _aggregate_flights(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flight-level aggregation for the DETAILED report format.
+    One row per (airline_key, airline_name, type, report_date, flight_no).
+    Assumes df already enriched.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    if "airline_key" not in df.columns:
+        df = _enrich(df)
+
+    dep_count = (
+        df.groupby(["airline_key", "report_date", "flight_no"], sort=False)["flt_com_dat_tim"]
+        .nunique()
+        .reset_index(name="flight_count")
+    )
+
+    awb_dedup = (
+        df.groupby(
+            ["airline_key", "airline_name", "airline_type",
+             "report_date", "flight_no", "awb_no"],
+            sort=False,
+        )
+        .agg(
+            pcs          = ("pcs",          "sum"),
+            gross_wgt    = ("gross_wgt",    "sum"),
+            chg_wgt      = ("chg_wgt",      "sum"),
+            no_of_houses = ("no_of_houses", "sum"),
+        )
+        .reset_index()
+    )
+
+    flt_agg = (
+        awb_dedup.groupby(
+            ["airline_key", "airline_name", "airline_type", "report_date", "flight_no"],
+            sort=False,
+        )
+        .agg(
+            mawb_count   = ("awb_no",       "nunique"),
+            hawb_count   = ("no_of_houses", "sum"),
+            pcs          = ("pcs",          "sum"),
+            gross_wgt_mt = ("gross_wgt",    lambda x: round(x.sum() / 1000, 3)),
+            chg_wgt_mt   = ("chg_wgt",      lambda x: round(x.sum() / 1000, 3)),
+        )
+        .reset_index()
+    )
+
+    flt_agg = flt_agg.merge(
+        dep_count, on=["airline_key", "report_date", "flight_no"], how="left"
+    )
+    flt_agg["flight_count"] = flt_agg["flight_count"].fillna(0).astype(int)
+    flt_agg["hawb_count"]   = flt_agg["hawb_count"].fillna(0).astype(int)
+
+    return flt_agg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -708,41 +1433,32 @@ def _enrich(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _empty_metrics() -> dict:
-    return {"flight_count": 0, "awb_count": 0, "pcs": 0, "gross_wgt_mt": 0.0, "chg_wgt_mt": 0.0}
+    return {
+        "flight_count": 0, "mawb_count": 0, "hawb_count": 0,
+        "pcs": 0, "gross_wgt_mt": 0.0, "chg_wgt_mt": 0.0,
+    }
 
 
 def _build_report(
     agg: pd.DataFrame,
     dates: list[date],
     flt_agg: pd.DataFrame | None = None,
+    ai_parent: pd.DataFrame | None = None,
 ) -> dict:
     """
-    Reshapes flat aggregated DataFrame into the nested report dict:
-    {
-      dates: [...],
-      pax:   { airlines: [...], totals: {date: metrics, grand_total: metrics} },
-      cao:   { same },
-      grand_total: { date: metrics, grand_total: metrics }
-    }
-    Each airline entry:
-    {
-      airline_key, airline_name, airline_type,
-      per_date: {date_str: metrics},
-      grand_total: metrics,
-      flights: [ {flight_no, per_date, grand_total}, ... ]   # only if flt_agg given
-    }
+    Reshapes aggregated DataFrames into the nested report dict.
+
+    AI is emitted as an expandable parent row 'AIR INDIA' (from ai_parent, with
+    deduped flight_count) whose children are the AI (Delhi) and AI (TP) rows.
+    The grand total uses the AI PARENT (deduped) numbers, not DEL+TP, so a split
+    flight counts once in the Final Count.
     """
     date_strs = [d.isoformat() for d in dates]
 
-    # Index agg by (airline_key, report_date) for O(1) lookup
-    if not agg.empty:
-        agg_idx = agg.set_index(["airline_key", "report_date"])
-    else:
-        agg_idx = pd.DataFrame()
+    agg_idx = agg.set_index(["airline_key", "report_date"]) if not agg.empty else pd.DataFrame()
+    ai_idx  = ai_parent.set_index(["airline_key", "report_date"]) if (ai_parent is not None and not ai_parent.empty) else pd.DataFrame()
 
-    # Build per-airline → per-flight lookup for the detailed format
-    # flights_by_airline[airline_key] = ordered list of flight_no
-    # flt_idx[(airline_key, flight_no, report_date)] = metrics
+    # per-airline → per-flight lookup for detailed format
     flights_by_airline: dict[str, list[str]] = {}
     flt_idx = {}
     if flt_agg is not None and not flt_agg.empty:
@@ -751,7 +1467,8 @@ def _build_report(
             fno  = r["flight_no"]
             flt_idx[(akey, fno, r["report_date"])] = {
                 "flight_count": int(r["flight_count"]),
-                "awb_count":    int(r["awb_count"]),
+                "mawb_count":   int(r["mawb_count"]),
+                "hawb_count":   int(r["hawb_count"]),
                 "pcs":          int(r["pcs"]),
                 "gross_wgt_mt": float(r["gross_wgt_mt"]),
                 "chg_wgt_mt":   float(r["chg_wgt_mt"]),
@@ -760,42 +1477,55 @@ def _build_report(
             if fno not in flights_by_airline[akey]:
                 flights_by_airline[akey].append(fno)
 
+    def _row_to_metrics(row) -> dict:
+        return {
+            "flight_count": int(row["flight_count"]),
+            "mawb_count":   int(row["mawb_count"]),
+            "hawb_count":   int(row["hawb_count"]),
+            "pcs":          int(row["pcs"]),
+            "gross_wgt_mt": float(row["gross_wgt_mt"]),
+            "chg_wgt_mt":   float(row["chg_wgt_mt"]),
+        }
+
     def _get(airline_key: str, d: date) -> dict:
         if agg_idx.empty:
             return _empty_metrics()
         try:
             row = agg_idx.loc[(airline_key, d)]
-            # loc can return Series (one row) or DataFrame (multiple) — handle both
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
-            return {
-                "flight_count": int(row["flight_count"]),
-                "awb_count":    int(row["awb_count"]),
-                "pcs":          int(row["pcs"]),
-                "gross_wgt_mt": float(row["gross_wgt_mt"]),
-                "chg_wgt_mt":   float(row["chg_wgt_mt"]),
-            }
+            return _row_to_metrics(row)
+        except KeyError:
+            return _empty_metrics()
+
+    def _get_ai_parent(d: date) -> dict:
+        if ai_idx.empty:
+            return _empty_metrics()
+        try:
+            row = ai_idx.loc[("AI_PARENT", d)]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            return _row_to_metrics(row)
         except KeyError:
             return _empty_metrics()
 
     def _sum_metrics(metrics_list: list[dict]) -> dict:
         return {
             "flight_count": sum(m["flight_count"] for m in metrics_list),
-            "awb_count":    sum(m["awb_count"]    for m in metrics_list),
-            "pcs":          sum(m["pcs"]           for m in metrics_list),
+            "mawb_count":   sum(m["mawb_count"]   for m in metrics_list),
+            "hawb_count":   sum(m["hawb_count"]   for m in metrics_list),
+            "pcs":          sum(m["pcs"]          for m in metrics_list),
             "gross_wgt_mt": round(sum(m["gross_wgt_mt"] for m in metrics_list), 3),
             "chg_wgt_mt":   round(sum(m["chg_wgt_mt"]   for m in metrics_list), 3),
         }
 
     def _build_flights(key: str) -> list[dict]:
-        """Build the per-flight rows for one airline (detailed format only)."""
         if key not in flights_by_airline:
             return []
         out = []
         for fno in flights_by_airline[key]:
-            per_date: dict[str, dict] = {}
-            for d, ds in zip(dates, date_strs):
-                per_date[ds] = flt_idx.get((key, fno, d), _empty_metrics())
+            per_date = {ds: flt_idx.get((key, fno, d), _empty_metrics())
+                        for d, ds in zip(dates, date_strs)}
             out.append({
                 "flight_no":   fno,
                 "per_date":    per_date,
@@ -803,58 +1533,86 @@ def _build_report(
             })
         return out
 
+    def _airline_row(code, name, atype, key) -> dict | None:
+        per_date = {ds: _get(key, d) for d, ds in zip(dates, date_strs)}
+        grand = _sum_metrics(list(per_date.values()))
+        if grand["flight_count"] <= 0:
+            return None
+        return {
+            "airline_code":  code,
+            "airline_name":  name,
+            "airline_type":  atype,
+            "per_date":      per_date,
+            "grand_total":   grand,
+            "flights":       _build_flights(key),
+        }
+
+    def _build_ai_parent_row() -> dict | None:
+        """Expandable AIR INDIA parent: deduped totals, children = DEL + TP."""
+        parent_per_date = {ds: _get_ai_parent(d) for d, ds in zip(dates, date_strs)}
+        parent_grand = _sum_metrics(list(parent_per_date.values()))
+        if parent_grand["flight_count"] <= 0:
+            return None
+
+        children = []
+        for child_key, child_name in [("AI_DEL", "AIR INDIA ( DELHI )"),
+                                       ("AI_TP",  "AIR INDIA ( TP )")]:
+            c_per_date = {ds: _get(child_key, d) for d, ds in zip(dates, date_strs)}
+            c_grand = _sum_metrics(list(c_per_date.values()))
+            if c_grand["flight_count"] > 0:
+                children.append({
+                    "airline_code":  "AI",
+                    "airline_name":  child_name,
+                    "airline_type":  "PAX",
+                    "per_date":      c_per_date,
+                    "grand_total":   c_grand,
+                    "flights":       _build_flights(child_key),
+                })
+
+        return {
+            "airline_code":  "AI",
+            "airline_name":  "AIR INDIA",
+            "airline_type":  "PAX",
+            "per_date":      parent_per_date,
+            "grand_total":   parent_grand,
+            "is_parent":     True,          # frontend: expandable
+            "children":      children,       # AI (Delhi), AI (TP)
+            "flights":       [],
+        }
+
     def _build_group(type_filter: str) -> dict:
         airlines_out = []
+
+        # AI expandable parent goes into PAX, in place of the two flat AI rows.
+        if type_filter == "PAX":
+            ai_row = _build_ai_parent_row()
+            if ai_row:
+                airlines_out.append(ai_row)
 
         for code, name, atype in _REPORT_AIRLINE_ORDER:
             if atype != type_filter:
                 continue
-            # Determine the lookup key
-            if code == "AI" and name == "AIR INDIA ( DELHI )":
-                key = "AI_DEL"
-            elif code == "AI" and name == "AIR INDIA ( TP )":
-                key = "AI_TP"
-            else:
-                key = code
+            # Skip AI flat rows — represented by the parent above
+            if code == "AI":
+                continue
+            key = code   # includes LH_CAO, BONDED, etc.
+            row = _airline_row(code, name, atype, key)
+            if row:
+                airlines_out.append(row)
 
-            per_date: dict[str, dict] = {}
-            for d, ds in zip(dates, date_strs):
-                per_date[ds] = _get(key, d)
+        # Others → PAX
+        if type_filter == _OTHERS_TYPE:
+            others = _airline_row("", _OTHERS_NAME, _OTHERS_TYPE, "Others")
+            if others:
+                airlines_out.append(others)
 
-            grand_total = _sum_metrics(list(per_date.values()))
-
-            # Only include airline if it has any data
-            if grand_total["flight_count"] > 0:
-                airlines_out.append({
-                    "airline_code":  code,
-                    "airline_name":  name,
-                    "airline_type":  atype,
-                    "per_date":      per_date,
-                    "grand_total":   grand_total,
-                    "flights":       _build_flights(key),
-                })
-
-        # Also add Others — belongs under PAX per master file (OTHERS = Passenger)
-        others_per_date: dict[str, dict] = {}
-        for d, ds in zip(dates, date_strs):
-            others_per_date[ds] = _get("Others", d)
-        others_total = _sum_metrics(list(others_per_date.values()))
-        if others_total["flight_count"] > 0 and type_filter == _OTHERS_TYPE:
-            airlines_out.append({
-                "airline_code":  "",
-                "airline_name":  _OTHERS_NAME,
-                "airline_type":  _OTHERS_TYPE,
-                "per_date":      others_per_date,
-                "grand_total":   others_total,
-                "flights":       _build_flights("Others"),
-            })
-
-        # Group totals = sum of all airline rows per date
-        group_per_date: dict[str, dict] = {}
-        for ds in date_strs:
-            group_per_date[ds] = _sum_metrics(
-                [a["per_date"][ds] for a in airlines_out]
-            )
+        # Group totals per date = sum of all TOP-LEVEL airline rows.
+        # AI parent already holds the deduped numbers, so summing top-level rows
+        # (parent, not children) gives the correct deduped group + grand total.
+        group_per_date = {
+            ds: _sum_metrics([a["per_date"][ds] for a in airlines_out])
+            for ds in date_strs
+        }
         group_grand = _sum_metrics(list(group_per_date.values()))
 
         return {
@@ -866,13 +1624,13 @@ def _build_report(
     pax = _build_group("PAX")
     cao = _build_group("CAO")
 
-    # Grand total per date = PAX + CAO
-    grand_per_date: dict[str, dict] = {}
-    for ds in date_strs:
-        grand_per_date[ds] = _sum_metrics([
+    grand_per_date = {
+        ds: _sum_metrics([
             pax["per_date"].get(ds, _empty_metrics()),
             cao["per_date"].get(ds, _empty_metrics()),
         ])
+        for ds in date_strs
+    }
     grand_total = _sum_metrics(list(grand_per_date.values()))
 
     return {
@@ -896,25 +1654,19 @@ async def generate_seg_report(
 ) -> dict:
     """
     Main service function called by the router.
-
     from_dt / to_dt : timezone-aware datetimes (UTC).
-    detailed        : if True, also include per-flight breakdown under each airline
-                      (consumed by build_excel_detailed).
-    Raises ValueError for invalid / oversized ranges.
-    Returns the full report dict consumed by the builders.
+    detailed        : if True, include per-flight breakdown under each airline.
     """
     _validate_range(from_dt, to_dt)
 
     df = await _fetch_raw(db, from_dt, to_dt)
 
-    # Enrich once, reuse for both airline-level and flight-level aggregation
-    enriched = _enrich(df)
-    agg = _aggregate(df)
-    flt_agg = _aggregate_flights(enriched) if detailed else None
+    enriched  = _enrich(df)
+    agg       = _aggregate(enriched)
+    ai_parent = _aggregate_ai_dedup(enriched)          # always — needed by compact too
+    flt_agg   = _aggregate_flights(enriched) if detailed else None
 
-    # Build date list (IST calendar days in range, inclusive).
-    # from_dt/to_dt are UTC-aware; convert to IST first so the columns match
-    # the IST buckets used in _enrich (otherwise a UTC .date() shows the wrong day).
+    # IST calendar days in range, inclusive
     dates: list[date] = []
     cur = from_dt.astimezone(IST).date()
     end = to_dt.astimezone(IST).date()
@@ -922,7 +1674,7 @@ async def generate_seg_report(
         dates.append(cur)
         cur += timedelta(days=1)
 
-    report = _build_report(agg, dates, flt_agg)
+    report = _build_report(agg, dates, flt_agg, ai_parent)
     report["from_dt"]  = from_dt.isoformat()
     report["to_dt"]    = to_dt.isoformat()
     report["detailed"] = detailed
