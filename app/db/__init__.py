@@ -41,14 +41,36 @@ from app.db.models.exportOperation.export_uld_loading_sheet_form import ExportLo
 from app.db.models.importOperation.imp_truck_in_out_module import ImportTruckInStaging , ImportTruckVisit, ImportGatePass, ImportGatePassAssignment, ImportGatePassLoading
 from app.db.models.app_config.app_config import AppConfig ,AppConfigLog 
 
+from app.db.models.digital_reports.import_dept.import_pick_order import DigitalReportImportPickOrder
+from app.db.models.digital_reports.import_dept.import_emp_roaster import DigitalReportRosterAttendance,DigitalReportRosterEmployee
+
+
+
+from app.db.models.digital_reports.customer_care.export_xray import DigitalReportExportXray
+from app.db.models.digital_reports.customer_care.export_tp_xray import DigitalReportExportTpXray
+from app.db.models.digital_reports.customer_care.import_tp_xray import DigitalReportImportTpXray
+from app.db.models.digital_reports.customer_care.xray_performance import DigitalReportXRayPerformance
+
+
 __all__ = [
 
 "ImportGpMismatchLog",
 "ImportShipmentHold",
 
+
+"DigitalReportExportXray",
+"DigitalReportExportTpXray",
+"DigitalReportImportTpXray",
+"DigitalReportXRayPerformance",
+
+
+
 "DigitalReportImportSegFlight",
 "DigitalReportImportSegAwb",
 'DigitalReportImportTruckInOut',
+'DigitalReportImportPickOrder',
+"DigitalReportRosterAttendance",
+"DigitalReportRosterEmployee",
 
 "AppConfig", "AppConfigLog",
 
