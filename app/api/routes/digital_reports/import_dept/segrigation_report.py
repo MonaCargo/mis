@@ -6,16 +6,21 @@ POST /api/digital-reports/import/segregation/upload
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile,status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile,status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dependency import verify_token_and_get_user
 from app.db.session import get_db
 from app.schemas.digital_reports.import_dept.operation_productivity_schema import ImportProductivityDashboardResponse, TruckInOutUploadResponse
+from app.services.digital_reports.import_dpt.operation_productivity_report.import_emp_roaster import save_import_roster_report
+from app.services.digital_reports.import_dpt.operation_productivity_report.import_pick_order import digital_report_save_pick_order_data
 from app.services.digital_reports.import_dpt.operation_productivity_report.import_truck_in_out import DigitalReportImpTruckInOutService
 from app.services.digital_reports.import_dpt.operation_productivity_report.operation_productivity_service import  ProductivityImportShiftService
 from app.services.digital_reports.import_dpt.segrigation_report import generate_seg_report, process_seg_upload
-from app.utils.digital_reports.import_dept.excel_report_builder.import_segrigation_excel_buider import build_csv, build_csv_detailed, build_excel, build_excel_detailed   # adjust to your project's DB dependency
+from app.utils.digital_reports.import_dept.excel_report_builder.import_segrigation_excel_buider import build_csv, build_csv_detailed, build_excel, build_excel_detailed
+from app.utils.digital_reports.import_dept.operation_productivity_report.imp_emp_roaster_cleaner import clean_import_roster_report
+from app.utils.digital_reports.import_dept.operation_productivity_report.imp_pick_order_cleaner import clean_pick_order_report_data_for_digital_reports   # adjust to your project's DB dependency
 
 router = APIRouter(
     prefix="/import",
@@ -346,3 +351,100 @@ async def get_import_dashboard(
  
     service = ProductivityImportShiftService(db)
     return await service.build(report_date)
+
+
+
+
+
+
+@router.post("/import/pick-order/upload")
+async def upload_pick_order(
+    file: UploadFile = File(...),
+    report_date: date = Form(..., description="Operator-selected report day (YYYY-MM-DD)."),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(verify_token_and_get_user),
+) -> dict:
+    
+    _ALLOWED_EXT = (".xlsx", ".xls",".csv")
+    if not file.filename or not file.filename.lower().endswith(_ALLOWED_EXT):
+        raise HTTPException(status_code=400, detail="Please upload an .xlsx, .xls or .csv file.")
+ 
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+ 
+    # Parse / clean (pure, no DB).
+    try:
+        rows = clean_pick_order_report_data_for_digital_reports(file_bytes,file.filename or "",report_date=report_date)
+    except Exception as exc:  # noqa: BLE001 — surface a clean 400 to the client
+        raise HTTPException(status_code=400, detail=f"Couldn't read the report: {exc}") from exc
+ 
+    if not rows:
+        raise HTTPException(status_code=400, detail="No data rows found in the report.")
+ 
+    # Atomic replace for this report_date.
+    summary = await digital_report_save_pick_order_data(
+        db=db,
+        report_date=report_date,
+        rows=rows,
+        uploaded_by=current_user.emp_id,   # set from auth when available
+    )
+    return {
+        "status": "ok",
+        "message": (
+            f"Saved {summary['inserted']} rows for {summary['report_date']} "
+            f"(replaced {summary['deleted']})."
+        ),
+        **summary,
+    }
+
+
+
+
+
+
+
+# ===========================Import Roaster Upload route =========================
+@router.post("/import-roaster-report/upload")
+async def upload_roster(
+    file: UploadFile = File(...),
+    allow_multiple_shifts_per_day: bool = Form(True),
+    db: AsyncSession = Depends(get_db),
+    # uploaded_by: str = Depends(current_user),   # wire to your auth if available
+) -> dict:
+    _ALLOWED_EXT = (".xlsx", ".xls", ".csv")
+    if not file.filename or not file.filename.lower().endswith(_ALLOWED_EXT):
+        raise HTTPException(status_code=400, detail="Please upload an .xlsx, .xls or .csv file.")
+ 
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+ 
+    # Parse / clean (pure, no DB).
+    try:
+        rows = clean_import_roster_report(file_bytes, file.filename or "")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Couldn't read the roster: {exc}") from exc
+ 
+    if not rows:
+        raise HTTPException(status_code=400, detail="No valid roster rows found in the file.")
+ 
+    # Upsert (employees + attendance), idempotent.
+    summary = await save_import_roster_report(
+        session=db,
+        rows=rows,
+        allow_multiple_shifts_per_day=allow_multiple_shifts_per_day,
+        uploaded_by=None,   # set from auth when available
+    )
+    return {
+        "status": "ok",
+        "message": (
+            f"Roster saved: {summary['attendance_upserted']} attendance rows, "
+            f"{summary['employees_upserted']} employees"
+            + (f", {summary['shifts_replaced']} shift(s) replaced"
+               if summary.get("shifts_replaced") else "")
+            + "."
+        ),
+        **summary,
+    }
+ 
