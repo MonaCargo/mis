@@ -35,6 +35,8 @@ from .app_config.app_config_route import router as app_config_router
 from .exportOperation.export_transipment_import_segrigation import router as export_transipment_import_segrigation_router
 
 
+from .digital_reports.customer_care_dept.customer_care_mis import router as digital_reports_customer_care_mis_router
+
 
 # You can add more routes here as your app grows
 
@@ -103,3 +105,5 @@ api_v1_router.include_router(app_config_router, prefix="/app/config", tags=["App
 
 # ====== Digital reports
 api_v1_router.include_router(digital_reports_import_router, prefix="/digital-reports", tags=["DIGITAL REPORTS"])
+# --- customer care dept routes
+api_v1_router.include_router(digital_reports_customer_care_mis_router, prefix="/digital-reports/customer-care/mis", tags=["CUSTOMER CARE DIGITALREPORTS"])
