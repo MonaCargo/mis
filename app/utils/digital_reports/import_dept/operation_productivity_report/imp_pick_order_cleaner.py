@@ -206,6 +206,10 @@ _HEADER_HINT = "awb no"
 # Day-first string date formats (Indian source). strptime does not guess, so we
 # try each in order. ISO is included last as an unambiguous fallback.
 _DT_FORMATS = (
+
+    "%d-%b-%y %I:%M:%S %p",   # 13-JUL-26 11:48:53 AM
+    "%d-%b-%Y %I:%M:%S %p",   # 13-JUL-2026 11:48:53 AM
+
     "%d-%m-%y %H:%M:%S",   # 07-07-26 20:35:10
     "%d-%m-%y %H:%M",      # 07-07-26 8:43
     "%d-%m-%y",            # 07-07-26

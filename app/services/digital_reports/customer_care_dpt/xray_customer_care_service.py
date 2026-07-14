@@ -60,8 +60,16 @@ def _match_serial_for_column(col_name: str) -> Optional[str]:
             return serial
     return None
 
+# DATE_LIKE_PATTERN = re.compile(
+#     r'^(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})|^(\d{1,2}[A-Za-z]{3}\d{2,4})|^(\d{4}[-/]\d{1,2}[-/]\d{1,2})', 
+#     re.IGNORECASE
+# )
+
 DATE_LIKE_PATTERN = re.compile(
-    r'^(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})|^(\d{1,2}[A-Za-z]{3}\d{2,4})|^(\d{4}[-/]\d{1,2}[-/]\d{1,2})', 
+    r'^(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})'
+    r'|^(\d{1,2}[-/][A-Za-z]{3}[-/]\d{2,4})'     # <-- add this line: matches 08-JUL-26
+    r'|^(\d{1,2}[A-Za-z]{3}\d{2,4})'
+    r'|^(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
     re.IGNORECASE
 )
 
@@ -283,7 +291,8 @@ class MISReportService:
 
     @classmethod
     async def process_export_normal(cls, file: UploadFile, target_date: datetime, delete_previous: bool, db: AsyncSession, uploaded_by: str):
-        df = pd.read_csv(file.file, header=None)
+        # df = pd.read_csv(file.file, header=None)
+        df = pd.read_csv(file.file, header=None, engine="python", names=range(35))
         t_read = time.perf_counter()
         t_start = time.perf_counter() 
         header_idx, awb_col_idx, date_col_indices, headers = cls._parse_and_validate(df, target_date) 
@@ -468,7 +477,8 @@ class MISReportService:
     
     @classmethod
     async def process_export_tp(cls, file: UploadFile, target_date: datetime, delete_previous: bool, db: AsyncSession, uploaded_by: str):
-        df = pd.read_csv(file.file, header=None)
+        # df = pd.read_csv(file.file, header=None)
+        df = pd.read_csv(file.file, header=None, engine="python", names=range(35))
         header_idx, awb_col_idx, date_col_indices, headers = cls._parse_and_validate(df, target_date)
         header_map = {str(h).upper().strip(): idx for idx, h in enumerate(headers)}
     
@@ -608,7 +618,8 @@ class MISReportService:
      
     @classmethod
     async def process_import_digital(cls, file: UploadFile, target_date: datetime, delete_previous: bool, db: AsyncSession, uploaded_by: str):
-        df = pd.read_csv(file.file, header=None)
+        # df = pd.read_csv(file.file, header=None)
+        df = pd.read_csv(file.file, header=None, engine="python", names=range(35))
         header_idx, awb_col_idx, date_col_indices, headers = cls._parse_and_validate(df, target_date)
         header_map = {str(h).upper().strip(): idx for idx, h in enumerate(headers)}
 
@@ -924,29 +935,32 @@ class MISReportService:
 class XrayPerformanceCalculator:
    
 
-    XRAY_MASTER = {
-        "190595": {"machineNo": "X- 1 (PER)", "device_model_no": "145180-2is","order": 1},
-        "205102": {"machineNo": "X-2(PER)(S)", "device_model_no": "100100V-2is","order": 2},
-        "129846": {"machineNo": "X-3 (PER)", "device_model_no": "145180-2is","order": 3},
-        "129730": {"machineNo": "X-4", "device_model_no": "145180-2is","order": 4},
-        "204042": {"machineNo": "X-5(S) ", "device_model_no": "100100V-2is","order": 5},
-        "207812": {"machineNo": "X-6(S)", "device_model_no": "100100V-2is","order": 6},
-        "127187": {"machineNo": "X-7 ", "device_model_no": "145180-2is","order": 7},
-        "203888": {"machineNo": "X-8(S)", "device_model_no": "100100V-2is","order": 8},
-        "127105": {"machineNo": "X-9", "device_model_no": "145180-2is","order": 9},
-        "202833": {"machineNo": "X-10(S)", "device_model_no": "100100V-2is","order": 10},
-        "210212": {"machineNo": "X-11(S)", "device_model_no": "100100V-2is","order": 11},
-        "190802": {"machineNo": "X-12", "device_model_no": "145180-2is","order": 12},
-        "129729": {"machineNo": "X-13", "device_model_no": "145180-2is","order": 13},
-        "129149": {"machineNo": "X-14 ", "device_model_no": "145180-2is","order": 14},
-        "212146": {"machineNo": "X-15 (S)", "device_model_no": "145180-2is","order": 15},
-        "159928": {"machineNo": "X-16(S)", "device_model_no": "100100V-2is","order": 16},
-        "129836": {"machineNo": "X-17 (EXP TP)", "device_model_no": "145180-2is","order": 17},
-        "204039": {"machineNo": "X-18(S) IMP TP", "device_model_no": "100100V-2is","order": 18},
-        "190801": {"machineNo": "X-19(IMP TP)", "device_model_no": "145180-2is","order": 19},
-        "190992": {"machineNo": "X-20(IMP TP)", "device_model_no": "145180-2is","order": 20},
-    }
 
+
+    XRAY_MASTER = {
+    "190595": {"machineNo": "No.1",           "device_model_no": "145180-2is",  "order": 1},
+    "205102": {"machineNo": "No.2 (S)",       "device_model_no": "100100V-2is", "order": 2},
+    "129846": {"machineNo": "No.3",           "device_model_no": "145180-2is",  "order": 3},
+    "129730": {"machineNo": "No.4",           "device_model_no": "145180-2is",  "order": 4},
+    "204042": {"machineNo": "No.5 (S)",       "device_model_no": "100100V-2is", "order": 5},
+    "207812": {"machineNo": "No.6 (S)",       "device_model_no": "100100V-2is", "order": 6},
+    "127187": {"machineNo": "No.7",           "device_model_no": "145180-2is",  "order": 7},
+    "203888": {"machineNo": "No.8 (S)",       "device_model_no": "100100V-2is", "order": 8},
+    "127105": {"machineNo": "No.9",           "device_model_no": "145180-2is",  "order": 9},
+    "202833": {"machineNo": "No.10 (S)",      "device_model_no": "100100V-2is", "order": 10},
+    "210212": {"machineNo": "No.11 (S)",      "device_model_no": "100100V-2is", "order": 11},
+    "190802": {"machineNo": "No.12",          "device_model_no": "145180-2is",  "order": 12},
+    "214551": {"machineNo": "No.13",          "device_model_no": "100100V-2is", "order": 13},
+    "129729": {"machineNo": "No.14",          "device_model_no": "145180-2is",  "order": 14},
+    "129149": {"machineNo": "No.15",          "device_model_no": "145180-2is",  "order": 15},
+    "212146": {"machineNo": "No.16 (S)",      "device_model_no": "145180-2is",  "order": 16},
+    "159928": {"machineNo": "No.17 (S)",      "device_model_no": "100100V-2is", "order": 17},
+    "129836": {"machineNo": "No.18 (EXP TP)", "device_model_no": "145180-2is",  "order": 18},
+    "204039": {"machineNo": "No.19 (IMP TP) (S)", "device_model_no": "100100V-2is", "order": 19},
+    "190801": {"machineNo": "No.20 (IMP TP)", "device_model_no": "145180-2is",  "order": 20},
+    "190992": {"machineNo": "No.21 (IMP TP)", "device_model_no": "145180-2is",  "order": 21},
+}
+    
     # ---------- shared helpers ----------
     @staticmethod
     def _get_shift_from_ist(dt_val: datetime):

@@ -30,6 +30,7 @@ from .exportOperation.export_import_tp_report_for_car import router as export_im
 from .exportOperation.car_message_awb_history import router as export_car_message_awb_history_router
 from .importOperation.imp_truck_in_out_module import router as imp_truck_in_out_router
 from .digital_reports.import_dept.segrigation_report import router as digital_reports_import_router
+from .digital_reports.export_dept.export_productivity_dashboard import router as digital_reports_export_router
 
 from .app_config.app_config_route import router as app_config_router
 from .exportOperation.export_transipment_import_segrigation import router as export_transipment_import_segrigation_router
@@ -107,3 +108,5 @@ api_v1_router.include_router(app_config_router, prefix="/app/config", tags=["App
 api_v1_router.include_router(digital_reports_import_router, prefix="/digital-reports", tags=["DIGITAL REPORTS"])
 # --- customer care dept routes
 api_v1_router.include_router(digital_reports_customer_care_mis_router, prefix="/digital-reports/customer-care/mis", tags=["CUSTOMER CARE DIGITALREPORTS"])
+#  Export digital reports
+api_v1_router.include_router(digital_reports_export_router, prefix="/digital-reports/export", tags=["Export Digital report Dashboard Summary"])

@@ -92,8 +92,8 @@ class DigitalReportRosterAttendance(Base):
         String(20), nullable=True, comment="Designation snapshot on this shift.",
     )
     present_status: Mapped[Optional[str]] = mapped_column(
-        String(1), nullable=True,
-        comment='"P"=Present, "A"=Absent, NULL=unknown/blank.',
+        String(10), nullable=True,
+        comment='"P"=Present, "A"=Absent, NULL=unknown/blank. LWP (Leave without pay) treated as absent',
     )
 
     created_at: Mapped[datetime] = mapped_column(

@@ -46,6 +46,18 @@ from app.db.models.digital_reports.import_dept.import_emp_roaster import Digital
 
 
 
+from app.db.models.digital_reports.export_dept.cargo_uplift_report import DigitalReportCargoUpliftReport
+from app.db.models.digital_reports.export_dept.car_message_report import DigitalReportCarMessageReport
+from app.db.models.digital_reports.export_dept.x_ray_report import DigitalReportXrayReport
+from app.db.models.digital_reports.export_dept.export_tp_xray_report import DigitalReportExportTpXrayReport
+from app.db.models.digital_reports.export_dept.import_segregation_report import DigitalReportImportSegregationReport
+from app.db.models.digital_reports.export_dept.import_tp_xray_report import DigitalReportImportTpXrayReport
+from app.db.models.digital_reports.export_dept.export_transhipment_report import DigitalReportExportTranshipmentReport
+from app.db.models.digital_reports.export_dept.export_loaded_inventory import DigitalReportExportLoadedInventory
+
+
+
+
 from app.db.models.digital_reports.customer_care.export_xray import DigitalReportExportXray
 from app.db.models.digital_reports.customer_care.export_tp_xray import DigitalReportExportTpXray
 from app.db.models.digital_reports.customer_care.import_tp_xray import DigitalReportImportTpXray
@@ -58,13 +70,25 @@ __all__ = [
 "ImportShipmentHold",
 
 
+# export DR
+'DigitalReportCargoUpliftReport',
+'DigitalReportCarMessageReport',
+'DigitalReportXrayReport',
+'DigitalReportExportTpXrayReport',
+'DigitalReportImportTpXrayReport',
+'DigitalReportExportLoadedInventory',
+'DigitalReportExportTranshipmentReport',
+'DigitalReportImportSegregationReport',
+
+
+# Controle room DR (customer care)
 "DigitalReportExportXray",
 "DigitalReportExportTpXray",
 "DigitalReportImportTpXray",
 "DigitalReportXRayPerformance",
 
 
-
+# Import DR
 "DigitalReportImportSegFlight",
 "DigitalReportImportSegAwb",
 'DigitalReportImportTruckInOut',
