@@ -129,8 +129,9 @@ async def save_import_roster_report(
         },
     )
     await session.execute(att_stmt)
+    await session.commit()   # <-- add this (replaces the flush)
 
-    await session.flush()
+    # await session.flush()
 
     return {
         "employees_upserted": len(emp_values),

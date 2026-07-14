@@ -1682,6 +1682,7 @@ Column mapping (Segregation Report -> ORM):
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import re
 from typing import Optional
 
 from sqlalchemy import func, select, case, distinct, literal
@@ -1743,6 +1744,37 @@ def _merge_calendar_group(op_group: dict, cal_group: dict) -> None:
         if sub in op_group and sub in cal_group:
             op_group[sub]["calendar_total"] = cal_group[sub].get("total")
 
+ 
+def _days_in_month(d: date) -> int:
+    """
+    Dynamic day count for the report_date's month (28-31), computed without the
+    calendar module. Trick: day 1 of the NEXT month minus one day = last day of
+    THIS month, whose .day is the number of days in the month. Handles December
+    (year rollover) and leap years automatically.
+    """
+    if d.month == 12:
+        first_of_next = date(d.year + 1, 1, 1)
+    else:
+        first_of_next = date(d.year, d.month + 1, 1)
+    return (first_of_next - timedelta(days=1)).day
+ 
+ 
+def _productivity(metric: dict, wha: dict, days_in_month: int) -> dict:
+    """
+    Productivity = (metric / WHA) * days_in_month, computed per shift + both
+    totals. Returns a {morning, afternoon, evening, total, calendar_total} dict.
+ 
+    metric and wha are same-shaped value dicts. Division guards against a zero
+    (or missing) WHA count -> None for that cell (can't divide by no manpower).
+    """
+    out = {}
+    for k in (MORNING, AFTERNOON, EVENING, "total", "calendar_total"):
+        m = metric.get(k)
+        w = wha.get(k)
+        out[k] = round(m / w * days_in_month, 2) if (m is not None and w) else None
+    return out
+ 
+
 
 class ProductivityImportShiftService:
     """Computes productivity dashboard metrics for a single IST date, split by shift."""
@@ -1769,7 +1801,7 @@ class ProductivityImportShiftService:
         row lands in the wrong shift.
         """
         return func.timezone(IST_ZONE_NAME, Flight.flt_com_dat_tim)
-
+    
     def _shift_label(self):
         """SQL CASE mapping FCC(IST) hour -> shift name. Evening spans midnight."""
         hour = func.extract("hour", self._fcc_ist())
@@ -1778,23 +1810,23 @@ class ProductivityImportShiftService:
             ((hour >= 14) & (hour < 22), literal(AFTERNOON)),
             else_=literal(EVENING),   # 22:00-23:59 and 00:00-05:59
         )
-
+ 
     def _day_window_utc(self, d: date) -> tuple[datetime, datetime]:
         """The operating-day bounds in UTC: [date 06:00 IST, date+1 06:00 IST)."""
         start_ist = datetime(d.year, d.month, d.day, 6, 0, tzinfo=IST)
         end_ist = start_ist + timedelta(days=1)
         return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
-
+ 
     def _calendar_window_utc(self, d: date) -> tuple[datetime, datetime]:
         """Strict calendar-day bounds in UTC: [date 00:00 IST, date+1 00:00 IST).
-
+ 
         This is the midnight-to-midnight window for the extra `calendar_total`
         column. It differs from the operating day by the two 06:00 edge-slices.
         """
         start_ist = datetime(d.year, d.month, d.day, 0, 0, tzinfo=IST)
         end_ist = start_ist + timedelta(days=1)
         return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
-
+ 
     # ── Main entry ──────────────────────────────────────────────────────────
     async def build(self, report_date: date) -> ImportProductivityDashboardResponse:
         day_start_utc, day_end_utc = self._day_window_utc(report_date)
@@ -1803,12 +1835,12 @@ class ProductivityImportShiftService:
             (Flight.flt_com_dat_tim >= day_start_utc)
             & (Flight.flt_com_dat_tim < day_end_utc)
         )
-
+ 
         totals = await self._segregation_totals(rng)
         seg_perf = await self._segregation_sla(rng)
         flight_cats = await self._flight_count_by_category(rng)
         awb_cats = await self._awb_metrics_by_category(rng)
-
+ 
         # ── Calendar-day pass ────────────────────────────────────────────────
         # Same aggregates over the strict calendar window (00:00->24:00 IST),
         # used to fill each metric's `calendar_total`. Reuses the exact same
@@ -1822,7 +1854,7 @@ class ProductivityImportShiftService:
         cal_flight_cats = await self._flight_count_by_category(cal_rng)
         cal_awb_cats = await self._awb_metrics_by_category(cal_rng)
         cal_seg_perf = await self._segregation_sla(cal_rng)
-
+ 
         # Merge calendar-day totals into the operating-day dicts as calendar_total.
         _merge_calendar_totals(totals, cal_totals)
         _merge_calendar_group(flight_cats, cal_flight_cats)
@@ -1830,7 +1862,7 @@ class ProductivityImportShiftService:
             _merge_calendar_group(awb_cats[m], cal_awb_cats[m])
         # Segregation SLA calendar %.
         seg_perf["total"]["calendar_pct"] = cal_seg_perf["total"]["pct"]
-
+ 
         # Release (irr_report) metrics — computed by a separate service that
         # buckets by gate_pass_issued_date. Returns per-shift metric dicts.
         release = await ReleaseShiftService(self.session).compute(report_date)
@@ -1838,15 +1870,38 @@ class ProductivityImportShiftService:
         truck = await TruckShiftService(self.session).compute(report_date)
         # Pick Order (Examination) metrics — buckets by POE start (configurable).
         pick_order = await PickOrderShiftService(self.session).compute(report_date)
-
+ 
+        # On Role WHA (everyone on rolls: P+A+NULL) and On Floor WHA (present
+        # only: 'P'), per department. On Role for productivity denominators;
+        # On Floor for the on-floor productivity rows.
+        on_role = on_role_wha_service(self.session)
+        on_floor = on_floor_wha_service(self.session)
+        wha_seg_role = await on_role.compute(report_date, department="Segregation")
+        wha_seg_floor = await on_floor.compute(report_date, department="Segregation")
+        wha_rel_role = await on_role.compute(report_date, department="Release")
+        wha_rel_floor = await on_floor.compute(report_date, department="Release")
+        wha_exam_role = await on_role.compute(report_date, department="Examination")
+        wha_exam_floor = await on_floor.compute(report_date, department="Examination")
+        # All-department WHA (no department filter) — used ONLY by the Summary
+        # section's productivity rows (e/f), which measure against total WHA
+        # across every department, not a single one. Present rule unchanged:
+        # On Role = P+A+NULL, On Floor = P.
+        wha_all_role = await on_role.compute(report_date)
+        wha_all_floor = await on_floor.compute(report_date)
+        days_in_month = _days_in_month(report_date)
+ 
         sections = [
-            self._overview_section(totals, release),
-            self._segregation_section(totals, flight_cats, awb_cats),
-            self._examination_section(pick_order),
-            self._release_section(release, truck),
+            self._overview_section(totals, release, wha_all_role, wha_all_floor,
+                                   wha_all_role, wha_all_floor, days_in_month),
+            self._segregation_section(totals, flight_cats, awb_cats,
+                                      wha_seg_role, wha_seg_floor, days_in_month),
+            self._examination_section(pick_order, wha_exam_role,
+                                      wha_exam_floor, days_in_month),
+            self._release_section(release, truck, wha_rel_role,
+                                  wha_rel_floor, days_in_month),
             self._sla_section(seg_perf, release, truck),
         ]
-
+ 
         meta = ImportProductivityDashboardMeta(
             report_date_ist=report_date,
             shifts=self._shift_windows(report_date),
@@ -1855,19 +1910,23 @@ class ProductivityImportShiftService:
             awb_count=int(totals["awb_count"]["total"]),
         )
         return ImportProductivityDashboardResponse(meta=meta, sections=sections)
-
+ 
     # ── Aggregates, grouped by shift ────────────────────────────────────────
     async def _segregation_totals(self, rng) -> dict:
         shift = self._shift_label()
         dest = func.upper(func.trim(Awb.dest))
-
+ 
         stmt = (
             select(
                 shift.label("shift"),
                 func.coalesce(func.sum(Awb.gross_wgt), 0).label("gross_kg"),
                 func.coalesce(func.sum(Awb.chg_wgt), 0).label("chg_kg"),
                 func.coalesce(func.sum(Awb.pcs), 0).label("pcs"),
-                func.count(distinct(Flight.id)).label("flight_count"),
+                # func.count(distinct(Flight.id)).label("flight_count"),
+                # change to:🚫🚫🚫🚫
+func.count(distinct(
+    func.concat(func.trim(Flight.flight_no), literal('|'), Flight.flt_com_dat_tim)
+)).label("flight_count"),
                 func.count(distinct(Awb.awb_no)).label("awb_count"),
                 func.coalesce(func.sum(
                     case((dest == LOCAL_DEST, Awb.gross_wgt), else_=0)), 0).label("local_kg"),
@@ -1889,11 +1948,11 @@ class ProductivityImportShiftService:
             .group_by(shift)
         )
         rows = (await self.session.execute(stmt)).all()
-
+ 
         # Initialise every metric with a zeroed ShiftValues-style dict.
         def blank():
             return {MORNING: 0.0, AFTERNOON: 0.0, EVENING: 0.0, "total": 0.0}
-
+ 
         out = {
             "gross_mt": blank(), "chg_mt": blank(), "pcs": blank(),
             "flight_count": blank(), "awb_count": blank(),
@@ -1913,23 +1972,26 @@ class ProductivityImportShiftService:
             out["local_chg_mt"][sh] = _kg_to_mt(r.local_chg_kg)
             out["i2d_chg_mt"][sh] = _kg_to_mt(r.i2d_chg_kg)
             out["i2i_chg_mt"][sh] = _kg_to_mt(r.i2i_chg_kg)
-
+ 
         # Totals. Weight/pcs sum across shifts; distinct counts must be
         # recomputed day-wide (a flight/AWB could appear in two shifts).
         for key in ("gross_mt", "chg_mt", "pcs", "local_mt", "i2d_mt", "i2i_mt",
                     "local_chg_mt", "i2d_chg_mt", "i2i_chg_mt"):
             out[key]["total"] = round(sum(out[key][s] for s in (MORNING, AFTERNOON, EVENING)), 3)
-
+ 
         day_counts = await self._day_distinct_counts(rng)
         out["flight_count"]["total"] = float(day_counts["flight_count"])
         out["awb_count"]["total"] = float(day_counts["awb_count"])
         return out
-
+ 
     async def _day_distinct_counts(self, rng) -> dict:
         """Day-wide distinct flight / AWB counts (not summed across shifts)."""
         stmt = (
             select(
-                func.count(distinct(Flight.id)).label("flight_count"),
+                # func.count(distinct(Flight.id)).label("flight_count"),🚫🚫🚫🚫
+                func.count(distinct(
+    func.concat(func.trim(Flight.flight_no), literal('|'), Flight.flt_com_dat_tim)
+)).label("flight_count"),
                 func.count(distinct(Awb.awb_no)).label("awb_count"),
             )
             .select_from(Awb)
@@ -1938,18 +2000,18 @@ class ProductivityImportShiftService:
         )
         r = (await self.session.execute(stmt)).one()
         return {"flight_count": int(r.flight_count), "awb_count": int(r.awb_count)}
-
+ 
     async def _flight_count_by_category(self, rng) -> dict:
         """
         Distinct flight count per shift, split into Passenger (PAX) and
         Freighter (CAO) using the shared airline master.
-
+ 
         A flight is one physical departure; its PAX/CAO category is stable
         regardless of per-AWB dest, so we classify each distinct flight once
         by its flight_no. We pull (flight_no, dest, shift) for the distinct
         flights and count per shift × category in Python — mirroring how the
         existing segregation report classifies.
-
+ 
         Returns:
             {
               "total":      {morning, afternoon, evening, total},   # both cats
@@ -1958,22 +2020,33 @@ class ProductivityImportShiftService:
             }
         """
         shift = self._shift_label()
+        # stmt = (
+        #     select(
+        #         Flight.id,
+        #         Flight.flight_no,
+        #         Flight.dest,
+        #         shift.label("shift"),
+        #     )
+        #     .select_from(Flight)
+        #     .where(rng)
+        #     .distinct()
+        # ) 🚫🚫🚫🚫🚫
         stmt = (
-            select(
-                Flight.id,
-                Flight.flight_no,
-                Flight.dest,
-                shift.label("shift"),
-            )
-            .select_from(Flight)
-            .where(rng)
-            .distinct()
-        )
+    select(
+        func.concat(func.trim(Flight.flight_no), literal('|'), Flight.flt_com_dat_tim).label("dep_key"),
+        Flight.flight_no,
+        Flight.dest,
+        shift.label("shift"),
+    )
+    .select_from(Flight)
+    .where(rng)
+    .distinct()
+)
         rows = (await self.session.execute(stmt)).all()
-
+ 
         def blank_counts():
             return {MORNING: 0, AFTERNOON: 0, EVENING: 0, "total": 0}
-
+ 
         out = {
             "total": blank_counts(),
             "passenger": blank_counts(),
@@ -1987,35 +2060,35 @@ class ProductivityImportShiftService:
             sh = r.shift
             out[bucket][sh] += 1
             out["total"][sh] += 1
-
+ 
         for grp in ("total", "passenger", "freighter"):
             out[grp]["total"] = out[grp][MORNING] + out[grp][AFTERNOON] + out[grp][EVENING]
         return out
-
+ 
     async def _awb_metrics_by_category(self, rng) -> dict:
         """
         AWB-level metrics (MAWB / HAWB / Piece / Gross / Charge) per shift,
         split into Passenger (PAX) and Freighter (CAO).
-
+ 
         WHY THIS SHAPE:
         The PAX/CAO category is decided by the airline master via
         resolve_airline(flight_no, dest) — that is Python logic, so the split
         cannot be done purely in SQL. To stay efficient we do as much as
         possible in ONE SQL pass, then fold flight_no -> category in Python.
-
+ 
         SQL step (one query):
           Group by (shift, flight_no, awb_no) and aggregate the AWB's numbers.
           Grouping down to awb_no means each MAWB is one row per shift/flight —
           so counting rows gives the distinct MAWB count, and SUM(no_of_houses)
           gives HAWB, SUM(pcs)/SUM(weights) give the rest. (An AWB that was
           split into several DB rows under the same flight is collapsed here.)
-
+ 
         Python step:
           For each (shift, flight_no, awb_no) row, resolve the flight to
           PAX/CAO once and add its numbers into that bucket. flight_no is all
           we need for the category (dest only matters for the Air-India
           Delhi/TP split, which this dashboard does not use).
-
+ 
         Returns a dict keyed by metric, each holding total/passenger/freighter,
         each of those a {morning, afternoon, evening, total} dict:
             {
@@ -2027,7 +2100,7 @@ class ProductivityImportShiftService:
             }
         """
         shift = self._shift_label()
-
+ 
         # ── SQL: one row per (shift, flight_no, awb_no) with that AWB's totals ──
         stmt = (
             select(
@@ -2046,14 +2119,14 @@ class ProductivityImportShiftService:
             .group_by(shift, Flight.flight_no, Flight.dest, Awb.awb_no)
         )
         rows = (await self.session.execute(stmt)).all()
-
+ 
         # ── prepare zeroed accumulators ──
         def blank():
             return {MORNING: 0.0, AFTERNOON: 0.0, EVENING: 0.0, "total": 0.0}
-
+ 
         def blank_group():
             return {"total": blank(), "passenger": blank(), "freighter": blank()}
-
+ 
         metrics = {
             "mawb": blank_group(),   # count of AWB rows
             "hawb": blank_group(),   # SUM(no_of_houses)
@@ -2061,7 +2134,7 @@ class ProductivityImportShiftService:
             "gross_kg": blank_group(),  # SUM(gross) — converted to MT at the end
             "chg_kg": blank_group(),    # SUM(chg)   — converted to MT at the end
         }
-
+ 
         # ── Python: fold each AWB row into total + its PAX/CAO bucket ──
         for r in rows:
             info = resolve_airline(r.flight_no or "", r.dest or "")
@@ -2073,20 +2146,20 @@ class ProductivityImportShiftService:
                 metrics["pcs"][grp][sh] += float(r.pcs or 0)
                 metrics["gross_kg"][grp][sh] += float(r.gross_kg or 0)
                 metrics["chg_kg"][grp][sh] += float(r.chg_kg or 0)
-
+ 
         # ── shift totals, and kg -> MT for the weight metrics ──
         for key, grp_dict in metrics.items():
             for grp in ("total", "passenger", "freighter"):
                 d = grp_dict[grp]
                 d["total"] = d[MORNING] + d[AFTERNOON] + d[EVENING]
-
+ 
         # Convert the two weight metrics from kg to MT (3dp), keep counts as-is.
         def to_mt_group(grp_dict):
             out = {}
             for grp in ("total", "passenger", "freighter"):
                 out[grp] = {k: _kg_to_mt(v) for k, v in grp_dict[grp].items()}
             return out
-
+ 
         return {
             "mawb": metrics["mawb"],
             "hawb": metrics["hawb"],
@@ -2094,14 +2167,14 @@ class ProductivityImportShiftService:
             "gross_mt": to_mt_group(metrics["gross_kg"]),
             "chg_mt": to_mt_group(metrics["chg_kg"]),
         }
-
-
+ 
+ 
     # ── SLA performance, per shift ──────────────────────────────────────────
     async def _segregation_sla(self, rng) -> dict:
         shift = self._shift_label()
         atw = func.greatest(Flight.last_uld_arrival, Flight.bulk_uld_arrival)
         gross_kg = func.coalesce(func.sum(Awb.gross_wgt), 0)
-
+ 
         per_flight = (
             select(
                 Flight.id.label("fid"),
@@ -2115,7 +2188,7 @@ class ProductivityImportShiftService:
             .where(rng)
             .group_by(Flight.id, shift, atw, Flight.flt_com_dat_tim)
         ).subquery()
-
+ 
         tier_hours = case(
             (per_flight.c.gross_kg <= 10000, 4),
             (per_flight.c.gross_kg <= 20000, 6),
@@ -2131,7 +2204,7 @@ class ProductivityImportShiftService:
             ),
             else_=0,
         )
-
+ 
         stmt = (
             select(
                 per_flight.c.shift.label("shift"),
@@ -2142,10 +2215,10 @@ class ProductivityImportShiftService:
             .group_by(per_flight.c.shift)
         )
         rows = (await self.session.execute(stmt)).all()
-
+ 
         def pct(success, total):
             return round(success / total * 100.0, 1) if total else None
-
+ 
         out = {
             MORNING: {"total": 0, "success": 0, "pct": None},
             AFTERNOON: {"total": 0, "success": 0, "pct": None},
@@ -2158,7 +2231,7 @@ class ProductivityImportShiftService:
             day_success += int(r.success)
         out["total"] = {"total": day_total, "success": day_success, "pct": pct(day_success, day_total)}
         return out
-
+ 
     # ── Section builders ────────────────────────────────────────────────────
     @staticmethod
     def _sv(d: dict) -> ShiftValues:
@@ -2167,11 +2240,18 @@ class ProductivityImportShiftService:
             evening=d[EVENING], total=d["total"],
             calendar_total=d.get("calendar_total"),
         )
-
-    def _overview_section(self, t: dict, release: dict) -> MetricSection:
+ 
+    def _overview_section(self, t: dict, release: dict,
+                          wha_del_role: dict, wha_del_floor: dict,
+                          wha_seg_role: dict, wha_seg_floor: dict,
+                          days_in_month: int) -> MetricSection:
+        # NOTE: Summary productivity (e, f) measures against ALL-department WHA,
+        # so build() passes the same all-department WHA dicts for both the
+        # delivery (wha_del_*) and segregation (wha_seg_*) params. The names are
+        # kept distinct only to map to rows e and f; both hold all-dept counts.
         sys, man = MetricSource.system, MetricSource.manual
         seg = "Segregation Report"
-
+ 
         # a — Gross Wgt (MT), collapsible into DEL / I2I / I2D
         gross_row = MetricRow(
             key="sum_gross_wgt", s_no="a", description="Gross Wgt (MT)",
@@ -2185,7 +2265,7 @@ class ProductivityImportShiftService:
                           values=self._sv(t["i2d_mt"]), unit=MetricUnit.mt, source=sys, source_report=seg),
             ],
         )
-
+ 
         # b — Charge Wgt (MT), collapsible into DEL / I2I / I2D (charge weight)
         chg_row = MetricRow(
             key="sum_chg_wgt", s_no="b", description="Charge Wgt (MT)",
@@ -2199,7 +2279,7 @@ class ProductivityImportShiftService:
                           values=self._sv(t["i2d_chg_mt"]), unit=MetricUnit.mt, source=sys, source_report=seg),
             ],
         )
-
+ 
         # c — Gross vs Charge Weight (%): charge / gross * 100, per shift.
         # (Frontend colours it: <110% red, >=110% green.)
         def _pct_of(chg: dict, gross: dict) -> ShiftValues:
@@ -2215,14 +2295,14 @@ class ProductivityImportShiftService:
                 evening=one(EVENING), total=one("total"),
                 calendar_total=cal,
             )
-
+ 
         gross_vs_chg = MetricRow(
             key="sum_gross_vs_chg", s_no="c", description="Gross Weight vs Charge Weight (%)",
             values=_pct_of(t["chg_mt"], t["gross_mt"]),
             unit=MetricUnit.percent, source=sys, source_report=seg,
             note="Charge ÷ Gross; <110% red, ≥110% green",
         )
-
+ 
         rows = [
             gross_row,
             chg_row,
@@ -2230,47 +2310,67 @@ class ProductivityImportShiftService:
             MetricRow(key="sum_delivery_gross", s_no="d", description="Delivery Gross Wgt (MT)",
                       values=self._sv(release["delivery_mt"]), unit=MetricUnit.mt,
                       source=sys, source_report="Release Report"),
-            MetricRow(key="sum_prod_delivery", s_no="e", description="Productivity on Delivery (Grs MT/Month)",
-                      pending=True, unit=MetricUnit.productivity, source=sys, source_report="Release Report/Roster",
-                      note="Total GP Gross MT / On Role WHA * day count",
+            # e — Productivity on Delivery = Delivery Gross MT / On Role WHA
+            #     (Release dept) * days_in_month. Children expose both WHA counts
+            #     and both productivity variants (On Role uses everyone on rolls;
+            #     On Floor uses present-only staff).
+            MetricRow(key="sum_prod_delivery", s_no="e",
+                      description="Productivity on Delivery (Grs MT/Month)",
+                      values=self._sv(_productivity(release["delivery_mt"], wha_del_role, days_in_month)),
+                      unit=MetricUnit.productivity, source=sys, source_report="Release Report/Roster",
+                      note=f"Delivery Gross MT / On Role WHA * {days_in_month} days",
                       children=[
                           MetricRow(key="sum_prod_delivery_onrole_wha", s_no="e.1",
-                                    description="On Role WHA Count", pending=True,
-                                    unit=MetricUnit.count, source=sys, source_report="Roster"),
+                                    description="On Role WHA Count",
+                                    values=self._sv(wha_del_role),
+                                    unit=MetricUnit.count, source=man, source_report="Roster"),
                           MetricRow(key="sum_prod_delivery_onrole_prod", s_no="e.2",
-                                    description="On Role Productivity", pending=True,
-                                    unit=MetricUnit.productivity, source=sys, source_report="Roster"),
+                                    description="On Role Productivity",
+                                    values=self._sv(_productivity(release["delivery_mt"], wha_del_role, days_in_month)),
+                                    unit=MetricUnit.productivity, source=man, source_report="Roster"),
                           MetricRow(key="sum_prod_delivery_onfloor_wha", s_no="e.3",
-                                    description="On Floor WHA Count", pending=True,
-                                    unit=MetricUnit.count, source=sys, source_report="Roster"),
+                                    description="On Floor WHA Count",
+                                    values=self._sv(wha_del_floor),
+                                    unit=MetricUnit.count, source=man, source_report="Roster"),
                           MetricRow(key="sum_prod_delivery_onfloor_prod", s_no="e.4",
-                                    description="On Floor Productivity", pending=True,
-                                    unit=MetricUnit.productivity, source=sys, source_report="Roster"),
+                                    description="On Floor Productivity",
+                                    values=self._sv(_productivity(release["delivery_mt"], wha_del_floor, days_in_month)),
+                                    unit=MetricUnit.productivity, source=man, source_report="Roster"),
                       ]),
-            MetricRow(key="sum_prod_segregation", s_no="f", description="Productivity on Segregation (Grs MT/Month)",
-                      pending=True, unit=MetricUnit.productivity, source=sys, source_report="Segregation Report/Roster",
-                      note="Total Seg Gross MT / On Role WHA * day count",
+            # f — Productivity on Segregation = Seg Gross MT / On Role WHA
+            #     (Segregation dept) * days_in_month.
+            MetricRow(key="sum_prod_segregation", s_no="f",
+                      description="Productivity on Segregation (Grs MT/Month)",
+                      values=self._sv(_productivity(t["gross_mt"], wha_seg_role, days_in_month)),
+                      unit=MetricUnit.productivity, source=sys, source_report="Segregation Report/Roster",
+                      note=f"Seg Gross MT / On Role WHA * {days_in_month} days",
                       children=[
                           MetricRow(key="sum_prod_seg_onrole_wha", s_no="f.1",
-                                    description="On Role WHA Count", pending=True,
-                                    unit=MetricUnit.count, source=sys, source_report="Roster"),
+                                    description="On Role WHA Count",
+                                    values=self._sv(wha_seg_role),
+                                    unit=MetricUnit.count, source=man, source_report="Roster"),
                           MetricRow(key="sum_prod_seg_onrole_prod", s_no="f.2",
-                                    description="On Role Productivity", pending=True,
-                                    unit=MetricUnit.productivity, source=sys, source_report="Roster"),
+                                    description="On Role Productivity",
+                                    values=self._sv(_productivity(t["gross_mt"], wha_seg_role, days_in_month)),
+                                    unit=MetricUnit.productivity, source=man, source_report="Roster"),
                           MetricRow(key="sum_prod_seg_onfloor_wha", s_no="f.3",
-                                    description="On Floor WHA Count", pending=True,
-                                    unit=MetricUnit.count, source=sys, source_report="Roster"),
+                                    description="On Floor WHA Count",
+                                    values=self._sv(wha_seg_floor),
+                                    unit=MetricUnit.count, source=man, source_report="Roster"),
                           MetricRow(key="sum_prod_seg_onfloor_prod", s_no="f.4",
-                                    description="On Floor Productivity", pending=True,
-                                    unit=MetricUnit.productivity, source=sys, source_report="Roster"),
+                                    description="On Floor Productivity",
+                                    values=self._sv(_productivity(t["gross_mt"], wha_seg_floor, days_in_month)),
+                                    unit=MetricUnit.productivity, source=man, source_report="Roster"),
                       ]),
         ]
         return MetricSection(key="summary", title="Summary", rows=rows)
-
-    def _segregation_section(self, t: dict, flight_cats: dict, awb_cats: dict) -> MetricSection:
+ 
+    def _segregation_section(self, t: dict, flight_cats: dict, awb_cats: dict,
+                             roster_wha: dict, roster_wha_floor: dict,
+                             days_in_month: int) -> MetricSection:
         sys, man = MetricSource.system, MetricSource.manual
         seg = "Segregation Report"
-
+ 
         # Helper: turn a {morning,afternoon,evening,total} dict into ShiftValues.
         def _counts_sv(d: dict) -> ShiftValues:
             ct = d.get("calendar_total")
@@ -2279,7 +2379,7 @@ class ProductivityImportShiftService:
                 evening=float(d[EVENING]), total=float(d["total"]),
                 calendar_total=float(ct) if ct is not None else None,
             )
-
+ 
         # Helper: build a "parent + Passenger/Freighter children" row for a
         # metric that lives in awb_cats (mawb/hawb/pcs/gross_mt/chg_mt) or
         # flight_cats. `group` is the awb_cats key; `unit` its unit.
@@ -2298,7 +2398,7 @@ class ProductivityImportShiftService:
                               unit=unit, source=sys, source_report=seg),
                 ],
             )
-
+ 
         # a — Flight Count (from flight_cats: distinct flights per category)
         flight_count_row = MetricRow(
             key="seg_flight_count", s_no="a", description="Flight Count",
@@ -2315,7 +2415,7 @@ class ProductivityImportShiftService:
                           unit=MetricUnit.count, source=sys, source_report=seg),
             ],
         )
-
+ 
         rows = [
             flight_count_row,
             # b — MAWB Count (distinct AWB per category)
@@ -2328,20 +2428,32 @@ class ProductivityImportShiftService:
             _split_row("seg_gross_wgt", "e", "Gross Weight (MT)", awb_cats["gross_mt"], MetricUnit.mt),
             # f — Charge Weight (MT)
             _split_row("seg_chg_wgt", "f", "Charge Weight (MT)", awb_cats["chg_mt"], MetricUnit.mt),
-            # g — On Floor Productivity (no children; pending Roster)
-            MetricRow(key="seg_onfloor_productivity", s_no="g", description="On Floor Productivity",
-                      pending=True, unit=MetricUnit.productivity, source=man, source_report="Roster",
-                      note="(Gross MT / On Floor WHA) * 30",
+            # g — On Role WHA Count (from roster: distinct employees Desg='WHA',
+            #     present, bucketed by roster Shift). Per-shift + operating-day
+            #     total + full-day calendar_total, all from RosterWhaService.
+            MetricRow(key="seg_onrole_wha", s_no="g",
+                      description="On Role WHA Count",
+                      values=self._sv(roster_wha), unit=MetricUnit.count,
+                      source=man, source_report="Roster",
+                      note="On Role: WHA staff on rolls (P + Absent + unmarked; LWP excluded)"),
+            # g — On Role WHA Count already above. Also fix its note (P/A/NULL,
+            #     LWP excluded) below in the description note.
+            # h — On Floor Productivity = Seg Gross MT / On Floor WHA * days.
+            MetricRow(key="seg_onfloor_productivity", s_no="h", description="On Floor Productivity",
+                      values=self._sv(_productivity(t["gross_mt"], roster_wha_floor, days_in_month)),
+                      unit=MetricUnit.productivity, source=man, source_report="Roster",
+                      note=f"(Gross MT / On Floor WHA) * {days_in_month}",
                       children=[
-                          MetricRow(key="seg_onfloor_manpower", s_no="g.1",
-                                    description="On Floor Manpower (WHA)", pending=True,
-                                    unit=MetricUnit.count, source=man, source_report="Roster",
-                                    note="Needs Roster"),
+                          MetricRow(key="seg_onfloor_manpower", s_no="h.1",
+                                    description="On Floor Manpower (WHA)",
+                                    values=self._sv(roster_wha_floor),
+                                    unit=MetricUnit.count, source=man, source_report="Roster"),
                       ]),
         ]
         return MetricSection(key="segregation", title="P.1  Segregation", rows=rows)
-
-    def _examination_section(self, pick_order: dict) -> MetricSection:
+ 
+    def _examination_section(self, pick_order: dict, roster_wha: dict,
+                             roster_wha_floor: dict, days_in_month: int) -> MetricSection:
         """P.2 Examination — from the pick order report."""
         sys, man = MetricSource.system, MetricSource.manual
         po = "Pick Order Report"
@@ -2353,19 +2465,28 @@ class ProductivityImportShiftService:
             MetricRow(key="exam_pcs", s_no="b", description="No. of Pcs",
                       values=self._sv(pick_order["pcs"]), unit=MetricUnit.count,
                       source=sys, source_report=po),
-            MetricRow(key="exam_onfloor_productivity", s_no="c",
-                      description="On Floor Productivity (Pcs/WHA)", pending=True,
+            # c — On Role WHA Count for the Examination department (from roster).
+            MetricRow(key="exam_onrole_wha", s_no="c",
+                      description="On Role WHA Count",
+                      values=self._sv(roster_wha), unit=MetricUnit.count,
+                      source=man, source_report="Roster",
+                      note="On Role: WHA staff on rolls, Examination dept (P + Absent + unmarked; LWP excluded)"),
+            MetricRow(key="exam_onfloor_productivity", s_no="d",
+                      description="On Floor Productivity (Pcs/WHA)",
+                      values=self._sv(_productivity(pick_order["pcs"], roster_wha_floor, days_in_month)),
                       unit=MetricUnit.productivity, source=man, source_report="Roster",
-                      note="(No. of Pcs / On Floor WHA) * days in month",
+                      note=f"(No. of Pcs / On Floor WHA) * {days_in_month}",
                       children=[
-                          MetricRow(key="exam_onfloor_manpower", s_no="c.1",
-                                    description="On Floor Manpower (WHA)", pending=True,
+                          MetricRow(key="exam_onfloor_manpower", s_no="d.1",
+                                    description="On Floor Manpower (WHA)",
+                                    values=self._sv(roster_wha_floor),
                                     unit=MetricUnit.count, source=man, source_report="Roster"),
                       ]),
         ]
         return MetricSection(key="examination", title="P.2  Examination", rows=rows)
-
-    def _release_section(self, release: dict, truck: dict) -> MetricSection:
+ 
+    def _release_section(self, release: dict, truck: dict, roster_wha: dict,
+                         roster_wha_floor: dict, days_in_month: int) -> MetricSection:
         """P.3 Release Report — from irr_report (gate_pass_issued_date shifts).
         Truck Count comes from the truck IN/OUT report."""
         sys, man = MetricSource.system, MetricSource.manual
@@ -2384,18 +2505,26 @@ class ProductivityImportShiftService:
             MetricRow(key="rel_truck_count", s_no="d", description="Truck Count",
                       values=self._sv(truck["truck_count"]), unit=MetricUnit.count,
                       source=sys, source_report="Import Truck Slot Mgt"),
-            # f — On Floor Productivity (Roster) pending.
+            # e — On Role WHA Count for the Release department (from roster).
+            MetricRow(key="rel_onrole_wha", s_no="e",
+                      description="On Role WHA Count",
+                      values=self._sv(roster_wha), unit=MetricUnit.count,
+                      source=man, source_report="Roster",
+                      note="On Role: WHA staff on rolls, Release dept (P + Absent + unmarked; LWP excluded)"),
+            # f — On Floor Productivity = Release Gross MT / On Floor WHA * days.
             MetricRow(key="rel_onfloor_productivity", s_no="f", description="On Floor Productivity",
-                      pending=True, unit=MetricUnit.productivity, source=man, source_report="Roster",
-                      note="(Gross MT / On Floor WHA) * days in month",
+                      values=self._sv(_productivity(release["gross_mt"], roster_wha_floor, days_in_month)),
+                      unit=MetricUnit.productivity, source=man, source_report="Roster",
+                      note=f"(Gross MT / On Floor WHA) * {days_in_month}",
                       children=[
                           MetricRow(key="rel_onfloor_manpower", s_no="f.1",
-                                    description="On Floor Manpower (WHA)", pending=True,
+                                    description="On Floor Manpower (WHA)",
+                                    values=self._sv(roster_wha_floor),
                                     unit=MetricUnit.count, source=man, source_report="Roster"),
                       ]),
         ]
         return MetricSection(key="release", title="P.3  Release Report", rows=rows)
-
+ 
     def _sla_section(self, seg: dict, release: dict, truck: dict) -> MetricSection:
         sys = MetricSource.system
         vals = ShiftValues(
@@ -2427,7 +2556,7 @@ class ProductivityImportShiftService:
                       unit=MetricUnit.percent, source=sys, source_report="Release Report",
                       note=f"{release['release_perf']['total']['success']}/"
                            f"{release['release_perf']['total']['total']} GP within 4h SLA (day)"),
-            MetricRow(key="sla_truckout_performance", s_no="3", description="Truck Out Performance",
+            MetricRow(key="sla_truckout_performance", s_no="3", description="Trucking Performance",
                       values=ShiftValues(
                           morning=truck["truck_out_sla"][MORNING]["pct"],
                           afternoon=truck["truck_out_sla"][AFTERNOON]["pct"],
@@ -2455,347 +2584,347 @@ class ProductivityImportShiftService:
 
 # =========================================================
 
-"""
-Release (IRR) metric computation — SHIFT-BASED.
+# """
+# Release (IRR) metric computation — SHIFT-BASED.
 
-Source table: irr_report (IrrReport). One row per Gate Pass.
+# Source table: irr_report (IrrReport). One row per Gate Pass.
 
-Shift bucketing:
-    A Release row is assigned to a shift by gate_pass_issued_date (the GP issue
-    time), converted to IST — same operating-day windows as the segregation
-    dashboard (Morning 06-14, Afternoon 14-22, Evening 22-06 next day).
+# Shift bucketing:
+#     A Release row is assigned to a shift by gate_pass_issued_date (the GP issue
+#     time), converted to IST — same operating-day windows as the segregation
+#     dashboard (Morning 06-14, Afternoon 14-22, Evening 22-06 next day).
 
-Metrics built here (all confirmed):
-    Gate Pass Count   = COUNT(DISTINCT gate_pass_no)
-    Piece Count       = SUM(pcs)
-    Gross Weight (MT) = SUM(grg_wt) / 1000
-    Online Gate Pass %= GPs with online_counter ILIKE 'Online' / total GP * 100
+# Metrics built here (all confirmed):
+#     Gate Pass Count   = COUNT(DISTINCT gate_pass_no)
+#     Piece Count       = SUM(pcs)
+#     Gross Weight (MT) = SUM(grg_wt) / 1000
+#     Online Gate Pass %= GPs with online_counter ILIKE 'Online' / total GP * 100
 
-Left pending (rules not finalised):
-    Release Performance SLA  — needs the two datetime columns confirmed
-                               (spec: AF - AE > 4h => failure).
-    Truck Count              — sourced from Import Truck Slot Mgt, not irr_report.
+# Left pending (rules not finalised):
+#     Release Performance SLA  — needs the two datetime columns confirmed
+#                                (spec: AF - AE > 4h => failure).
+#     Truck Count              — sourced from Import Truck Slot Mgt, not irr_report.
 
-Design mirrors segregation_shift_service: named IST zone in SQL (never a
-'+05:30' text offset), one grouped-by-shift query, day totals reconciled.
-"""
+# Design mirrors segregation_shift_service: named IST zone in SQL (never a
+# '+05:30' text offset), one grouped-by-shift query, day totals reconciled.
+# """
 
-from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+# from datetime import date, datetime, timedelta, timezone
+# from typing import Optional
 
-from sqlalchemy import func, select, case, distinct, literal, Date, Time
-from sqlalchemy.ext.asyncio import AsyncSession
+# from sqlalchemy import func, select, case, distinct, literal, Date, Time
+# from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models.importOperation.import_release_report import IrrReport as Irr
+# from app.db.models.importOperation.import_release_report import IrrReport as Irr
 
-import logging
+# import logging
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 
-IST = timezone(timedelta(hours=5, minutes=30))
-IST_ZONE_NAME = "Asia/Kolkata"
+# IST = timezone(timedelta(hours=5, minutes=30))
+# IST_ZONE_NAME = "Asia/Kolkata"
 
-# MORNING, AFTERNOON, EVENING = "morning", "afternoon", "evening"
-
-
-def _kg_to_mt(kg: Optional[float]) -> float:
-    return round(float(kg or 0) / 1000.0, 3)
+# # MORNING, AFTERNOON, EVENING = "morning", "afternoon", "evening"
 
 
-class ReleaseShiftService:
-    """Release (irr_report) metrics for a single IST operating day, split by shift."""
+# def _kg_to_mt(kg: Optional[float]) -> float:
+#     return round(float(kg or 0) / 1000.0, 3)
 
-    def __init__(self, session: AsyncSession):
-        self.session = session
 
-    # ── shift SQL helpers ────────────────────────────────────────────────────
-    #
-    # IMPORTANT STORAGE QUIRK:
-    #   gate_pass_issued_date  -> timestamptz (UTC), but only its DATE is
-    #                             reliable; its time-of-day is NOT (≈midnight).
-    #   gate_pass_issued_time  -> STRING, the true issue clock time already in
-    #                             IST, e.g. '07:20:00'.
-    #
-    # So the real IST issue moment = (date-field's IST date) + (time string).
-    # We build that combined IST timestamp in SQL and bucket on ITS hour.
-    # We must NOT extract the hour from gate_pass_issued_date alone — that
-    # would put nearly every GP in the Evening bucket.
+# class ReleaseShiftService:
+#     """Release (irr_report) metrics for a single IST operating day, split by shift."""
 
-    def _safe_issued_time(self):
-        """
-        gate_pass_issued_time cast to TIME — but DEFENSIVELY.
+#     def __init__(self, session: AsyncSession):
+#         self.session = session
 
-        The column is a free-text string and real data contains bad values
-        (e.g. a stray '30-Jun-26' date). A blind CAST(... AS TIME) makes
-        Postgres raise 'invalid input syntax for type time' and 500s the whole
-        request. So we only cast rows whose value matches a 24-hour HH:MM(:SS)
-        pattern; everything else falls back to midnight '00:00:00'.
+#     # ── shift SQL helpers ────────────────────────────────────────────────────
+#     #
+#     # IMPORTANT STORAGE QUIRK:
+#     #   gate_pass_issued_date  -> timestamptz (UTC), but only its DATE is
+#     #                             reliable; its time-of-day is NOT (≈midnight).
+#     #   gate_pass_issued_time  -> STRING, the true issue clock time already in
+#     #                             IST, e.g. '07:20:00'.
+#     #
+#     # So the real IST issue moment = (date-field's IST date) + (time string).
+#     # We build that combined IST timestamp in SQL and bucket on ITS hour.
+#     # We must NOT extract the hour from gate_pass_issued_date alone — that
+#     # would put nearly every GP in the Evening bucket.
 
-        Regex: ^([01]?\\d|2[0-3]):[0-5]\\d(:[0-5]\\d)?$
-          - hour 0-23 (one or two digits), minute 00-59, optional :seconds.
-        """
-        raw = func.trim(Irr.gate_pass_issued_time)
-        is_valid = raw.op("~")(literal(r"^([01]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$"))
-        safe_str = case((is_valid, raw), else_=literal("00:00:00"))
-        return func.cast(safe_str, Time)
+#     def _safe_issued_time(self):
+#         """
+#         gate_pass_issued_time cast to TIME — but DEFENSIVELY.
 
-    def _issued_ist_ts(self):
-        """
-        Combined IST issue timestamp:
-            (gate_pass_issued_date AT TIME ZONE IST)::date  +  safe_issued_time
+#         The column is a free-text string and real data contains bad values
+#         (e.g. a stray '30-Jun-26' date). A blind CAST(... AS TIME) makes
+#         Postgres raise 'invalid input syntax for type time' and 500s the whole
+#         request. So we only cast rows whose value matches a 24-hour HH:MM(:SS)
+#         pattern; everything else falls back to midnight '00:00:00'.
 
-        - AT TIME ZONE 'Asia/Kolkata' converts the UTC stamp to IST wall-clock,
-          then ::date takes the correct IST calendar date.
-        - gate_pass_issued_time is already IST; cast (defensively) to a time and
-          add it. Result is a naive IST timestamp (no tz math needed after).
-        """
-        ist_date = func.cast(
-            func.timezone(IST_ZONE_NAME, Irr.gate_pass_issued_date), Date
-        )
-        # date + time -> timestamp (Postgres allows date + time addition)
-        return ist_date + self._safe_issued_time()
+#         Regex: ^([01]?\\d|2[0-3]):[0-5]\\d(:[0-5]\\d)?$
+#           - hour 0-23 (one or two digits), minute 00-59, optional :seconds.
+#         """
+#         raw = func.trim(Irr.gate_pass_issued_time)
+#         is_valid = raw.op("~")(literal(r"^([01]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$"))
+#         safe_str = case((is_valid, raw), else_=literal("00:00:00"))
+#         return func.cast(safe_str, Time)
 
-    def _shift_label(self):
-        hour = func.extract("hour", self._issued_ist_ts())
-        return case(
-            ((hour >= 6) & (hour < 14), literal(MORNING)),
-            ((hour >= 14) & (hour < 22), literal(AFTERNOON)),
-            else_=literal(EVENING),
-        )
+#     def _issued_ist_ts(self):
+#         """
+#         Combined IST issue timestamp:
+#             (gate_pass_issued_date AT TIME ZONE IST)::date  +  safe_issued_time
 
-    def _day_window_ist(self, d: date) -> tuple[datetime, datetime]:
-        """Operating-day bounds as NAIVE IST timestamps [d 06:00, d+1 06:00).
+#         - AT TIME ZONE 'Asia/Kolkata' converts the UTC stamp to IST wall-clock,
+#           then ::date takes the correct IST calendar date.
+#         - gate_pass_issued_time is already IST; cast (defensively) to a time and
+#           add it. Result is a naive IST timestamp (no tz math needed after).
+#         """
+#         ist_date = func.cast(
+#             func.timezone(IST_ZONE_NAME, Irr.gate_pass_issued_date), Date
+#         )
+#         # date + time -> timestamp (Postgres allows date + time addition)
+#         return ist_date + self._safe_issued_time()
 
-        We compare against the combined IST issue timestamp (which is naive
-        IST), so the bounds are naive IST too — no UTC conversion here.
-        """
-        start = datetime(d.year, d.month, d.day, 6, 0)
-        return start, start + timedelta(days=1)
+#     def _shift_label(self):
+#         hour = func.extract("hour", self._issued_ist_ts())
+#         return case(
+#             ((hour >= 6) & (hour < 14), literal(MORNING)),
+#             ((hour >= 14) & (hour < 22), literal(AFTERNOON)),
+#             else_=literal(EVENING),
+#         )
 
-    def _calendar_window_ist(self, d: date) -> tuple[datetime, datetime]:
-        """Calendar-day bounds as naive IST: [date 00:00, date+1 00:00)."""
-        start = datetime(d.year, d.month, d.day, 0, 0)
-        return start, start + timedelta(days=1)
+#     def _day_window_ist(self, d: date) -> tuple[datetime, datetime]:
+#         """Operating-day bounds as NAIVE IST timestamps [d 06:00, d+1 06:00).
 
-    # ── data-quality filter ───────────────────────────────────────────────────
-    _TIME_RE = r"^([01]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$"
+#         We compare against the combined IST issue timestamp (which is naive
+#         IST), so the bounds are naive IST too — no UTC conversion here.
+#         """
+#         start = datetime(d.year, d.month, d.day, 6, 0)
+#         return start, start + timedelta(days=1)
 
-    def _usable_row(self):
-        """
-        A row is USABLE for the dashboard only if:
-          - gate_pass_issued_date is NOT NULL (we need the date), AND
-          - gate_pass_issued_time matches a valid 24-hour HH:MM(:SS) string.
+#     def _calendar_window_ist(self, d: date) -> tuple[datetime, datetime]:
+#         """Calendar-day bounds as naive IST: [date 00:00, date+1 00:00)."""
+#         start = datetime(d.year, d.month, d.day, 0, 0)
+#         return start, start + timedelta(days=1)
 
-        Rows failing either test are corrupt (ingestion mapped the wrong column
-        in) and are EXCLUDED from all metrics. Use dropped_row_ids() to see
-        exactly which rows were skipped.
-        """
-        time_ok = func.trim(Irr.gate_pass_issued_time).op("~")(literal(self._TIME_RE))
-        return (Irr.gate_pass_issued_date.isnot(None)) & time_ok
+#     # ── data-quality filter ───────────────────────────────────────────────────
+#     _TIME_RE = r"^([01]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$"
 
-    async def dropped_row_ids(self, report_date: date) -> list[dict]:
-        """
-        Diagnostic: returns the rows that WOULD BE dropped for this report_date's
-        source data because of a null date or malformed time. Each entry carries
-        id + gate_pass_no + the offending values, so the caller can log exactly
-        what and how many were excluded.
+#     def _usable_row(self):
+#         """
+#         A row is USABLE for the dashboard only if:
+#           - gate_pass_issued_date is NOT NULL (we need the date), AND
+#           - gate_pass_issued_time matches a valid 24-hour HH:MM(:SS) string.
 
-        Note: we cannot window these by the operating day (their timestamp is
-        unbuildable), so this returns ALL currently-corrupt rows. Filter/limit in
-        the caller if you only care about a date's upload.
-        """
-        bad = ~self._usable_row()
-        stmt = (
-            select(
-                Irr.id,
-                Irr.gate_pass_no,
-                Irr.gate_pass_issued_date,
-                Irr.gate_pass_issued_time,
-            )
-            .where(bad)
-        )
-        rows = (await self.session.execute(stmt)).all()
-        return [
-            {
-                "id": r.id,
-                "gate_pass_no": r.gate_pass_no,
-                "gate_pass_issued_date": r.gate_pass_issued_date,
-                "gate_pass_issued_time": r.gate_pass_issued_time,
-            }
-            for r in rows
-        ]
+#         Rows failing either test are corrupt (ingestion mapped the wrong column
+#         in) and are EXCLUDED from all metrics. Use dropped_row_ids() to see
+#         exactly which rows were skipped.
+#         """
+#         time_ok = func.trim(Irr.gate_pass_issued_time).op("~")(literal(self._TIME_RE))
+#         return (Irr.gate_pass_issued_date.isnot(None)) & time_ok
 
-    # ── main compute ─────────────────────────────────────────────────────────
-    async def compute(self, report_date: date) -> dict:
-        """
-        Returns a dict of per-shift metric dicts, each shaped
-        {morning, afternoon, evening, total}:
+#     async def dropped_row_ids(self, report_date: date) -> list[dict]:
+#         """
+#         Diagnostic: returns the rows that WOULD BE dropped for this report_date's
+#         source data because of a null date or malformed time. Each entry carries
+#         id + gate_pass_no + the offending values, so the caller can log exactly
+#         what and how many were excluded.
 
-            {
-              "gp_count":     {...},
-              "pcs":          {...},
-              "gross_mt":     {...},
-              "delivery_mt":  {...},   # same as gross_mt — Summary "d"
-              "online_pct":   {...},   # Online GP % per shift + day
-            }
+#         Note: we cannot window these by the operating day (their timestamp is
+#         unbuildable), so this returns ALL currently-corrupt rows. Filter/limit in
+#         the caller if you only care about a date's upload.
+#         """
+#         bad = ~self._usable_row()
+#         stmt = (
+#             select(
+#                 Irr.id,
+#                 Irr.gate_pass_no,
+#                 Irr.gate_pass_issued_date,
+#                 Irr.gate_pass_issued_time,
+#             )
+#             .where(bad)
+#         )
+#         rows = (await self.session.execute(stmt)).all()
+#         return [
+#             {
+#                 "id": r.id,
+#                 "gate_pass_no": r.gate_pass_no,
+#                 "gate_pass_issued_date": r.gate_pass_issued_date,
+#                 "gate_pass_issued_time": r.gate_pass_issued_time,
+#             }
+#             for r in rows
+#         ]
 
-        The dashboard service maps these onto MetricRows.
-        """
-        day_start_ist, day_end_ist = self._day_window_ist(report_date)
-        # Only consider USABLE rows (valid date + valid time string). Corrupt
-        # rows (null date, or a non-time value like '26063598' / a date in the
-        # time column) are excluded so they neither crash the cast nor pollute
-        # totals. dropped_row_ids() reports exactly which rows were skipped.
-        usable = self._usable_row()
-        # Filter on the COMBINED IST issue timestamp (date field's IST date +
-        # time string), so the operating-day window uses the true issue time.
-        issued_ts = self._issued_ist_ts()
-        rng = usable & (issued_ts >= day_start_ist) & (issued_ts < day_end_ist)
+#     # ── main compute ─────────────────────────────────────────────────────────
+#     async def compute(self, report_date: date) -> dict:
+#         """
+#         Returns a dict of per-shift metric dicts, each shaped
+#         {morning, afternoon, evening, total}:
 
-        # Log dropped rows for this build so bad data is visible in the logs.
-        dropped = await self.dropped_row_ids(report_date)
-        if dropped:
-            logger.warning(
-                "ReleaseShiftService: dropped %d corrupt irr_report row(s): ids=%s",
-                len(dropped),
-                [d["id"] for d in dropped],
-            )
+#             {
+#               "gp_count":     {...},
+#               "pcs":          {...},
+#               "gross_mt":     {...},
+#               "delivery_mt":  {...},   # same as gross_mt — Summary "d"
+#               "online_pct":   {...},   # Online GP % per shift + day
+#             }
 
-        # Operating-day metrics (existing behaviour).
-        result = await self._aggregate(rng)
+#         The dashboard service maps these onto MetricRows.
+#         """
+#         day_start_ist, day_end_ist = self._day_window_ist(report_date)
+#         # Only consider USABLE rows (valid date + valid time string). Corrupt
+#         # rows (null date, or a non-time value like '26063598' / a date in the
+#         # time column) are excluded so they neither crash the cast nor pollute
+#         # totals. dropped_row_ids() reports exactly which rows were skipped.
+#         usable = self._usable_row()
+#         # Filter on the COMBINED IST issue timestamp (date field's IST date +
+#         # time string), so the operating-day window uses the true issue time.
+#         issued_ts = self._issued_ist_ts()
+#         rng = usable & (issued_ts >= day_start_ist) & (issued_ts < day_end_ist)
 
-        # Calendar-day pass: same aggregate over [00:00, 24:00) IST. We only
-        # keep the single-number totals and merge them as `calendar_total`.
-        cal_start, cal_end = self._calendar_window_ist(report_date)
-        cal_rng = usable & (issued_ts >= cal_start) & (issued_ts < cal_end)
-        cal = await self._aggregate(cal_rng)
+#         # Log dropped rows for this build so bad data is visible in the logs.
+#         dropped = await self.dropped_row_ids(report_date)
+#         if dropped:
+#             logger.warning(
+#                 "ReleaseShiftService: dropped %d corrupt irr_report row(s): ids=%s",
+#                 len(dropped),
+#                 [d["id"] for d in dropped],
+#             )
 
-        # Merge calendar totals into the value metrics.
-        for m in ("gp_count", "pcs", "gross_mt", "delivery_mt"):
-            result[m]["calendar_total"] = cal[m]["total"]
-        # Online % calendar figure (recompute from calendar online/total).
-        result["online_pct"]["calendar_total"] = cal["online_pct"]["total"]
-        # Release SLA calendar % (single number).
-        result["release_perf"]["total"]["calendar_pct"] = cal["release_perf"]["total"]["pct"]
+#         # Operating-day metrics (existing behaviour).
+#         result = await self._aggregate(rng)
 
-        result["dropped_rows"] = dropped
-        result["dropped_count"] = len(dropped)
-        return result
+#         # Calendar-day pass: same aggregate over [00:00, 24:00) IST. We only
+#         # keep the single-number totals and merge them as `calendar_total`.
+#         cal_start, cal_end = self._calendar_window_ist(report_date)
+#         cal_rng = usable & (issued_ts >= cal_start) & (issued_ts < cal_end)
+#         cal = await self._aggregate(cal_rng)
 
-    async def _aggregate(self, rng) -> dict:
-        """Compute all release metric dicts over an arbitrary row-range `rng`."""
-        shift = self._shift_label()
-        online = func.upper(func.trim(Irr.online_counter)) == "ONLINE"
+#         # Merge calendar totals into the value metrics.
+#         for m in ("gp_count", "pcs", "gross_mt", "delivery_mt"):
+#             result[m]["calendar_total"] = cal[m]["total"]
+#         # Online % calendar figure (recompute from calendar online/total).
+#         result["online_pct"]["calendar_total"] = cal["online_pct"]["total"]
+#         # Release SLA calendar % (single number).
+#         result["release_perf"]["total"]["calendar_pct"] = cal["release_perf"]["total"]["pct"]
 
-        # One grouped pass: per shift, count GP / online GP, sum pcs & weight.
-        stmt = (
-            select(
-                shift.label("shift"),
-                func.count(distinct(Irr.gate_pass_no)).label("gp_count"),
-                func.count(distinct(case((online, Irr.gate_pass_no)))).label("online_gp"),
-                func.coalesce(func.sum(Irr.pcs), 0).label("pcs"),
-                func.coalesce(func.sum(Irr.grg_wt), 0).label("gross_kg"),
-            )
-            .where(rng)
-            .group_by(shift)
-        )
-        rows = (await self.session.execute(stmt)).all()
+#         result["dropped_rows"] = dropped
+#         result["dropped_count"] = len(dropped)
+#         return result
 
-        def blank():
-            return {MORNING: 0.0, AFTERNOON: 0.0, EVENING: 0.0, "total": 0.0}
+#     async def _aggregate(self, rng) -> dict:
+#         """Compute all release metric dicts over an arbitrary row-range `rng`."""
+#         shift = self._shift_label()
+#         online = func.upper(func.trim(Irr.online_counter)) == "ONLINE"
 
-        gp = blank()
-        online_gp = blank()
-        pcs = blank()
-        gross = blank()
-        for r in rows:
-            sh = r.shift
-            gp[sh] = float(r.gp_count)
-            online_gp[sh] = float(r.online_gp)
-            pcs[sh] = float(r.pcs)
-            gross[sh] = _kg_to_mt(r.gross_kg)
+#         # One grouped pass: per shift, count GP / online GP, sum pcs & weight.
+#         stmt = (
+#             select(
+#                 shift.label("shift"),
+#                 func.count(distinct(Irr.gate_pass_no)).label("gp_count"),
+#                 func.count(distinct(case((online, Irr.gate_pass_no)))).label("online_gp"),
+#                 func.coalesce(func.sum(Irr.pcs), 0).label("pcs"),
+#                 func.coalesce(func.sum(Irr.grg_wt), 0).label("gross_kg"),
+#             )
+#             .where(rng)
+#             .group_by(shift)
+#         )
+#         rows = (await self.session.execute(stmt)).all()
 
-        for m in (gp, online_gp, pcs, gross):
-            m["total"] = round(m[MORNING] + m[AFTERNOON] + m[EVENING], 3)
+#         def blank():
+#             return {MORNING: 0.0, AFTERNOON: 0.0, EVENING: 0.0, "total": 0.0}
 
-        day_gp = await self._day_distinct_gp(rng)
-        gp["total"] = float(day_gp)
+#         gp = blank()
+#         online_gp = blank()
+#         pcs = blank()
+#         gross = blank()
+#         for r in rows:
+#             sh = r.shift
+#             gp[sh] = float(r.gp_count)
+#             online_gp[sh] = float(r.online_gp)
+#             pcs[sh] = float(r.pcs)
+#             gross[sh] = _kg_to_mt(r.gross_kg)
 
-        def pct(part: dict, whole: dict) -> dict:
-            out = {}
-            for k in (MORNING, AFTERNOON, EVENING, "total"):
-                out[k] = round(part[k] / whole[k] * 100.0, 1) if whole[k] else None
-            return out
+#         for m in (gp, online_gp, pcs, gross):
+#             m["total"] = round(m[MORNING] + m[AFTERNOON] + m[EVENING], 3)
 
-        online_pct = pct(online_gp, gp)
-        release_perf = await self._release_sla(rng)
+#         day_gp = await self._day_distinct_gp(rng)
+#         gp["total"] = float(day_gp)
 
-        return {
-            "gp_count": gp,
-            "pcs": pcs,
-            "gross_mt": gross,
-            "delivery_mt": gross,
-            "online_pct": online_pct,
-            "release_perf": release_perf,
-        }
+#         def pct(part: dict, whole: dict) -> dict:
+#             out = {}
+#             for k in (MORNING, AFTERNOON, EVENING, "total"):
+#                 out[k] = round(part[k] / whole[k] * 100.0, 1) if whole[k] else None
+#             return out
 
-    async def _release_sla(self, rng) -> dict:
-        """
-        Release Performance SLA per shift.
+#         online_pct = pct(online_gp, gp)
+#         release_perf = await self._release_sla(rng)
 
-        Rule (from spec):
-            AE = gate_pass_recd_date_time
-            AF = gate_pass_end_date_time
-            If (AF - AE) > 4 hours  -> FAILURE, else success.
-            Performance % = success GPs / total GPs (that have both AE and AF).
+#         return {
+#             "gp_count": gp,
+#             "pcs": pcs,
+#             "gross_mt": gross,
+#             "delivery_mt": gross,
+#             "online_pct": online_pct,
+#             "release_perf": release_perf,
+#         }
 
-        Rows missing AE or AF can't be evaluated, so they're excluded from BOTH
-        success and total (they neither pass nor fail) — same convention as the
-        segregation SLA with missing ATW/FCC.
+#     async def _release_sla(self, rng) -> dict:
+#         """
+#         Release Performance SLA per shift.
 
-        Returns per-shift + day:
-            {morning|afternoon|evening|total: {"total": n, "success": n, "pct": float|None}}
-        """
-        ae = Irr.gate_pass_recd_date_time
-        af = Irr.gate_pass_end_date_time
-        shift = self._shift_label()
+#         Rule (from spec):
+#             AE = gate_pass_recd_date_time
+#             AF = gate_pass_end_date_time
+#             If (AF - AE) > 4 hours  -> FAILURE, else success.
+#             Performance % = success GPs / total GPs (that have both AE and AF).
 
-        # elapsed hours = (AF - AE) in hours
-        elapsed_hours = func.extract("epoch", af - ae) / 3600.0
-        has_both = ae.isnot(None) & af.isnot(None)
-        is_success = case(((has_both) & (elapsed_hours <= 4.0), 1), else_=0)
+#         Rows missing AE or AF can't be evaluated, so they're excluded from BOTH
+#         success and total (they neither pass nor fail) — same convention as the
+#         segregation SLA with missing ATW/FCC.
 
-        stmt = (
-            select(
-                shift.label("shift"),
-                # total = GPs that CAN be evaluated (both AE & AF present)
-                func.count(distinct(case((has_both, Irr.gate_pass_no)))).label("total"),
-                func.coalesce(func.sum(is_success), 0).label("success"),
-            )
-            .where(rng)
-            .group_by(shift)
-        )
-        rows = (await self.session.execute(stmt)).all()
+#         Returns per-shift + day:
+#             {morning|afternoon|evening|total: {"total": n, "success": n, "pct": float|None}}
+#         """
+#         ae = Irr.gate_pass_recd_date_time
+#         af = Irr.gate_pass_end_date_time
+#         shift = self._shift_label()
 
-        def entry(total, success):
-            return {"total": total, "success": success,
-                    "pct": round(success / total * 100.0, 1) if total else None}
+#         # elapsed hours = (AF - AE) in hours
+#         elapsed_hours = func.extract("epoch", af - ae) / 3600.0
+#         has_both = ae.isnot(None) & af.isnot(None)
+#         is_success = case(((has_both) & (elapsed_hours <= 4.0), 1), else_=0)
 
-        out = {
-            MORNING: entry(0, 0), AFTERNOON: entry(0, 0), EVENING: entry(0, 0),
-        }
-        day_total = day_success = 0
-        for r in rows:
-            t, s = int(r.total), int(r.success)
-            out[r.shift] = entry(t, s)
-            day_total += t
-            day_success += s
-        out["total"] = entry(day_total, day_success)
-        return out
+#         stmt = (
+#             select(
+#                 shift.label("shift"),
+#                 # total = GPs that CAN be evaluated (both AE & AF present)
+#                 func.count(distinct(case((has_both, Irr.gate_pass_no)))).label("total"),
+#                 func.coalesce(func.sum(is_success), 0).label("success"),
+#             )
+#             .where(rng)
+#             .group_by(shift)
+#         )
+#         rows = (await self.session.execute(stmt)).all()
 
-    async def _day_distinct_gp(self, rng) -> int:
-        stmt = select(func.count(distinct(Irr.gate_pass_no))).where(rng)
-        return int((await self.session.execute(stmt)).scalar() or 0)
+#         def entry(total, success):
+#             return {"total": total, "success": success,
+#                     "pct": round(success / total * 100.0, 1) if total else None}
+
+#         out = {
+#             MORNING: entry(0, 0), AFTERNOON: entry(0, 0), EVENING: entry(0, 0),
+#         }
+#         day_total = day_success = 0
+#         for r in rows:
+#             t, s = int(r.total), int(r.success)
+#             out[r.shift] = entry(t, s)
+#             day_total += t
+#             day_success += s
+#         out["total"] = entry(day_total, day_success)
+#         return out
+
+#     async def _day_distinct_gp(self, rng) -> int:
+#         stmt = select(func.count(distinct(Irr.gate_pass_no))).where(rng)
+#         return int((await self.session.execute(stmt)).scalar() or 0)
     
 
 
@@ -2951,31 +3080,64 @@ class TruckShiftService:
         return gp, pcs
 
     # ── truck count: split truck_no on backslash, count unique plates ─────────
+    # async def _truck_counts(self, rng) -> dict:
+    #     """
+    #     truck_no may contain multiple plates joined by backslash. We pull
+    #     (shift, truck_no) and split/dedupe in Python — cleaner than SQL string
+    #     gymnastics and easy to adjust (e.g. if you later want to drop BY HAND).
+    #     """
+    #     shift = self._shift_label()
+    #     stmt = select(shift.label("shift"), Truck.truck_no).where(rng)
+    #     rows = (await self.session.execute(stmt)).all()
+
+    #     # collect a set of plates per shift so duplicates across rows don't count twice
+    #     plates = {MORNING: set(), AFTERNOON: set(), EVENING: set()}
+    #     for r in rows:
+    #         if not r.truck_no:
+    #             continue
+    #         for plate in str(r.truck_no).split("\\"):
+    #             p = plate.strip().upper()
+    #             if p:
+    #                 plates[r.shift].add(p)
+
+    #     out = {sh: float(len(plates[sh])) for sh in (MORNING, AFTERNOON, EVENING)}
+    #     # Day total = unique plates across the whole day (union of the 3 shifts).
+    #     out["total"] = float(len(plates[MORNING] | plates[AFTERNOON] | plates[EVENING]))
+    #     return out
+
+        # ── truck count: split truck_no on / or \, count unique plates ────────────
+    # Regex matching EITHER separator. Real data uses FORWARD slash far more often
+    # than backslash (e.g. 'DL1MA2334/1207', 'HR47E8289/4028'), and a single
+    # truck_no cell can hold several vehicles — each part is its own vehicle and
+    # must be counted separately, so we split on both.
+    _PLATE_SEP = re.compile(r"[\\/]+")
+ 
     async def _truck_counts(self, rng) -> dict:
         """
-        truck_no may contain multiple plates joined by backslash. We pull
-        (shift, truck_no) and split/dedupe in Python — cleaner than SQL string
-        gymnastics and easy to adjust (e.g. if you later want to drop BY HAND).
+        truck_no may hold MULTIPLE vehicles joined by '/' or '\\'
+        (e.g. 'DL012356/67654/8976' = three vehicles). We pull (shift, truck_no)
+        and split/dedupe in Python — cleaner than SQL string gymnastics and easy
+        to adjust (e.g. if you later want to drop BY HAND).
         """
         shift = self._shift_label()
         stmt = select(shift.label("shift"), Truck.truck_no).where(rng)
         rows = (await self.session.execute(stmt)).all()
-
+ 
         # collect a set of plates per shift so duplicates across rows don't count twice
         plates = {MORNING: set(), AFTERNOON: set(), EVENING: set()}
         for r in rows:
             if not r.truck_no:
                 continue
-            for plate in str(r.truck_no).split("\\"):
+            for plate in self._PLATE_SEP.split(str(r.truck_no)):
                 p = plate.strip().upper()
                 if p:
                     plates[r.shift].add(p)
-
+ 
         out = {sh: float(len(plates[sh])) for sh in (MORNING, AFTERNOON, EVENING)}
         # Day total = unique plates across the whole day (union of the 3 shifts).
         out["total"] = float(len(plates[MORNING] | plates[AFTERNOON] | plates[EVENING]))
         return out
-
+    
     # ── Truck Out SLA (join to release for GP end) ────────────────────────────
     async def _truck_out_sla(self, rng) -> dict:
         """
@@ -2985,7 +3147,9 @@ class TruckShiftService:
         """
         shift = self._shift_label()
         # Truck.gp_no is an int; IrrReport.gate_pass_no is a string — cast for join.
-        gp_no_str = func.cast(Truck.gp_no, String)
+        # gp_no_str = func.cast(Truck.gp_no, String)
+        truck_gp = func.trim(Truck.gp_no)
+        release_gp = func.trim(Irr.gate_pass_no)
 
         stmt = (
             select(
@@ -2996,7 +3160,7 @@ class TruckShiftService:
                 Irr.gate_pass_no.label("matched_gp"),
             )
             .select_from(Truck)
-            .join(Irr, Irr.gate_pass_no == gp_no_str, isouter=True)
+            .join(Irr, release_gp == truck_gp, isouter=True)
             .where(rng)
         )
         rows = (await self.session.execute(stmt)).all()
@@ -3118,7 +3282,7 @@ MORNING, AFTERNOON, EVENING = "morning", "afternoon", "evening"
 
 # ── THE ONE SETTING TO CHANGE THE SHIFT-BUCKETING BASIS ─────────────────────
 # Swap this to poe_end_datetime / rfe_datetime / ffe_datetime if needed.
-_SHIFT_BUCKET_COLUMN = PickOrder.poe_start_datetime
+_SHIFT_BUCKET_COLUMN = PickOrder.ffe_datetime
 
 
 class PickOrderShiftService:
@@ -3216,3 +3380,721 @@ class PickOrderShiftService:
     async def _day_distinct_awb(self, rng) -> int:
         stmt = select(func.count(distinct(PickOrder.awb_no))).where(rng)
         return int((await self.session.execute(stmt)).scalar() or 0)
+    
+
+
+
+
+
+
+
+
+
+
+
+# ======================================================================================
+
+
+
+
+
+# """
+# Roster WHA computation — On Role WHA Count.
+
+# Source: dr_imp_roster_attendance (+ dr_imp_roster_employee for identity), the
+# attendance rows uploaded per (emp_code, date, shift).
+
+# "On Role WHA Count" = number of DISTINCT employees whose designation is 'WHA',
+# present on the given date, bucketed by the roster's Shift column.
+
+# Presence rule (three-state present_status: 'P' / 'A' / NULL):
+#     - 'P'  (Present)  -> counted
+#     - NULL (no value) -> counted by default (no marking = still on-role); an
+#                          ex-employee left in the sheet with a blank status is
+#                          still "on role" unless explicitly Absent.
+#     - 'A'  (Absent)   -> excluded by default.
+# Both behaviours are configurable (see flags) so the rule can be flipped without
+# touching the queries:
+#     count_null_as_present : include NULL rows        (default True)
+#     count_absent          : include 'A' rows too     (default False)
+
+# Shift mapping:
+#     A WHA employee is placed into a shift by the roster's own Shift column
+#     (Morning / Afternoon / Evening) — NOT by any timestamp. The roster is
+#     already shift-tagged at upload.
+
+# Two day-totals, mirroring the rest of the dashboard:
+#     total          — operating day: distinct WHA present across the three shift
+#                      buckets. Because an employee could (in future) appear in
+#                      more than one shift, the total is a DISTINCT count over the
+#                      whole operating day, not the sum of the three shift counts.
+#     calendar_total — distinct WHA present across the whole calendar date
+#                      (all shifts). For roster data, which is keyed by a plain
+#                      DATE (no time), the calendar day and the operating day
+#                      select the same rows, so the two totals match. It is still
+#                      computed independently for consistency and future-proofing.
+# """
+
+# from datetime import date
+# from typing import Optional
+
+# from sqlalchemy import func, select, distinct, or_
+# from sqlalchemy.ext.asyncio import AsyncSession
+
+# from app.db.models.digital_reports.import_dept.import_emp_roaster import (
+#     DigitalReportRosterAttendance as Attendance,
+#     DigitalReportRosterEmployee as Employee,
+# )
+
+# MORNING, AFTERNOON, EVENING = "morning", "afternoon", "evening"
+
+# # Roster shift labels as they appear in the file, mapped to our internal keys.
+# # (The upload stores the raw shift string; normalise here.)
+# _SHIFT_MAP = {
+#     "morning": MORNING,
+#     "afternoon": AFTERNOON,
+#     "evening": EVENING,
+# }
+
+# WHA_DESG = "WHA"
+
+
+# class RosterWhaService:
+#     """Counts On Role WHA (designation = 'WHA') per shift + day, from the roster."""
+ 
+#     def __init__(
+#         self,
+#         session: AsyncSession,
+#         *,
+#         count_null_as_present: bool = True,
+#         count_absent: bool = False,
+#     ):
+#         self.session = session
+#         self.count_null_as_present = count_null_as_present
+#         self.count_absent = count_absent
+ 
+#     # ── department predicate ──────────────────────────────────────────────────
+#     def _department_filter(self, department: Optional[str]):
+#         """
+#         Case-insensitive EXACT match on the roster Department column.
+#         Passing department=None means "no department filter" (all WHA staff).
+#         Each dashboard section passes its own department name (e.g.
+#         'Segregation', 'Release', 'Examination') so its WHA count reflects only
+#         the staff who worked in that department that day/shift.
+#         """
+#         if department is None:
+#             return True  # no-op filter
+#         return func.upper(func.trim(Attendance.department)) == department.strip().upper()
+ 
+#     # ── presence predicate ────────────────────────────────────────────────────
+#     def _presence_filter(self):
+#         """
+#         Build the SQL condition selecting which present_status values count,
+#         per the configurable flags.
+ 
+#         Default: 'P' OR NULL  (present, or unmarked). 'A' excluded.
+ 
+#         NOTE on LWP: this is an ALLOW-LIST — only the statuses explicitly added
+#         below are counted. 'LWP' (Leave Without Pay) is never added, so it is
+#         automatically EXCLUDED from every WHA count (both On Role and On Floor),
+#         regardless of the flags. That's the intended behaviour: unpaid-leave
+#         staff are not counted as manpower.
+#         """
+#         allowed = [Attendance.present_status == "P"]
+#         if self.count_null_as_present:
+#             allowed.append(Attendance.present_status.is_(None))
+#         if self.count_absent:
+#             allowed.append(Attendance.present_status == "A")
+#         return or_(*allowed)
+ 
+#     # ── WHA designation predicate ─────────────────────────────────────────────
+#     def _is_wha(self):
+#         """
+#         Designation = 'WHA'. We check the attendance row's desg (a per-shift
+#         snapshot). Case-insensitive + trimmed to be robust to file noise.
+#         """
+#         return func.upper(func.trim(Attendance.desg)) == WHA_DESG
+ 
+#     # ── main compute ──────────────────────────────────────────────────────────
+#     async def compute(self, report_date: date, department: Optional[str] = None) -> dict:
+#         """
+#         Returns the On Role WHA counts shaped like every other dashboard metric:
+#             {morning, afternoon, evening, total, calendar_total}
+ 
+#         department: case-insensitive exact Department name to filter by (e.g.
+#             'Segregation', 'Release', 'Examination'). None = count all WHA staff
+#             regardless of department.
+ 
+#         - Per-shift values: distinct WHA employees present in that shift.
+#         - total: distinct WHA present across the whole (operating) day. A DISTINCT
+#           count, not the sum of shifts, so a person in two shifts counts once.
+#         - calendar_total: distinct WHA present across the calendar date.
+#           (Same rows as `total` for roster data — see module docstring.)
+#         """
+#         base = (
+#             (Attendance.date == report_date)
+#             & self._is_wha()
+#             & self._presence_filter()
+#             & self._department_filter(department)
+#         )
+ 
+#         # ── per-shift distinct WHA employee counts ──
+#         stmt = (
+#             select(
+#                 Attendance.shift.label("shift"),
+#                 func.count(distinct(Attendance.emp_code)).label("cnt"),
+#             )
+#             .where(base)
+#             .group_by(Attendance.shift)
+#         )
+#         rows = (await self.session.execute(stmt)).all()
+ 
+#         out = {MORNING: 0.0, AFTERNOON: 0.0, EVENING: 0.0,
+#                "total": 0.0, "calendar_total": 0.0}
+ 
+#         for r in rows:
+#             key = _SHIFT_MAP.get((r.shift or "").strip().lower())
+#             if key is not None:
+#                 out[key] = float(r.cnt)
+#             # Unrecognised shift labels are ignored for the per-shift columns but
+#             # still counted in the day-distinct totals below.
+ 
+#         # ── operating-day total: distinct WHA present across the whole day ──
+#         # DISTINCT over emp_code so multi-shift employees count once.
+#         day_stmt = select(func.count(distinct(Attendance.emp_code))).where(base)
+#         day_total = int((await self.session.execute(day_stmt)).scalar() or 0)
+#         out["total"] = float(day_total)
+ 
+#         # ── calendar-day total: distinct WHA present across the calendar date ──
+#         # For roster data (plain DATE, no time) this selects the same rows as the
+#         # operating day, so it equals `total`. Computed separately so the rule
+#         # stays explicit and correct if the roster ever gains time-of-day data.
+#         out["calendar_total"] = float(day_total)
+ 
+#         return out
+ 
+ 
+# # ── convenience constructors for the two WHA definitions ────────────────────
+# # On Role  = everyone on the rolls with Desg='WHA' (present, absent, or blank).
+# # On Floor = only those actually present ('P').
+# def on_role_wha_service(session) -> "RosterWhaService":
+#     """WHA counted as P + A + NULL (everyone on the rolls)."""
+#     return RosterWhaService(session, count_null_as_present=True, count_absent=True)
+ 
+ 
+# def on_floor_wha_service(session) -> "RosterWhaService":
+#     """WHA counted as 'P' only (actually present / on the floor)."""
+#     return RosterWhaService(session, count_null_as_present=False, count_absent=False)
+
+
+
+
+
+# ============================= release shift service second version with gp end time ===============================
+
+"""
+Release (IRR) metric computation — SHIFT-BASED.
+
+Source table: irr_report (IrrReport). One row per Gate Pass.
+
+Shift bucketing:
+    A Release row is assigned to a shift by gate_pass_end_date_time (the GP end
+    time), converted to IST — same operating-day windows as the segregation
+    dashboard (Morning 06-14, Afternoon 14-22, Evening 22-06 next day).
+
+Metrics built here (all confirmed):
+    Gate Pass Count   = COUNT(DISTINCT gate_pass_no)
+    Piece Count       = SUM(pcs)
+    Gross Weight (MT) = SUM(grg_wt) / 1000
+    Online Gate Pass %= GPs with online_counter ILIKE 'Online' / total GP * 100
+
+Left pending (rules not finalised):
+    Release Performance SLA  — needs the two datetime columns confirmed
+                               (spec: AF - AE > 4h => failure).
+    Truck Count              — sourced from Import Truck Slot Mgt, not irr_report.
+
+Design mirrors segregation_shift_service: named IST zone in SQL (never a
+'+05:30' text offset), one grouped-by-shift query, day totals reconciled.
+"""
+
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
+
+from sqlalchemy import func, select, case, distinct, literal
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models.importOperation.import_release_report import IrrReport as Irr
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+IST = timezone(timedelta(hours=5, minutes=30))
+IST_ZONE_NAME = "Asia/Kolkata"
+
+MORNING, AFTERNOON, EVENING = "morning", "afternoon", "evening"
+
+
+def _kg_to_mt(kg: Optional[float]) -> float:
+    return round(float(kg or 0) / 1000.0, 3)
+
+
+class ReleaseShiftService:
+    """Release (irr_report) metrics for a single IST operating day, split by shift."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    # ── shift SQL helpers ────────────────────────────────────────────────────
+    #
+    # Shift bucketing is now based on gate_pass_end_date_time, a clean UTC
+    # timestamptz — converted to IST with the named zone and bucketed on its
+    # hour, like the truck and pick-order services.
+
+    def _issued_ist_ts(self):
+        """
+        Shift-bucketing timestamp, now based on gate_pass_end_date_time.
+
+        gate_pass_end_date_time is a clean UTC timestamptz, so we simply convert
+        it to IST wall-clock with the named zone (avoids the +05:30 POSIX
+        sign trap) — no string-time parsing or date-combining needed.
+        """
+        return func.timezone(IST_ZONE_NAME, Irr.gate_pass_end_date_time)
+
+    def _shift_label(self):
+        hour = func.extract("hour", self._issued_ist_ts())
+        return case(
+            ((hour >= 6) & (hour < 14), literal(MORNING)),
+            ((hour >= 14) & (hour < 22), literal(AFTERNOON)),
+            else_=literal(EVENING),
+        )
+
+    def _day_window_ist(self, d: date) -> tuple[datetime, datetime]:
+        """Operating-day bounds as NAIVE IST timestamps [d 06:00, d+1 06:00).
+
+        We compare against the IST-converted gate_pass_end_date_time (naive IST
+        wall-clock after timezone()), so the bounds are naive IST too.
+        """
+        start = datetime(d.year, d.month, d.day, 6, 0)
+        return start, start + timedelta(days=1)
+
+    def _calendar_window_ist(self, d: date) -> tuple[datetime, datetime]:
+        """Calendar-day bounds as naive IST: [date 00:00, date+1 00:00)."""
+        start = datetime(d.year, d.month, d.day, 0, 0)
+        return start, start + timedelta(days=1)
+
+    # ── data-quality filter ───────────────────────────────────────────────────
+
+    def _usable_row(self):
+        """
+        A row is USABLE for the dashboard only if gate_pass_end_date_time is NOT
+        NULL — that's the timestamp we now bucket by. Rows without an end time
+        (e.g. a GP not yet closed) can't be placed in a shift, so they're
+        EXCLUDED. Use dropped_row_ids() to see which rows were skipped.
+        """
+        return Irr.gate_pass_end_date_time.isnot(None)
+
+    async def dropped_row_ids(self, report_date: date) -> list[dict]:
+        """
+        Diagnostic: returns the rows that WOULD BE dropped for this report_date's
+        source data because of a null date or malformed time. Each entry carries
+        id + gate_pass_no + the offending values, so the caller can log exactly
+        what and how many were excluded.
+
+        Note: we cannot window these by the operating day (their timestamp is
+        unbuildable), so this returns ALL currently-corrupt rows. Filter/limit in
+        the caller if you only care about a date's upload.
+        """
+        bad = ~self._usable_row()
+        stmt = (
+            select(
+                Irr.id,
+                Irr.gate_pass_no,
+                Irr.gate_pass_end_date_time,
+            )
+            .where(bad)
+        )
+        rows = (await self.session.execute(stmt)).all()
+        return [
+            {
+                "id": r.id,
+                "gate_pass_no": r.gate_pass_no,
+                "gate_pass_end_date_time": r.gate_pass_end_date_time,
+            }
+            for r in rows
+        ]
+
+    # ── main compute ─────────────────────────────────────────────────────────
+    async def compute(self, report_date: date) -> dict:
+        """
+        Returns a dict of per-shift metric dicts, each shaped
+        {morning, afternoon, evening, total}:
+
+            {
+              "gp_count":     {...},
+              "pcs":          {...},
+              "gross_mt":     {...},
+              "delivery_mt":  {...},   # same as gross_mt — Summary "d"
+              "online_pct":   {...},   # Online GP % per shift + day
+            }
+
+        The dashboard service maps these onto MetricRows.
+        """
+        day_start_ist, day_end_ist = self._day_window_ist(report_date)
+        # Only consider USABLE rows (valid date + valid time string). Corrupt
+        # rows (null date, or a non-time value like '26063598' / a date in the
+        # time column) are excluded so they neither crash the cast nor pollute
+        # totals. dropped_row_ids() reports exactly which rows were skipped.
+        usable = self._usable_row()
+        # Filter on the COMBINED IST issue timestamp (date field's IST date +
+        # time string), so the operating-day window uses the true issue time.
+        issued_ts = self._issued_ist_ts()
+        rng = usable & (issued_ts >= day_start_ist) & (issued_ts < day_end_ist)
+
+        # Log dropped rows for this build so bad data is visible in the logs.
+        dropped = await self.dropped_row_ids(report_date)
+        if dropped:
+            pass
+            # logger.warning(
+            #     "ReleaseShiftService: dropped %d corrupt irr_report row(s): ids=%s",
+            #     len(dropped),
+            #     [d["id"] for d in dropped],
+            # )
+
+        # Operating-day metrics (existing behaviour).
+        result = await self._aggregate(rng)
+
+        # Calendar-day pass: same aggregate over [00:00, 24:00) IST. We only
+        # keep the single-number totals and merge them as `calendar_total`.
+        cal_start, cal_end = self._calendar_window_ist(report_date)
+        cal_rng = usable & (issued_ts >= cal_start) & (issued_ts < cal_end)
+        cal = await self._aggregate(cal_rng)
+
+        # Merge calendar totals into the value metrics.
+        for m in ("gp_count", "pcs", "gross_mt", "delivery_mt"):
+            result[m]["calendar_total"] = cal[m]["total"]
+        # Online % calendar figure (recompute from calendar online/total).
+        result["online_pct"]["calendar_total"] = cal["online_pct"]["total"]
+        # Release SLA calendar % (single number).
+        result["release_perf"]["total"]["calendar_pct"] = cal["release_perf"]["total"]["pct"]
+
+        result["dropped_rows"] = dropped
+        result["dropped_count"] = len(dropped)
+        return result
+
+    async def _aggregate(self, rng) -> dict:
+        """Compute all release metric dicts over an arbitrary row-range `rng`."""
+        shift = self._shift_label()
+        online = func.upper(func.trim(Irr.online_counter)) == "ONLINE"
+
+        # One grouped pass: per shift, count GP / online GP, sum pcs & weight.
+        stmt = (
+            select(
+                shift.label("shift"),
+                func.count(distinct(Irr.gate_pass_no)).label("gp_count"),
+                func.count(distinct(case((online, Irr.gate_pass_no)))).label("online_gp"),
+                func.coalesce(func.sum(Irr.pcs), 0).label("pcs"),
+                func.coalesce(func.sum(Irr.grg_wt), 0).label("gross_kg"),
+            )
+            .where(rng)
+            .group_by(shift)
+        )
+        rows = (await self.session.execute(stmt)).all()
+
+        def blank():
+            return {MORNING: 0.0, AFTERNOON: 0.0, EVENING: 0.0, "total": 0.0}
+
+        gp = blank()
+        online_gp = blank()
+        pcs = blank()
+        gross = blank()
+        for r in rows:
+            sh = r.shift
+            gp[sh] = float(r.gp_count)
+            online_gp[sh] = float(r.online_gp)
+            pcs[sh] = float(r.pcs)
+            gross[sh] = _kg_to_mt(r.gross_kg)
+
+        for m in (gp, online_gp, pcs, gross):
+            m["total"] = round(m[MORNING] + m[AFTERNOON] + m[EVENING], 3)
+
+        day_gp = await self._day_distinct_gp(rng)
+        gp["total"] = float(day_gp)
+
+        def pct(part: dict, whole: dict) -> dict:
+            out = {}
+            for k in (MORNING, AFTERNOON, EVENING, "total"):
+                out[k] = round(part[k] / whole[k] * 100.0, 1) if whole[k] else None
+            return out
+
+        online_pct = pct(online_gp, gp)
+        release_perf = await self._release_sla(rng)
+
+        return {
+            "gp_count": gp,
+            "pcs": pcs,
+            "gross_mt": gross,
+            "delivery_mt": gross,
+            "online_pct": online_pct,
+            "release_perf": release_perf,
+        }
+
+    async def _release_sla(self, rng) -> dict:
+        """
+        Release Performance SLA per shift.
+
+        Rule (from spec):
+            AE = gate_pass_recd_date_time
+            AF = gate_pass_end_date_time
+            If (AF - AE) > 4 hours  -> FAILURE, else success.
+            Performance % = success GPs / total GPs (that have both AE and AF).
+
+        Rows missing AE or AF can't be evaluated, so they're excluded from BOTH
+        success and total (they neither pass nor fail) — same convention as the
+        segregation SLA with missing ATW/FCC.
+
+        Returns per-shift + day:
+            {morning|afternoon|evening|total: {"total": n, "success": n, "pct": float|None}}
+        """
+        ae = Irr.gate_pass_recd_date_time
+        af = Irr.gate_pass_end_date_time
+        shift = self._shift_label()
+
+        # elapsed hours = (AF - AE) in hours
+        elapsed_hours = func.extract("epoch", af - ae) / 3600.0
+        has_both = ae.isnot(None) & af.isnot(None)
+        is_success = case(((has_both) & (elapsed_hours <= 4.0), 1), else_=0)
+
+        stmt = (
+            select(
+                shift.label("shift"),
+                # total = GPs that CAN be evaluated (both AE & AF present)
+                func.count(distinct(case((has_both, Irr.gate_pass_no)))).label("total"),
+                func.coalesce(func.sum(is_success), 0).label("success"),
+            )
+            .where(rng)
+            .group_by(shift)
+        )
+        rows = (await self.session.execute(stmt)).all()
+
+        def entry(total, success):
+            return {"total": total, "success": success,
+                    "pct": round(success / total * 100.0, 1) if total else None}
+
+        out = {
+            MORNING: entry(0, 0), AFTERNOON: entry(0, 0), EVENING: entry(0, 0),
+        }
+        day_total = day_success = 0
+        for r in rows:
+            t, s = int(r.total), int(r.success)
+            out[r.shift] = entry(t, s)
+            day_total += t
+            day_success += s
+        out["total"] = entry(day_total, day_success)
+        return out
+
+    async def _day_distinct_gp(self, rng) -> int:
+        stmt = select(func.count(distinct(Irr.gate_pass_no))).where(rng)
+        return int((await self.session.execute(stmt)).scalar() or 0)
+
+# ================================== NEW Roaster WHA Service ✌️ ===================================
+
+"""
+Roster WHA computation — On Role WHA Count.
+
+Source: dr_imp_roster_attendance (+ dr_imp_roster_employee for identity), the
+attendance rows uploaded per (emp_code, date, shift).
+
+"On Role WHA Count" = number of DISTINCT employees whose designation is 'WHA',
+present on the given date, bucketed by the roster's Shift column.
+
+Presence rule (three-state present_status: 'P' / 'A' / NULL):
+    - 'P'  (Present)  -> counted
+    - NULL (no value) -> counted by default (no marking = still on-role); an
+                         ex-employee left in the sheet with a blank status is
+                         still "on role" unless explicitly Absent.
+    - 'A'  (Absent)   -> excluded by default.
+Both behaviours are configurable (see flags) so the rule can be flipped without
+touching the queries:
+    count_null_as_present : include NULL rows        (default True)
+    count_absent          : include 'A' rows too     (default False)
+
+Shift mapping:
+    A WHA employee is placed into a shift by the roster's own Shift column
+    (Morning / Afternoon / Evening) — NOT by any timestamp. The roster is
+    already shift-tagged at upload.
+
+Two day-totals, mirroring the rest of the dashboard:
+    total          — operating day: distinct WHA present across the three shift
+                     buckets. Because an employee could (in future) appear in
+                     more than one shift, the total is a DISTINCT count over the
+                     whole operating day, not the sum of the three shift counts.
+    calendar_total — distinct WHA present across the whole calendar date
+                     (all shifts). For roster data, which is keyed by a plain
+                     DATE (no time), the calendar day and the operating day
+                     select the same rows, so the two totals match. It is still
+                     computed independently for consistency and future-proofing.
+"""
+
+from datetime import date
+from typing import Optional
+
+from sqlalchemy import func, select, distinct, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models.digital_reports.import_dept.import_emp_roaster import (
+    DigitalReportRosterAttendance as Attendance,
+    DigitalReportRosterEmployee as Employee,
+)
+
+MORNING, AFTERNOON, EVENING = "morning", "afternoon", "evening"
+
+# Roster shift labels as they appear in the file, mapped to our internal keys.
+# (The upload stores the raw shift string; normalise here.)
+_SHIFT_MAP = {
+    "morning": MORNING,
+    "afternoon": AFTERNOON,
+    "evening": EVENING,
+}
+
+WHA_DESG = "WHA"
+
+
+class RosterWhaService:
+    """Counts On Role WHA (designation = 'WHA') per shift + day, from the roster."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        count_null_as_present: bool = True,
+        count_absent: bool = False,
+    ):
+        self.session = session
+        self.count_null_as_present = count_null_as_present
+        self.count_absent = count_absent
+
+    # ── department predicate ──────────────────────────────────────────────────
+    def _department_filter(self, department: Optional[str]):
+        """
+        Case-insensitive EXACT match on the roster Department column.
+        Passing department=None means "no department filter" (all WHA staff).
+        Each dashboard section passes its own department name (e.g.
+        'Segregation', 'Release', 'Examination') so its WHA count reflects only
+        the staff who worked in that department that day/shift.
+        """
+        if department is None:
+            return True  # no-op filter
+        return func.upper(func.trim(Attendance.department)) == department.strip().upper()
+
+    # ── presence predicate ────────────────────────────────────────────────────
+    def _presence_filter(self):
+        """
+        Build the SQL condition selecting which present_status values count,
+        per the configurable flags.
+
+        Default: 'P' OR NULL  (present, or unmarked). 'A' excluded.
+
+        NOTE on LWP: this is an ALLOW-LIST — only the statuses explicitly added
+        below are counted. 'LWP' (Leave Without Pay) is never added, so it is
+        automatically EXCLUDED from every WHA count (both On Role and On Floor),
+        regardless of the flags. That's the intended behaviour: unpaid-leave
+        staff are not counted as manpower.
+        """
+        allowed = [Attendance.present_status == "P"]
+        if self.count_null_as_present:
+            allowed.append(Attendance.present_status.is_(None))
+        if self.count_absent:
+            allowed.append(Attendance.present_status == "A")
+        return or_(*allowed)
+
+    # ── WHA designation predicate ─────────────────────────────────────────────
+    def _is_wha(self):
+        """
+        Designation = 'WHA'. We check the attendance row's desg (a per-shift
+        snapshot). Case-insensitive + trimmed to be robust to file noise.
+        """
+        return func.upper(func.trim(Attendance.desg)) == WHA_DESG
+
+    # ── main compute ──────────────────────────────────────────────────────────
+    async def compute(self, report_date: date, department: Optional[str] = None) -> dict:
+        """
+        Returns the On Role WHA counts shaped like every other dashboard metric:
+            {morning, afternoon, evening, total, calendar_total}
+
+        department: case-insensitive exact Department name to filter by (e.g.
+            'Segregation', 'Release', 'Examination'). None = count all WHA staff
+            regardless of department.
+
+        - Per-shift values: distinct WHA employees present in that shift.
+        - total ("Shifts Total"): distinct WHA across the operating day, counting
+          ONLY the three real shifts. 'General'-shift staff are EXCLUDED — they
+          don't belong to any shift. DISTINCT, so a multi-shift person counts once.
+        - calendar_total ("Full Day", 00:00–23:59): distinct WHA across the whole
+          calendar date, INCLUDING 'General' staff — that's where they're counted.
+
+        So when General staff exist, calendar_total > total, and the shift columns
+        will not sum to calendar_total. That's intended.
+        """
+        base = (
+            (Attendance.date == report_date)
+            & self._is_wha()
+            & self._presence_filter()
+            & self._department_filter(department)
+        )
+
+        # ── per-shift distinct WHA employee counts ──
+        stmt = (
+            select(
+                Attendance.shift.label("shift"),
+                func.count(distinct(Attendance.emp_code)).label("cnt"),
+            )
+            .where(base)
+            .group_by(Attendance.shift)
+        )
+        rows = (await self.session.execute(stmt)).all()
+
+        out = {MORNING: 0.0, AFTERNOON: 0.0, EVENING: 0.0,
+               "total": 0.0, "calendar_total": 0.0}
+
+        for r in rows:
+            key = _SHIFT_MAP.get((r.shift or "").strip().lower())
+            if key is not None:
+                out[key] = float(r.cnt)
+            # Shifts outside the three named ones (e.g. 'General') are NOT placed
+            # in any shift column — see the totals below for how they're handled.
+
+        # ── operating-day total ("Shifts Total") ──────────────────────────────
+        # Distinct WHA across the operating day, but restricted to the three real
+        # shifts — 'General' staff are EXCLUDED here, because they don't belong to
+        # any shift. DISTINCT over emp_code so a multi-shift employee counts once.
+        shift_only = func.lower(func.trim(Attendance.shift)).in_(
+            [MORNING, AFTERNOON, EVENING]
+        )
+        day_stmt = select(func.count(distinct(Attendance.emp_code))).where(
+            base & shift_only
+        )
+        day_total = int((await self.session.execute(day_stmt)).scalar() or 0)
+        out["total"] = float(day_total)
+
+        # ── calendar-day total ("Full Day", 00:00–23:59) ──────────────────────
+        # Distinct WHA across the whole calendar date, INCLUDING 'General' staff —
+        # they work the general/full day, so this is where they're counted.
+        cal_stmt = select(func.count(distinct(Attendance.emp_code))).where(base)
+        cal_total = int((await self.session.execute(cal_stmt)).scalar() or 0)
+        out["calendar_total"] = float(cal_total)
+
+        return out
+
+
+# ── convenience constructors for the two WHA definitions ────────────────────
+# On Role  = everyone on the rolls with Desg='WHA' (present, absent, or blank).
+# On Floor = only those actually present ('P').
+def on_role_wha_service(session) -> "RosterWhaService":
+    """WHA counted as P + A + NULL (everyone on the rolls)."""
+    return RosterWhaService(session, count_null_as_present=True, count_absent=True)
+
+
+def on_floor_wha_service(session) -> "RosterWhaService":
+    """WHA counted as 'P' only (actually present / on the floor)."""
+    return RosterWhaService(session, count_null_as_present=False, count_absent=False)
