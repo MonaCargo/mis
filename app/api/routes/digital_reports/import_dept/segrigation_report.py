@@ -19,7 +19,7 @@ from app.services.digital_reports.import_dpt.operation_productivity_report.impor
 from app.services.digital_reports.import_dpt.operation_productivity_report.operation_productivity_service import  ProductivityImportShiftService
 from app.services.digital_reports.import_dpt.segrigation_report import generate_seg_report, process_seg_upload
 from app.utils.digital_reports.import_dept.excel_report_builder.import_segrigation_excel_buider import build_csv, build_csv_detailed, build_excel, build_excel_detailed
-from app.utils.digital_reports.import_dept.operation_productivity_report.imp_emp_roaster_cleaner import clean_import_roster_report
+from app.utils.digital_reports.import_dept.operation_productivity_report.imp_emp_roaster_cleaner import  clean_new_import_roster_report
 from app.utils.digital_reports.import_dept.operation_productivity_report.imp_pick_order_cleaner import clean_pick_order_report_data_for_digital_reports   # adjust to your project's DB dependency
 
 router = APIRouter(
@@ -422,7 +422,8 @@ async def upload_roster(
  
     # Parse / clean (pure, no DB).
     try:
-        rows = clean_import_roster_report(file_bytes, file.filename or "")
+        # rows = clean_import_roster_report(file_bytes, file.filename or "")
+        rows = clean_new_import_roster_report(file_bytes, file.filename or "")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Couldn't read the roster: {exc}") from exc
  

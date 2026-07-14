@@ -36,8 +36,8 @@ class DigitalReportImportTruckInOut(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
     # ── Core report fields ─────────────────────────────────────────────────
-    gp_no: Mapped[int] = mapped_column(
-        Integer,
+    gp_no: Mapped[str] = mapped_column(
+        String(20),
         nullable=False,
         comment="Gate Pass number from COSYS",
     )
