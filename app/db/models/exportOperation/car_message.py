@@ -322,6 +322,10 @@ class ExportFlightBookingDetail(Base):
 
     awb = relationship("ExportCarMessageAwbMaster", backref="flight_details")
 
+    created_by = Column(String(15), nullable=True)
+    created_at  = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=True)
+
 
 
 # =======================✌️✌️  ULD BOOKING MODELS =================================

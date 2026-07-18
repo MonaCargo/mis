@@ -75,13 +75,14 @@ async def upload_irr_report_file(
     Upload CSV or Excel file and bulk insert Import Release Report data
     """
     # Validate file type
-    if not (file.filename.endswith('.csv') or 
-            file.filename.endswith('.CSV') or 
+    if not (
+        # file.filename.endswith('.csv') or 
+        #     file.filename.endswith('.CSV') or 
             file.filename.endswith('.xlsx') or 
             file.filename.endswith('.xls')):
         raise HTTPException(
             status_code=400,
-            detail="Invalid file type. Only CSV and Excel files are supported."
+            detail="Invalid file type. Only Excel files are supported."
         )
     
     # Validate and parse date

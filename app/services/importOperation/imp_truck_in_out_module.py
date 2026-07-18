@@ -45,7 +45,7 @@ from app.services.importOperation.import_shipment_hold import assert_not_on_hold
 
 
 logger = logging.getLogger(__name__)
-
+TEST_ALLOW_INCOMPLETE_TRUCK_OUT = True  # ← testing only 🚫🚫🚫🚫🚫
 # Load environment variables
 # load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
 
@@ -179,242 +179,6 @@ def convert_to_ist_date(dt, ist_timezone) -> str:
 
 
 class ImportTruckInOutService:
-
-
-    # @staticmethod
-    # async def check_gate_pass_validity(
-    #     db: AsyncSession, request: GatePassCheckRequest
-    # ) -> GatePassCheckResponse:
-    #     """
-    #     Validate if a gate pass exists and can be assigned.
-    #     Rules:
-    #     1. New GP: Always allow if exists in IRR
-    #     2. Existing GP with pcs_remaining > 0: Allow reassignment
-    #     3. Existing GP with pcs_remaining = 0: Block
-    #     4. Prevent duplicate in staging
-    #     5. Prevent reassignment if active assignment exists but not yet loaded/unloaded
-    #     """
-    #     print(f"🔍 Validating gate pass: {request}")
-    #     # 1️⃣ Check staging duplicate
-    #     staging_stmt = select(ImportTruckInStaging).where(
-    #         ImportTruckInStaging.gate_pass_no == request.gate_pass_no
-    #     )
-    #     staging_result = await db.execute(staging_stmt)
-    #     staging_record = staging_result.scalar_one_or_none()
-
-    #     # if staging_record:
-    #     #     raise HTTPException(
-    #     #         status_code=400,
-    #     #         detail=f"Gate pass {request.gate_pass_no} already exists in staging. Preventing duplicate assignment.",
-    #     #     )
-
-
-    #     if staging_record:
-    #         truck_no = getattr(staging_record, "truck_number", None)
-    #         driver = getattr(staging_record, "driver_name", None)
-    #         contact = getattr(staging_record, "driver_contact", None)
-
-    #         # Build a "who" phrase from whatever is available
-    #         parts = []
-    #         if truck_no:
-    #             parts.append(f"truck {truck_no}")
-    #         if driver:
-    #             parts.append(f"driver {driver}")
-    #         if contact:
-    #             parts.append(f"contact {contact}")
-    #         where_txt = ", ".join(parts) if parts else "another staging entry"
-
-    #         raise HTTPException(
-    #             status_code=400,
-    #             detail=(
-    #                 f"Gate pass {request.gate_pass_no} is already staged under {where_txt}. "
-    #                 f"Remove it there first to use this gatepass"
-    #             ),
-    #         )
-
-    #     # 2️⃣ Check if gate pass exists in system
-    #     gp_stmt = select(ImportGatePass).where(
-    #         ImportGatePass.gate_pass_no == request.gate_pass_no
-    #     )
-    #     gp_result = await db.execute(gp_stmt)
-    #     existing_gate_pass = gp_result.scalar_one_or_none()
-
-    #     if existing_gate_pass:
-
-    #         # ═══════════════════════════════════════════════════════════════════
-    #         # ⬇️ ADD HERE — same-truck check (only when truck_visit_id provided)
-    #         # ═══════════════════════════════════════════════════════════════════
-    #         if request.current_truck_visit_id is not None:
-    #             prior_stmt = select(ImportGatePassAssignment).where(
-    #                 ImportGatePassAssignment.gate_pass_id == existing_gate_pass.id,
-    #                 ImportGatePassAssignment.truck_visit_id
-    #                 == request.current_truck_visit_id,
-    #             )
-    #             prior = (await db.execute(prior_stmt)).scalars().first()
-
-    #             if prior:
-    #                 load_count_stmt = (
-    #                     select(func.count())
-    #                     .select_from(ImportGatePassLoading)
-    #                     .where(
-    #                         ImportGatePassLoading.gate_pass_id == existing_gate_pass.id,
-    #                         ImportGatePassLoading.truck_visit_id
-    #                         == request.current_truck_visit_id,
-    #                     )
-    #                 )
-    #                 load_count = (await db.execute(load_count_stmt)).scalar() or 0
-
-    #                 if load_count > 0:
-    #                     raise HTTPException(
-    #                         status_code=400,
-    #                         detail=f"Gate pass {request.gate_pass_no} already loaded on this truck. Remaining pcs must go to a different truck.",
-    #                     )
-    #                 else:
-    #                     raise HTTPException(
-    #                         status_code=400,
-    #                         detail=f"Gate pass {request.gate_pass_no} already assigned to this truck.",
-    #                     )
-    #         # ═══════════════════════════════════════════════════════════════════
-    #         # ⬆️ END of new block
-    #         # ═══════════════════════════════════════════════════════════════════
-
-    #         # Block if fully consumed
-    #         if existing_gate_pass.pcs_remaining <= 0:
-    #             raise HTTPException(
-    #                 status_code=400,
-    #                 detail=f"Gate pass {request.gate_pass_no} fully consumed (0 pcs remaining)",
-    #             )
-
-    #         # Check active assignment
-    #         active_assign_stmt = select(ImportGatePassAssignment).where(
-    #             ImportGatePassAssignment.gate_pass_id == existing_gate_pass.id,
-    #             ImportGatePassAssignment.is_active == True,
-    #         )
-    #         active_assign_result = await db.execute(active_assign_stmt)
-    #         active_assignment = active_assign_result.scalar_one_or_none()
-
-    #         if active_assignment:
-    #             # Check loading records for this assignment
-    #             load_stmt = select(ImportGatePassLoading).where(
-    #                 ImportGatePassLoading.gate_pass_id == existing_gate_pass.id,
-    #                 ImportGatePassLoading.truck_visit_id
-    #                 == active_assignment.truck_visit_id,
-    #             )
-    #             load_result = await db.execute(load_stmt)
-    #             loading_record = load_result.scalar_one_or_none()
-
-    #             if loading_record:
-    #                 if existing_gate_pass.pcs_remaining < existing_gate_pass.pcs_total:
-    #                     # ✅ Partial loading already done → allow reassignment of remaining pcs
-    #                     pass
-    #                 else:
-    #                     # ❌ Loading started but nothing consumed yet → block reassignment
-    #                     truck_stmt = select(ImportTruckVisit).where(
-    #                         ImportTruckVisit.id == active_assignment.truck_visit_id
-    #                     )
-    #                     truck_result = await db.execute(truck_stmt)
-    #                     truck = truck_result.scalar_one_or_none()
-
-    #                     # raise HTTPException(
-    #                     #     status_code=400,
-    #                     #     detail=f"Gate pass {request.gate_pass_no} loading in progress on truck "
-    #                     #     f"{truck.truck_number if truck else 'unknown'}. Complete or cancel current loading first.",
-    #                     # )
-
-    #                     raise HTTPException(
-    #                         status_code=400,
-    #                         detail=(
-    #                             f"Gate pass {request.gate_pass_no} loading in progress on "
-    #                             f"{_visit_label(truck)}. Complete or cancel current loading first."
-    #                         ),
-    #                     )
-    #             else:
-    #                 # ❌ Assigned but no loading record yet → block reassignment until unloaded or GP Out
-    #                 truck_stmt = select(ImportTruckVisit).where(
-    #                     ImportTruckVisit.id == active_assignment.truck_visit_id
-    #                 )
-    #                 truck_result = await db.execute(truck_stmt)
-    #                 truck = truck_result.scalar_one_or_none()
-
-    #                 # raise HTTPException(
-    #                 #     status_code=400,
-    #                 #     detail=f"Gate pass {request.gate_pass_no} already assigned on truck "
-    #                 #     f"{truck.truck_number if truck else 'unknown'}. Reassignment not allowed until GP Out.",
-    #                 # )
-    #                 raise HTTPException(
-    #                     status_code=400,
-    #                     detail=(
-    #                         f"Gate pass {request.gate_pass_no} is already assigned to "
-    #                         f"{_visit_label(truck)}. Reassignment is not allowed until it is GP loaded."
-    #                     ),
-    #                 )
-
-    #     # 3️⃣ Validate against IRR Report (new GP case)
-    #     # NEW
-    #     was_stmt = (
-    #         select(WorkerAssignmentShipment, WorkerAssignmentHeader)
-    #         .join(
-    #             WorkerAssignmentHeader,
-    #             WorkerAssignmentShipment.assignment_header_id
-    #             == WorkerAssignmentHeader.id,
-    #         )
-    #         .where(WorkerAssignmentShipment.gate_pass_no == request.gate_pass_no)
-    #     )
-    #     was_result = await db.execute(was_stmt)
-    #     was_row = was_result.first()
-
-    #     if not was_row:
-    #         return GatePassCheckResponse(
-    #             valid=False,
-    #             message="Invalid gate pass - not found in system",
-    #             gate_pass_no=request.gate_pass_no,
-    #         )
-
-    #     shipment, header = was_row
-
-    #     # 4️⃣ Build message
-    #     message = "Gate pass is valid"
-    #     if (
-    #         existing_gate_pass
-    #         and existing_gate_pass.pcs_remaining < existing_gate_pass.pcs_total
-    #     ):
-    #         loaded_pcs = existing_gate_pass.pcs_total - existing_gate_pass.pcs_remaining
-    #         message = f"Gate pass partially loaded ({loaded_pcs}/{existing_gate_pass.pcs_total} pcs). {existing_gate_pass.pcs_remaining} pcs available for assignment."
-
-    #     # return GatePassCheckResponse(
-    #     #     valid=True,
-    #     #     message=message,
-    #     #     gate_pass_no=shipment.gate_pass_no,
-    #     #     agent=shipment.agent_name,
-    #     #     consignee=shipment.customer_name,
-    #     #     pcs=existing_gate_pass.pcs_remaining if existing_gate_pass else shipment.no_of_pc,
-    #     #     grg_wt=shipment.weight_in_kgs,
-    #     #     issued_date=shipment.gate_pass_issued_date_time_combo,
-    #     #     gate_pass_released_by=shipment.verified_by
-    #     # )
-
-    #     return GatePassCheckResponse(
-    #         valid=True,
-    #         message=message,
-    #         gate_pass_no=shipment.gate_pass_no,
-    #         agent=shipment.agent_name,
-    #         consignee=shipment.customer_name,
-    #         pcs=(
-    #             existing_gate_pass.pcs_remaining
-    #             if existing_gate_pass
-    #             else shipment.no_of_pc
-    #         ),
-    #         grg_wt=shipment.weight_in_kgs,
-    #         issued_date=shipment.gate_pass_issued_date_time_combo,
-    #         gate_pass_released_by=shipment.verified_by,
-    #         # NEW
-    #         final_delivery_datetime=shipment.final_delivery_datetime,
-    #         final_delivery_by_person=shipment.final_delivery_by_person,
-    #         gate_pass_end_datetime=shipment.gate_pass_end_datetime,
-    #         drop_dlv_zone=shipment.drop_dlv_zone,
-    #        lift_out_zone=shipment.unloading_from_lift_zone, 
-    #           dlv_zone_from_irr=shipment.dlv_zone_from_irr,    
-    #     )
 
     @staticmethod
     async def check_gate_pass_validity(
@@ -561,23 +325,24 @@ class ImportTruckInOutService:
                 # Any ACTIVE assignment blocks a new assignment.
                 # Partial-loaded-but-active → must confirm complete first
                 # (otherwise the GP would be active on two trucks).
-                if has_loading:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Gate pass {request.gate_pass_no} is still being loaded on "
-                            f"{_visit_label(truck)} ({loaded_global}/{existing_gate_pass.pcs_total} pcs loaded). "
-                            f"Confirm it complete on that truck before assigning the remaining pcs elsewhere."
-                        ),
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Gate pass {request.gate_pass_no} is already assigned to "
-                            f"{_visit_label(truck)}. Reassignment is not allowed until it is GP loaded."
-                        ),
-                    )
+                if not TEST_ALLOW_INCOMPLETE_TRUCK_OUT:
+                    if has_loading :
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Gate pass {request.gate_pass_no} is still being loaded on "
+                                f"{_visit_label(truck)} ({loaded_global}/{existing_gate_pass.pcs_total} pcs loaded). "
+                                f"Confirm it complete on that truck before assigning the remaining pcs elsewhere."
+                            ),
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Gate pass {request.gate_pass_no} is already assigned to "
+                                f"{_visit_label(truck)}. Reassignment is not allowed until it is GP loaded."
+                            ),
+                        )
             # NOTE: NO active assignment + computed_remaining > 0 → falls through →
             # allowed (multi-truck split: remaining pcs go to a new truck).
 
@@ -636,6 +401,7 @@ class ImportTruckInOutService:
             gate_pass_end_datetime=shipment.gate_pass_end_datetime,
             drop_dlv_zone=shipment.drop_dlv_zone,
             lift_out_zone=shipment.unloading_from_lift_zone,
+            unloading_from_lift_zone_datetime=shipment.unloading_from_lift_zone_datetime,  # ← ADD
             dlv_zone_from_irr=shipment.dlv_zone_from_irr,
             is_hold=is_hold,   # ← ADD
             Info = "Here pcs represent remaining pcs if this gatepass used or load somewhere else also"
@@ -1119,6 +885,8 @@ class ImportTruckStagingService:
             delivery_ref = (
                 shipment.gate_pass_end_datetime
                 or shipment.final_delivery_datetime
+                # 🚫🚫🚫🚫🚫🚫🚫🚫🚫
+                  or shipment.unloading_from_lift_zone_datetime
             )
             if not delivery_ref:
                 raise HTTPException(
@@ -1704,7 +1472,7 @@ class ImportTruckVisitService:
                     ImportGatePassAssignment.is_active == True,
                 )
                 active = (await db.execute(active_stmt)).scalar_one_or_none()
-                if active:
+                if active and not TEST_ALLOW_INCOMPLETE_TRUCK_OUT:
                     other_visit = (
                         await db.execute(
                             select(ImportTruckVisit).where(
@@ -2527,7 +2295,7 @@ class ImportTruckOutService:
                 if gp:
                     unprocessed_gps.append(gp.gate_pass_no)
 
-        if unprocessed_gps:
+        if unprocessed_gps and not TEST_ALLOW_INCOMPLETE_TRUCK_OUT:
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot truck out: {len(unprocessed_gps)} active gate pass(es) not processed: {', '.join(unprocessed_gps)}",
@@ -2537,7 +2305,7 @@ class ImportTruckOutService:
         any_needed, missing = await ImportTruckOutService._visit_charge_status(
             db, truck_visit
         )
-        if any_needed:
+        if any_needed and not TEST_ALLOW_INCOMPLETE_TRUCK_OUT:
             # Some GP is charge-eligible → require BOTH: CC cleared AND no GP missing a charge
             if any_needed and missing:
                 raise HTTPException(
@@ -2727,432 +2495,6 @@ class ImportTruckOutService:
         return response
 
  
-
-    # @staticmethod
-    # async def search_truck_for_out(
-    #     db: AsyncSession,
-    #     search_term: str,
-    #     search_by: str = "truck_no",  # ← NEW: "truck_no" | "gp_no"
-    # ):
-    #     """
-    #     Find the active (BOOKED + truck_in + not truck_out) visit for the truck out screen.
-
-    #     search_by:
-    #     - "truck_no" → finds by truck_number (works for both TRUCK and BY_HAND visits)
-    #     - "gp_no"    → finds active visit that has this GP currently assigned & pending
-    #                 (typical use case: BY_HAND pickups where operator has only the GP slip)
-    #     """
-    #     term = (search_term or "").strip().upper()
-    #     search_by = (search_by or "truck_no").strip().lower()
-
-    #     if not term:
-    #         raise HTTPException(status_code=400, detail="Search term is required")
-
-    #     if search_by not in ("truck_no", "gp_no", "visit_id"):
-    #         raise HTTPException(
-    #             status_code=400,
-    #             detail="search_by must be 'truck_no', 'gp_no', or 'visit_id'",
-    #         )
-
-    #     visit = None
-    #     # ═══════════════════════════════════════════════════════════════════════════
-    #     # BRANCH 0: Search by visit ID (used for refresh after any operation)
-    #     # ═══════════════════════════════════════════════════════════════════════════
-    #     if search_by == "visit_id":
-    #         try:
-    #             visit_id_int = int(term)
-    #         except ValueError:
-    #             raise HTTPException(status_code=400, detail=f"Invalid visit_id: {term}")
-
-    #         visit = (
-    #             (
-    #                 await db.execute(
-    #                     select(ImportTruckVisit).where(
-    #                         ImportTruckVisit.id == visit_id_int
-    #                     )
-    #                 )
-    #             )
-    #             .scalars()
-    #             .first()
-    #         )
-
-    #         if not visit:
-    #             raise HTTPException(
-    #                 status_code=404, detail=f"Visit #{visit_id_int} not found."
-    #             )
-
-    #     # ═══════════════════════════════════════════════════════════════════════════
-    #     # BRANCH 1: Search by GP number
-    #     # ═══════════════════════════════════════════════════════════════════════════
-    #     elif search_by == "gp_no":
-    #         # Find the GP first
-    #         gp_stmt = select(ImportGatePass).where(ImportGatePass.gate_pass_no == term)
-    #         gp = (await db.execute(gp_stmt)).scalar_one_or_none()
-
-    #         if not gp:
-    #             raise HTTPException(
-    #                 status_code=404, detail=f"Gate pass '{term}' not found in system."
-    #             )
-
-    #         # Find an ACTIVE assignment for this GP on a visit that's IN but not yet OUT
-    #         # active_assign_stmt = (
-    #         #     select(ImportGatePassAssignment, ImportTruckVisit)
-    #         #     .join(
-    #         #         ImportTruckVisit,
-    #         #         ImportTruckVisit.id == ImportGatePassAssignment.truck_visit_id,
-    #         #     )
-    #         #     .where(
-    #         #         ImportGatePassAssignment.gate_pass_id == gp.id,
-    #         #         ImportGatePassAssignment.is_active == True,
-    #         #         ImportTruckVisit.status == "BOOKED",
-    #         #         ImportTruckVisit.is_truck_in == True,
-    #         #         ImportTruckVisit.is_truck_out == False,
-    #         #     )
-    #         #     .order_by(ImportGatePassAssignment.assigned_time.desc())
-    #         # )
-
-    #         active_assign_stmt = (
-    #             select(ImportGatePassAssignment, ImportTruckVisit)
-    #             .join(
-    #                 ImportTruckVisit,
-    #                 ImportTruckVisit.id == ImportGatePassAssignment.truck_visit_id,
-    #             )
-    #             .where(
-    #                 ImportGatePassAssignment.gate_pass_id == gp.id,
-    #                 ImportTruckVisit.status == "BOOKED",
-    #                 ImportTruckVisit.is_truck_in == True,
-    #                 ImportTruckVisit.is_truck_out == False,
-    #                 or_(
-    #                     ImportGatePassAssignment.is_active == True,
-    #                     exists().where(
-    #                         ImportGatePassLoading.gate_pass_id == gp.id,
-    #                         ImportGatePassLoading.truck_visit_id == ImportTruckVisit.id,
-    #                     ),
-    #                 ),
-    #             )
-    #             .order_by(ImportTruckVisit.truck_in_date_time.desc())
-    #         )
-
-    #         row = (await db.execute(active_assign_stmt)).first()
-
-    #         # if not row:
-    #         #     # Helpful error — check what state the GP is actually in
-    #         #     any_assign_stmt = (
-    #         #         select(ImportGatePassAssignment, ImportTruckVisit)
-    #         #         .join(ImportTruckVisit, ImportTruckVisit.id == ImportGatePassAssignment.truck_visit_id)
-    #         #         .where(ImportGatePassAssignment.gate_pass_id == gp.id)
-    #         #         .order_by(ImportGatePassAssignment.assigned_time.desc())
-    #         #     )
-    #         #     any_row = (await db.execute(any_assign_stmt)).first()
-
-    #         #     if any_row:
-    #         #         _, any_visit = any_row
-    #         #         if any_visit.is_truck_out:
-    #         #             raise HTTPException(
-    #         #                 status_code=404,
-    #         #                 detail=(
-    #         #                     f"Gate pass {term} was last on '{any_visit.truck_number}' "
-    #         #                     f"which already checked out at "
-    #         #                     f"{ImportTruckQueueService._to_ist(any_visit.truck_out_date_time)}."
-    #         #                 )
-    #         #             )
-    #         #         raise HTTPException(
-    #         #             status_code=404,
-    #         #             detail=f"Gate pass {term} has no active pickup pending."
-    #         #         )
-    #         #     raise HTTPException(
-    #         #         status_code=404,
-    #         #         detail=f"Gate pass {term} not assigned to any visit yet."
-    #         #     )
-
-    #         if not row:
-    #             # No active visit — build a friendly message from the GP's full history
-    #             history_stmt = (
-    #                 select(ImportGatePassAssignment, ImportTruckVisit)
-    #                 .join(
-    #                     ImportTruckVisit,
-    #                     ImportTruckVisit.id == ImportGatePassAssignment.truck_visit_id,
-    #                 )
-    #                 .where(ImportGatePassAssignment.gate_pass_id == gp.id)
-    #                 .order_by(ImportTruckVisit.truck_out_date_time.desc().nullslast())
-    #             )
-    #             history = (await db.execute(history_stmt)).all()
-
-    #             if not history:
-    #                 raise HTTPException(
-    #                     status_code=404,
-    #                     detail=f"Gate pass {term} is not assigned to any visit yet.",
-    #                 )
-
-    #             out_visits = [v for (_, v) in history if v.is_truck_out]
-
-    #             if out_visits:
-
-    #                 def carrier_label(v):
-    #                     if getattr(v, "visit_type", "TRUCK") == "BY_HAND":
-    #                         return f"{v.driver_name or 'by-hand pickup'} (by hand)"
-    #                     return v.truck_number or "unknown truck"
-
-    #                 # Deduplicate, keep most-recent-first order
-    #                 seen = set()
-    #                 labels = []
-    #                 for v in out_visits:
-    #                     lbl = carrier_label(v)
-    #                     if lbl not in seen:
-    #                         seen.add(lbl)
-    #                         labels.append(lbl)
-
-    #                 last_out = ImportTruckQueueService._to_ist(
-    #                     out_visits[0].truck_out_date_time
-    #                 )
-
-    #                 if len(labels) == 1:
-    #                     detail = (
-    #                         f"Gate pass {term} already shipped on {labels[0]} "
-    #                         f"(checked out {last_out}). No active pickup pending."
-    #                     )
-    #                 else:
-    #                     joined = ", ".join(labels)
-    #                     detail = (
-    #                         f"Gate pass {term} already shipped on {len(labels)} visits: {joined} "
-    #                         f"(last checkout {last_out}). No active pickup pending."
-    #                     )
-
-    #                 raise HTTPException(status_code=404, detail=detail)
-
-    #             raise HTTPException(
-    #                 status_code=404,
-    #                 detail=f"Gate pass {term} has no active pickup pending.",
-    #             )
-
-    #         _, visit = row
-
-    #     # ═══════════════════════════════════════════════════════════════════════════
-    #     # BRANCH 2: Search by truck number (existing behavior)
-    #     # ═══════════════════════════════════════════════════════════════════════════
-    #     else:
-    #         stmt = (
-    #             select(ImportTruckVisit)
-    #             .where(
-    #                 ImportTruckVisit.truck_number == term,
-    #                 ImportTruckVisit.status == "BOOKED",
-    #                 ImportTruckVisit.is_truck_in == True,
-    #             )
-    #             .order_by(ImportTruckVisit.truck_in_date_time.desc())
-    #         )
-    #         visit = (await db.execute(stmt)).scalars().first()
-
-    #         if not visit:
-    #             queued_stmt = (
-    #                 select(ImportTruckVisit)
-    #                 .where(
-    #                     ImportTruckVisit.truck_number == term,
-    #                     ImportTruckVisit.status == "QUEUED",
-    #                 )
-    #                 .order_by(ImportTruckVisit.queued_at.desc())
-    #             )
-    #             queued_visit = (await db.execute(queued_stmt)).scalars().first()
-
-    #             if queued_visit:
-    #                 raise HTTPException(
-    #                     status_code=409,
-    #                     detail=(
-    #                         f"Truck {term} is in QUEUE (Queue No: {queued_visit.queue_no}). "
-    #                         f"Promote to Truck IN first before processing Truck OUT."
-    #                     ),
-    #                 )
-
-    #             any_stmt = (
-    #                 select(ImportTruckVisit)
-    #                 .where(ImportTruckVisit.truck_number == term)
-    #                 .order_by(ImportTruckVisit.created_at.desc())
-    #             )
-    #             any_visit = (await db.execute(any_stmt)).scalars().first()
-
-    #             if any_visit and any_visit.is_truck_out:
-    #                 raise HTTPException(
-    #                     status_code=404,
-    #                     detail=(
-    #                         f"No active visit for truck {term}. "
-    #                         f"Last visit checked out at "
-    #                         f"{ImportTruckQueueService._to_ist(any_visit.truck_out_date_time)}."
-    #                     ),
-    #                 )
-
-    #             raise HTTPException(
-    #                 status_code=404,
-    #                 detail=f"No active truck visit found for '{term}'. Truck has not been checked in.",
-    #             )
-
-    #     # ═══════════════════════════════════════════════════════════════════════════
-    #     # COMMON: Build response (same for both branches)
-    #     # ═══════════════════════════════════════════════════════════════════════════
-    #     assign_stmt = select(ImportGatePassAssignment).where(
-    #         ImportGatePassAssignment.truck_visit_id == visit.id
-    #     )
-    #     assignments = (await db.execute(assign_stmt)).scalars().all()
-
-    #     # Collect all emp_ids we need to resolve to names
-    #     emp_ids = set()
-    #     for a in assignments:
-    #         if a.assigned_by:
-    #             emp_ids.add(a.assigned_by)
-
-    #     if visit.truck_in_by:
-    #         emp_ids.add(visit.truck_in_by)
-    #     if visit.truck_out_by:
-    #         emp_ids.add(visit.truck_out_by)
-
-    #     gate_passes = []
-    #     pending_count = 0
-    #     completed_count = 0
-
-    #     # Pre-fetch loadings + collect their emp_ids
-    #     loadings_by_assign = {}
-    #     gps_by_assign = {}
-    #     for assignment in assignments:
-    #         gp = (
-    #             await db.execute(
-    #                 select(ImportGatePass).where(
-    #                     ImportGatePass.id == assignment.gate_pass_id
-    #                 )
-    #             )
-    #         ).scalar_one_or_none()
-    #         if not gp:
-    #             continue
-    #         gps_by_assign[assignment.id] = gp
-
-    #         loading = (
-    #             await db.execute(
-    #                 select(ImportGatePassLoading).where(
-    #                     ImportGatePassLoading.gate_pass_id == gp.id,
-    #                     ImportGatePassLoading.truck_visit_id == visit.id,
-    #                 )
-    #             )
-    #         ).scalar_one_or_none()
-    #         loadings_by_assign[assignment.id] = loading
-    #         if loading and loading.loaded_by:
-    #             emp_ids.add(loading.loaded_by)
-
-    #     # Resolve emp_id → name in one query
-    #     name_map = {}
-    #     if emp_ids:
-    #         users = (
-    #             await db.execute(
-    #                 select(User.emp_id, User.name).where(User.emp_id.in_(emp_ids))
-    #             )
-    #         ).all()
-    #         name_map = {u.emp_id: u.name for u in users}
-
-    #     for assignment in assignments:
-    #         gp = gps_by_assign.get(assignment.id)
-    #         if not gp:
-    #             continue
-    #         loading = loadings_by_assign.get(assignment.id)
-
-    #         pcs_loaded = loading.loaded_pcs if loading else 0
-    #         pcs_remaining_for_truck = gp.pcs_remaining if assignment.is_active else 0
-
-    #         is_done = (not assignment.is_active) or pcs_remaining_for_truck == 0
-    #         if is_done:
-    #             completed_count += 1
-    #         else:
-    #             pending_count += 1
-
-    #          # final delivery for charge eligibility (frontend computes)
-    #         final_delivery = None
-    #         gp_end = None
-    #         if gp.worker_assignment_shipment_id:
-    #             ship_row = (await db.execute(
-    #                 select(WorkerAssignmentShipment.final_delivery_datetime,
-    #                        WorkerAssignmentShipment.gate_pass_end_datetime,
-    #                        ).where(
-    #                     WorkerAssignmentShipment.id == gp.worker_assignment_shipment_id
-    #                 )
-    #             )).first()
-    #             if ship_row:
-    #                 gp_end = ship_row.gate_pass_end_datetime
-    #                 final_delivery = ship_row.final_delivery_datetime
-
-    #         gate_passes.append(
-    #             {
-    #                 "gate_pass_no": gp.gate_pass_no,
-    #                 "awb": gp.awb_no,
-    #                 "hawb": gp.hawb_no,
-    #                 "pcs": gp.pcs_total,
-    #                 "pcs_loaded": pcs_loaded,
-    #                 "pcs_remaining": pcs_remaining_for_truck,
-    #                 "agent": gp.agent,
-    #                 "consignee": gp.consignee,
-    #                 "assigned_time": assignment.assigned_time,
-    #                 "assigned_by": assignment.assigned_by,
-    #                 "assigned_by_name": name_map.get(assignment.assigned_by),
-    #                 "gate_pass_out_time": loading.loaded_time if loading else None,
-    #                 "gate_pass_out_by": loading.loaded_by if loading else None,
-    #                 "gate_pass_out_by_name": (
-    #                     name_map.get(loading.loaded_by) if loading else None
-    #                 ),
-    #                 "is_active_assignment": assignment.is_active,
-    #                     # ── charge fields (read-only for truck-out page) ──
-    #                 "final_delivery_datetime": final_delivery,
-    #                 "gate_pass_end_datetime": gp_end,
-    #                 "storage_charge": float(assignment.storage_charge) if assignment.storage_charge is not None else None,
-    #                 "challan_no": assignment.challan_no,
-    #             }
-    #         )
-
-    #     gate_passes.sort(
-    #         key=lambda g: (
-    #             0 if (g["is_active_assignment"] and g["pcs_remaining"] > 0) else 1,
-    #             g["assigned_time"] or datetime.min,
-    #         )
-    #     )
-
-    #     # Workflow status with by-hand-aware messages
-    #     is_by_hand = getattr(visit, "visit_type", "TRUCK") == "BY_HAND"
-    #     label = visit.driver_name if is_by_hand else visit.truck_number
-
-    #     if visit.is_truck_out:
-    #         workflow_status = "TRUCK_OUT_DONE"
-    #         message = (
-    #             f"Pickup by {label} already completed."
-    #             if is_by_hand
-    #             else f"Truck {label} already checked out."
-    #         )
-    #     elif pending_count == 0 and len(gate_passes) > 0:
-    #         workflow_status = "READY_FOR_TRUCK_OUT"
-    #         message = (
-    #             f"All {completed_count} gate pass(es) loaded. Ready to mark pickup complete."
-    #             if is_by_hand
-    #             else f"All {completed_count} gate pass(es) loaded. Ready for truck out."
-    #         )
-    #     else:
-    #         workflow_status = "READY_FOR_GP_OUT"
-    #         message = f"{pending_count} gate pass(es) pending loading."
-
-    #     return {
-    #         "success": True,
-    #         "truck_visit_id": visit.id,
-    #         "truck_number": visit.truck_number,
-    #         "visit_type": getattr(visit, "visit_type", "TRUCK"),  # ← NEW
-    #         "driver_name": visit.driver_name,
-    #         "driver_contact": visit.driver_contact,
-    #         "token_no": visit.token_no,
-    #         "status": visit.status,
-    #         "truck_in_date_time": visit.truck_in_date_time,
-    #         "truck_out_date_time": visit.truck_out_date_time,
-    #         "truck_in_by": visit.truck_in_by,
-    #         "truck_in_by_name": name_map.get(visit.truck_in_by),
-    #         "truck_out_by": visit.truck_out_by,
-    #         "truck_out_by_name": name_map.get(visit.truck_out_by),
-    #         "workflow_status": workflow_status,
-    #         "pending_gp_count": pending_count,
-    #         "completed_gp_count": completed_count,
-    #         "gate_passes": gate_passes,
-    #         "message": message,
-    #         "queued_at": visit.queued_at,
-    #         "charges_cleared": visit.charges_cleared,
-    #     }
 
     @staticmethod
     async def search_truck_for_out(
@@ -5298,6 +4640,8 @@ class ImportAddMoreGpService:
                                 select(
                                     WorkerAssignmentShipment.gate_pass_end_datetime,
                                     WorkerAssignmentShipment.final_delivery_datetime,
+                                    # 🚫🚫🚫🚫🚫🚫
+                                    WorkerAssignmentShipment.unloading_from_lift_zone_datetime,
                                 ).where(
                                     WorkerAssignmentShipment.id
                                     == existing_gp.worker_assignment_shipment_id
@@ -5305,8 +4649,8 @@ class ImportAddMoreGpService:
                             )
                         ).first()
                         if row:
-                            gp_end, final_del = row
-                            existing_delivery_ref = gp_end or final_del
+                            gp_end, final_del,lift_out  = row
+                            existing_delivery_ref = gp_end or final_del or lift_out 
 
                     # Must have GP end time OR final delivery
                     if not existing_delivery_ref:
@@ -5314,7 +4658,7 @@ class ImportAddMoreGpService:
                             {
                                 "gate_pass_no": gp_no,
                                 "success": False,
-                                "message": "Neither GP end time nor final delivery recorded yet for this gate pass.",
+                                "message": "No GP end time, lift-out or final delivery recorded yet for this gate pass.",
                             }
                         )
                         continue
@@ -5436,13 +4780,15 @@ class ImportAddMoreGpService:
                 delivery_ref = (
                     shipment.gate_pass_end_datetime
                     or shipment.final_delivery_datetime
+                    # 🚫🚫🚫🚫🚫🚫
+                     or shipment.unloading_from_lift_zone_datetime
                 )
                 if not delivery_ref:
                     results.append(
                         {
                             "gate_pass_no": gp_no,
                             "success": False,
-                            "message": "Neither GP end time nor final delivery recorded yet for this gate pass.",
+                            "message": "No GP end time, lift-out or final delivery recorded yet for this gate pass.",
                         }
                     )
                     continue

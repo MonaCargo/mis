@@ -124,7 +124,7 @@ def process_export_tp_xray(file_content: bytes, filename: str, selected_date: st
     string_cols = [
        'awb_no', 'origin', 'destination', 'nog', 'shc',
         'xray_type', 'xray_user', 'flt_no', 'agent_name',
-        'device_model_no', 'remarks']
+        'device_model_no', 'remarks','serial_no']
    
     for col in string_cols:
         if col in df_db.columns:
@@ -150,7 +150,7 @@ def process_export_tp_xray(file_content: bytes, filename: str, selected_date: st
 
     # --- NUMERIC CONVERSION ---
     # ✅ FIX: 'serial_no' yahan se hata diya (ab string_cols me hai)
-    numeric_cols = ['sl_no', 'pcs', 'gross_wgt', 'chg_wgt', 'serial_no']
+    numeric_cols = ['sl_no', 'pcs', 'gross_wgt', 'chg_wgt']
 
     for col in numeric_cols:
         if col in df_db.columns:
@@ -173,7 +173,7 @@ def process_export_tp_xray(file_content: bytes, filename: str, selected_date: st
 
     df_db = df_db.replace({pd.NA: None, float('nan'): None, pd.NaT: None})
 
-    # ✅ CHECK 2 REMOVED (per business decision): saara data allow hota hai.
+   
     dropped_count = 0
 
     if df_db.empty:

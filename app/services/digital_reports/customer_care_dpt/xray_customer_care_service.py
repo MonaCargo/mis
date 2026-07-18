@@ -212,8 +212,8 @@ class MISReportService:
             pd.set_option('display.max_columns', None)
             pd.set_option('display.width', 1000)
             pd.set_option('display.colheader_justify', 'center')
-            print(preview_df[cols_to_show].to_string(index=False))
-            print("\n================================────────────────────────================\n")
+            # print(preview_df[cols_to_show].to_string(index=False))
+            # print("\n================================────────────────────────================\n")
         except Exception as e:
             print(f"Terminal preview rendering skipped: {e}")
 
@@ -225,10 +225,10 @@ class MISReportService:
                 print(f"\n⚠️ [DB SAVE] No records found to save for {label}.")
                 return
 
-            print(f"\n========================= [DB SAVE - CONVERTED UTC DATA] {label} =========================\n")
+            # print(f"\n========================= [DB SAVE - CONVERTED UTC DATA] {label} =========================\n")
             
-            print(f"{'SL NO':<6} | {'AWB NUMBER':<14} | {'XRAY START (UTC)':<18} | {'XRAY END (UTC)':<18} | {'FLIGHT NO':<10}")
-            print("-" * 88)
+            # print(f"{'SL NO':<6} | {'AWB NUMBER':<14} | {'XRAY START (UTC)':<18} | {'XRAY END (UTC)':<18} | {'FLIGHT NO':<10}")
+            # print("-" * 88)
             
             for obj in db_objects[:5]:
                 sl_no    = getattr(obj, 'sl_no', 'N/A')
@@ -245,7 +245,7 @@ class MISReportService:
                 
             if len(db_objects) > 5:
                 print(f"\n... and {len(db_objects) - 5} more records successfully saved in UTC format.")
-            print("\n========================================================================================\n")
+            # print("\n========================================================================================\n")
         except Exception as e:
             print(f"Failed to log cleaned database saving state: {e}")    # @classmethod
 
@@ -328,7 +328,7 @@ class MISReportService:
                                f"column '{field}' should contain a valid date but found '{val}'."
                     )
 
-            # 2. Target Validation on PCS (Should be a pure number, not a date layout)
+            # 2.🚫 Target Validation on PCS (Should be a pure number, not a date layout)
             pcs_fields = ["PCS", "PCS."]
             for field in pcs_fields:
                 col_idx = header_map.get(field)
@@ -458,14 +458,14 @@ class MISReportService:
         
         # Print final database save verification table
         cls.print_database_save_log(db_objects, label="EXPORT NORMAL")
-        print(
-            f"\n⏱️  TIMING [EXPORT NORMAL] "
-            f"read_csv: {t_read - t_start:.3f}s | "
-            f"validate: {t_validate - t_read:.3f}s | "
-            f"clean_loop: {t_clean - t_validate:.3f}s | "
-            f"db_commit: {t_commit - t_clean:.3f}s | "
-            f"TOTAL: {t_commit - t_start:.3f}s\n"
-    )
+    #     print(
+    #         f"\n⏱️  TIMING [EXPORT NORMAL] "
+    #         f"read_csv: {t_read - t_start:.3f}s | "
+    #         f"validate: {t_validate - t_read:.3f}s | "
+    #         f"clean_loop: {t_clean - t_validate:.3f}s | "
+    #         f"db_commit: {t_commit - t_clean:.3f}s | "
+    #         f"TOTAL: {t_commit - t_start:.3f}s\n"
+    # )
         return {"status": "Success", "records_inserted": len(db_objects),
                 "timing_seconds": {
                     "read_csv": round(t_read - t_start, 3),
@@ -513,7 +513,7 @@ class MISReportService:
                                f"column '{field}' should contain a valid date but found '{val}'."
                     )
 
-            # 2. Target Validation on PCS (Should be a pure number, not a date layout)
+            # 2.🚫 Target Validation on PCS (Should be a pure number, not a date layout)
             pcs_fields = ["PCS", "PCS."]
             for field in pcs_fields:
                 col_idx = header_map.get(field)
@@ -651,7 +651,7 @@ class MISReportService:
                     )
                 
 
-            # Fields that should be a date, if filled, must actually parse as one
+            #🚫 Fields that should be a date, if filled, must actually parse as one
             date_fields = ["X-RAY END DATE & TIME", "X-RAY STRT DATE & TIME", "X-RAY DT/TIME"]
             for field in date_fields:
                 col_idx = header_map.get(field.upper().strip())
@@ -983,7 +983,7 @@ class XrayPerformanceCalculator:
     def _agg(records):
         pcs = sum(int(r["pcs"] or 0) for r in records)
         tons = round(sum(float(r["grs_wt"] or 0) for r in records) / 1000, 3)
-        return pcs, round(tons)
+        return pcs, (tons)
     
     @staticmethod
     def _normalize_serial(val):
@@ -1038,11 +1038,11 @@ class XrayPerformanceCalculator:
                 # 🌟 STEP 1: Explicitly convert the DB timestamp to IST
                 ist_dt = utc_dt + timedelta(hours=5, minutes=30)
                 
-                # 🌟 STEP 2: Use the IST timestamp for fingerprint deduplication
-                record_key = (serial, ist_dt.isoformat(), pcs, grs_wt)
-                if record_key in seen_records:
-                    continue
-                seen_records.add(record_key)
+                # # 🌟 STEP 2: Use the IST timestamp for fingerprint deduplication
+                # record_key = (serial, ist_dt.isoformat(), pcs, grs_wt)
+                # if record_key in seen_records:
+                #     continue
+                # seen_records.add(record_key)
                 
                 # 🌟 STEP 3: Assign the shift using the new local IST evaluator
                 assigned_shift = cls._get_shift_from_ist(ist_dt)
@@ -1253,7 +1253,8 @@ class XrayPerformanceCalculator:
                 if not op_date:
                     continue
                 serial = cls._normalize_serial(serial_no)
-                shift = cls._get_shift_from_utc(xray_end_dt)
+                ist_dt = xray_end_dt + timedelta(hours=5, minutes=30)
+                shift = cls._get_shift_from_ist(ist_dt)
                 key = (op_date, serial, shift)
                 agg[key]["pcs"] += int(pcs or 0)
                 agg[key]["grs_wt"] += float(grs_wt or 0)
