@@ -1830,6 +1830,7 @@ async def download_flight_booking_report(
             ExportFlightBookingHeader.flight_dpt_datetime,
             ExportFlightBookingHeader.is_active,
             ExportFlightBookingHeader.booked_by,
+            ExportFlightBookingHeader.booked_at,
             User.name.label("booked_by_name"),
             ExportFlightBookingDetail.booked_pcs,
             ExportCarMessageAwbMaster.awb_no,
@@ -1911,7 +1912,7 @@ async def download_flight_booking_report(
     # Row 4: header
     headers = [
         "Flight No", "Flight Date", "Departure (IST)",
-        "Booked By (Emp ID)", "Booked By (Name)",
+        "Booked By (Emp ID)", "Booked By (Name)", "Booked At",
         "AWB No", "Total Pcs", "Booked Pcs",
     ]
     head_row = 4
@@ -1932,6 +1933,9 @@ async def download_flight_booking_report(
         dep_val = dep_ist.replace(tzinfo=None) if dep_ist else None  # openpyxl: no tz-aware
         flight_date_val = header_r.flight_date  # already a date object
 
+        booked_at_ist = _to_ist(header_r.booked_at)
+        booked_at_val = booked_at_ist.replace(tzinfo=None) if booked_at_ist else None
+
         def write_flight_row(awb=None):
             # flight columns — repeated on every row
             ws.cell(row=cur, column=1, value=header_r.flight_no).font = cell_font
@@ -1949,16 +1953,21 @@ async def download_flight_booking_report(
             ws.cell(row=cur, column=4, value=header_r.booked_by or "").font = cell_font
             ws.cell(row=cur, column=5, value=header_r.booked_by_name or "").font = cell_font
 
-            # AWB columns
-            ws.cell(row=cur, column=6, value=(awb.awb_no if awb else "") or "").font = cell_font
+            c6 = ws.cell(row=cur, column=6, value=booked_at_val)
+            c6.font = cell_font
+            if booked_at_val:
+                c6.number_format = DATETIME_FMT
 
-            total_pcs_cell = ws.cell(row=cur, column=7)
+            # AWB columns
+            ws.cell(row=cur, column=7, value=(awb.awb_no if awb else "") or "").font = cell_font
+
+            total_pcs_cell = ws.cell(row=cur, column=8)
             if awb and awb.awb_total_pcs is not None:
                 total_pcs_cell.value = int(awb.awb_total_pcs)
                 total_pcs_cell.number_format = "0"
             total_pcs_cell.font = cell_font
 
-            pcs_cell = ws.cell(row=cur, column=8)
+            pcs_cell = ws.cell(row=cur, column=9)
             if awb and awb.booked_pcs is not None:
                 pcs_cell.value = int(awb.booked_pcs)
                 pcs_cell.number_format = "0"
@@ -1980,7 +1989,7 @@ async def download_flight_booking_report(
             cur += 1
 
     # ── Column widths + freeze ─────────────────────────────────────────
-    widths = [12, 13, 18, 18, 22, 14, 11, 11]
+    widths = [12, 13, 18, 18, 22, 18, 14, 11, 11]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[ws.cell(row=head_row, column=i).column_letter].width = w
     # ws.freeze_panes = "A5"

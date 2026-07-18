@@ -33,6 +33,9 @@ class GatePassCheckResponse(BaseModel):
     # NEW
     final_delivery_datetime: Optional[datetime] = None
     final_delivery_by_person: Optional[str] = None
+    
+    unloading_from_lift_zone_datetime: datetime | None = None
+
     gate_pass_end_datetime: Optional[datetime] = None
     drop_dlv_zone: Optional[str] = None
     lift_out_zone: Optional[str] = None    

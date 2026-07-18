@@ -2182,11 +2182,12 @@ func.count(distinct(
                 atw.label("atw"),
                 Flight.flt_com_dat_tim.label("fcc"),
                 gross_kg.label("gross_kg"),
+                Flight.flight_no.label("flight_no"),
             )
             .select_from(Flight)
             .join(Awb, Awb.flight_id == Flight.id)
             .where(rng)
-            .group_by(Flight.id, shift, atw, Flight.flt_com_dat_tim)
+            .group_by(Flight.id, shift, atw, Flight.flt_com_dat_tim,Flight.flight_no)
         ).subquery()
  
         tier_hours = case(
@@ -2194,13 +2195,34 @@ func.count(distinct(
             (per_flight.c.gross_kg <= 20000, 6),
             else_=8,
         )
+        # elapsed_hours = func.extract("epoch", per_flight.c.fcc - per_flight.c.atw) / 3600.0
+        # is_success = case(
+        #     (
+        #         (per_flight.c.atw.isnot(None))
+        #         & (per_flight.c.fcc.isnot(None))
+        #         & (elapsed_hours <= tier_hours),
+        #         1,
+        #     ),
+        #     else_=0,
+        # )
+
         elapsed_hours = func.extract("epoch", per_flight.c.fcc - per_flight.c.atw) / 3600.0
+
+        # PO Mail (PXX): flight_no starts with 'P' (case-insensitive). Always success.
+        is_pxx = func.upper(func.trim(func.coalesce(per_flight.c.flight_no, literal(""))))\
+            .like("P%")
+
         is_success = case(
+            (is_pxx, 1),                                              # 1. PXX -> always success
+            (
+                (per_flight.c.atw.is_(None)) & (per_flight.c.fcc.isnot(None)),
+                1,                                                    # 2. no ATW but completed
+            ),
             (
                 (per_flight.c.atw.isnot(None))
                 & (per_flight.c.fcc.isnot(None))
                 & (elapsed_hours <= tier_hours),
-                1,
+                1,                                                    # 3. normal check
             ),
             else_=0,
         )
