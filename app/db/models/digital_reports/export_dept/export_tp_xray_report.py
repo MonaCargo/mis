@@ -35,7 +35,7 @@ class DigitalReportExportTpXrayReport(Base):
 
     flt_no = Column(String, nullable=True)
     agent_name = Column(String, nullable=True)
-    serial_no = Column(Integer, nullable=True)
+    serial_no = Column(String(20), nullable=True)
     device_model_no = Column(String, nullable=True)
 
     uploaded_at = Column(DateTime, default=datetime.utcnow)

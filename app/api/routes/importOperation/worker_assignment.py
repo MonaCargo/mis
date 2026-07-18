@@ -596,6 +596,8 @@ from app.schemas.user import UserListResponse, UserRead
 from app.services.export_slot_file_upload_service import get_utc_now
 from app.services.importOperation.import_pick_location import ImportLocationPickupService
 from app.services.importOperation.import_shipment_hold import ImportShipmentHoldService
+from app.services.importOperation.sla_dashboard.worker_sla_dashboard_config import DEFAULT_FILTER_MODE, FILTER_MODES
+from app.services.importOperation.sla_dashboard.worker_sla_service import build_gp_dashboard
 from app.services.importOperation.worker_assignment_service import (
     add_drop_dlv_zone_by_assigned_worker,
     add_loading_in_lift_by_assigned_worker,
@@ -3047,3 +3049,41 @@ async def get_worker_assigned_shipments(
         drop_status=drop_status,
         window=window,
     )
+
+
+
+
+
+
+# ================================  NEW SLA Dashboard ===================================
+def _default_range() -> tuple[datetime, datetime]:
+    """One day prior, 00:01 -> next-day 00:00 IST."""
+    today_ist = datetime.now(IST).date()
+    prior = today_ist - timedelta(days=1)
+    start = datetime.combine(prior, time(0, 1), tzinfo=IST)
+    end = datetime.combine(today_ist, time(0, 0), tzinfo=IST)
+    return start, end
+ 
+ 
+@router.get("/gp-dashboard/new-sla")
+async def gp_dashboard(
+    start_dt: Optional[datetime] = Query(None, description="Range start (defaults to one day prior 00:01 IST)"),
+    end_dt: Optional[datetime] = Query(None, description="Range end (defaults to today 00:00 IST)"),
+    filter_by: str = Query(DEFAULT_FILTER_MODE, description=f"One of: {', '.join(FILTER_MODES)}"),
+    db: AsyncSession = Depends(get_db),
+):
+    if start_dt is None or end_dt is None:
+        d_start, d_end = _default_range()
+        start_dt = start_dt or d_start
+        end_dt = end_dt or d_end
+
+    
+    print("GP DASHBOARD RANGE:", start_dt.isoformat(), "->", end_dt.isoformat())
+ 
+    data = await build_gp_dashboard(
+        db=db,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        filter_by=filter_by,
+    )
+    return {"success": True, "data": data}

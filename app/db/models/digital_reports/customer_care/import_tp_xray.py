@@ -16,7 +16,7 @@ class DigitalReportImportTpXray(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
     # ── Core operational references ───────────────────────────────────────────
-    sl_no       = Column(Integer, nullable=False)
+    sl_no       = Column(Integer, nullable=True)
     awb_no      = Column(String(20),  nullable=False, index=True)
     origin      = Column(String(10),  nullable=False)  
     destination = Column(String(10),  nullable=False)
@@ -26,7 +26,7 @@ class DigitalReportImportTpXray(Base):
     grs_wt      = Column(Numeric(12, 3), nullable=False)
     chg_wt      = Column(Numeric(12, 3), nullable=False)
     nog         = Column(Text,        nullable=True)  
-    shc         = Column(String(50),  nullable=False)   
+    shc         = Column(String(50),  nullable=True)   
 
     # ── Operational Date / Time Fields ─────────────────────────────────────── 
     xray_start_datetime = Column(DateTime(timezone=True), nullable=False)

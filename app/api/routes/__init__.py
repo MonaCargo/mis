@@ -18,6 +18,7 @@ from .importOperation.all_import_logs_route import router as all_import_logs_rou
 from .importOperation.damage_report import router as damage_report
 
 
+
 from .domesticOperation.domestic_xray_report import router as domestic_xray_report_route
 from .exportOperation.car_message import router as export_car_message_awb_router
 from .exportOperation.export_skid_master import router as export_skid_master_router
@@ -110,3 +111,6 @@ api_v1_router.include_router(digital_reports_import_router, prefix="/digital-rep
 api_v1_router.include_router(digital_reports_customer_care_mis_router, prefix="/digital-reports/customer-care/mis", tags=["CUSTOMER CARE DIGITALREPORTS"])
 #  Export digital reports
 api_v1_router.include_router(digital_reports_export_router, prefix="/digital-reports/export", tags=["Export Digital report Dashboard Summary"])
+
+
+
