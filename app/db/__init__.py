@@ -62,7 +62,20 @@ from app.db.models.digital_reports.customer_care.export_xray import DigitalRepor
 from app.db.models.digital_reports.customer_care.export_tp_xray import DigitalReportExportTpXray
 from app.db.models.digital_reports.customer_care.import_tp_xray import DigitalReportImportTpXray
 from app.db.models.digital_reports.customer_care.xray_performance import DigitalReportXRayPerformance
-
+from app.db.models.digital_reports.mis_dept.mis_international_code import DigitalMisInternationalCode
+from app.db.models.digital_reports.mis_dept.mis_domestic_code import DigitalMisDomesticCode
+from app.db.models.digital_reports.mis_dept.mis_uplifting_po_cleaned import DigitalReportsMisUpliftingCleaned
+from app.db.models.digital_reports.mis_dept.mis_uplifting_po import DigitalReportsMisUpliftingPo
+from app.db.models.digital_reports.mis_dept.mis_flight_status_cleaned import DigitalReportsMisFlightStatus
+from app.db.models.digital_reports.mis_dept.mis_flt_country_cont import DigitalMisFltCountryContinent
+from app.db.models.digital_reports.mis_dept.mis_segregation_cleaned import  DigitalReportsMisSegregationCleaned
+from app.db.models.digital_reports.mis_dept.mis_segregation import DigitalReportsMisSegregation
+from app.db.models.digital_reports.mis_dept.mis_flt_schedule_cleaning import DigitalReportsFlightScheduleImport
+from app.db.models.digital_reports.mis_dept.mis_agent_list import DigitalMisPdaAgent
+from app.db.models.digital_reports.mis_dept.mis_nog_list import DigitalMisNogMaster
+from app.db.models.digital_reports.mis_dept.mis_shc_code import DigitalMisShcMaster
+from app.db.models.digital_reports.mis_dept.mis_pivot_reports import DigitalReportsMisPivotReport, DigitalReportsMisPivotReportField
+    
 
 
 __all__ = [
@@ -167,6 +180,23 @@ __all__ = [
     'DamageReportReason',
 
     'DomesticXray',
+    
+    #mis
+    'DigitalReportsMisUpliftingPo',
+    'DigitalMisInternationalCode',
+    'DigitalMisDomesticCode',
+    'DigitalReportsMisUpliftingCleaned',
+    'DigitalReportsMisFlightStatus',
+    'DigitalMisFltCountryContinent',
+    'DigitalReportsMisSegregation',
+    'DigitalReportsMisSegregationCleaned',
+    'DigitalReportsFlightScheduleImport',
+    'DigitalMisPdaAgent',
+    'DigitalMisShcMaster',
+    'DigitalMisNogMaster',
+    'DigitalReportsMisPivotReport',
+    'DigitalReportsMisPivotReportField',
+
 ]
 
 

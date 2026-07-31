@@ -1,9 +1,10 @@
 from datetime import datetime,timezone
-
+from zoneinfo import ZoneInfo
+import pandas as pd
 import pytz
 
 from app.utils.common.enums import OriginSourceType
-
+IST = ZoneInfo("Asia/Kolkata")
 
 def get_utc_now() -> datetime:
     """Returns current UTC time with timezone info"""
@@ -86,3 +87,20 @@ def ist_day_to_utc_range(date_str: str):
     end_ist = ist.localize(d.replace(hour=23, minute=59, second=59, microsecond=999999))
 
     return start_ist.astimezone(pytz.UTC), end_ist.astimezone(pytz.UTC)
+
+
+
+def to_ist(dt: datetime | None, fmt: str = "%Y-%m-%d %H:%M:%S") -> str | None:
+    """Convert a UTC datetime to IST formatted string (for reports)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST).strftime(fmt)
+
+
+def convert_df_utc_to_ist(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert all UTC-aware datetime columns in a DataFrame to naive IST (for Excel export)."""
+    for col in df.select_dtypes(include=['datetime64[ns, UTC]', 'datetimetz']).columns:
+        df[col] = df[col].dt.tz_convert(IST).dt.tz_localize(None)
+    return df

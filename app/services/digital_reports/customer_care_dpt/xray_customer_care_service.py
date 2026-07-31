@@ -1086,7 +1086,7 @@ class XrayPerformanceCalculator:
                 
             # Aggregate row totals across the machine profile
             total_pcs, total_tons = cls._agg(machine_records)
-            shift_summary["Total"][serial] = {"pcs": total_pcs, "tons": round(total_tons, 3)}
+            shift_summary["Total"][serial] = {"pcs": total_pcs, "tons": round(total_tons)}
             grand_pcs_by_shift["Total"] += total_pcs
             grand_tons_by_shift["Total"] += total_tons
 
